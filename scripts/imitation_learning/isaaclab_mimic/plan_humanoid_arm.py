@@ -20,6 +20,7 @@ parser.add_argument("--dx", type=float, default=0.05, help="Forward motion in me
 parser.add_argument("--retime_deg", type=float, default=1.0, help="Joint retime step (deg); 0 disables retiming.")
 parser.add_argument("--rest", type=int, default=10, help="Initial rest steps before planning.")
 parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+parser.add_argument("--replay_trials", type=int, default=10, help="Number of trials to replay.")
 
 
 # append AppLauncher cli args and parse
@@ -47,13 +48,11 @@ from isaaclab.controllers import utils as ControllerUtils
 
 import isaaclab_mimic.envs  # noqa: F401
 import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
-from isaaclab_mimic.envs.pinocchio_envs.nutpour_gr1t2_mimic_env_cfg import NutPourGR1T2MimicEnvCfg
 from isaaclab_mimic.envs.pinocchio_envs.pickplace_gr1t2_mimic_env_cfg import PickPlaceGR1T2MimicEnvCfg
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_humanoid import HumanoidArmCuroboPlanner
 
 import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.manager_based.manipulation.pick_place.pickplace_gr1t2_env_cfg import PickPlaceGR1T2EnvCfg
 
 
 def _detect_robot_usd_path(env):
@@ -153,12 +152,35 @@ def _build_temp_robot_yaml_from_usd(usd_path: str, arm: str) -> str:
     return out_path
 
 
-def rest_robot(env, robot, steps=10):
-    """Let robot settle for a few steps."""
-    print(f"[PlanHumanoid] Resting robot for {steps} steps...")
+def rest_with_idle_action(env, steps=10):
+    cfg = getattr(env, "cfg", None)
+    if cfg is None or not hasattr(cfg, "idle_action"):
+        raise AttributeError("[PlanHumanoid] This env has no cfg.idle_action defined.")
+
+    idle = cfg.idle_action
+    if not isinstance(idle, torch.Tensor):
+        idle = torch.tensor(idle, dtype=torch.float32)
+    else:
+        idle = idle.to(dtype=torch.float32)
+    idle = idle.to(device=env.device)
+
+    act_dim = env.action_manager.total_action_dim
+    if idle.shape[-1] != act_dim:
+        raise ValueError(f"[PlanHumanoid] Idle action dim mismatch ({idle.shape[-1]} != {act_dim}).")
+
+    if idle.dim() == 1:
+        idle_batched = idle.unsqueeze(0).repeat(env.num_envs, 1)
+    elif idle.dim() == 2 and idle.size(0) == 1:
+        idle_batched = idle.repeat(env.num_envs, 1)
+    elif idle.dim() == 2 and idle.size(0) == env.num_envs:
+        idle_batched = idle
+    else:
+        raise ValueError(f"[PlanHumanoid] Unexpected idle_action shape: {tuple(idle.shape)}")
+
+    print(f"[PlanHumanoid] Resting with idle action for {steps} steps...")
     for i in range(steps):
-        env.step(torch.zeros((env.num_envs, env.action_manager.total_action_dim), device=env.device))
-        if (i + 1) % 5 == 0:
+        env.step(idle_batched)
+        if (i + 1) % 5 == 0 or i == steps - 1:
             print(f"  Rest step {i + 1}/{steps}")
 
 
@@ -193,7 +215,18 @@ def main():
 
     print("[PlanHumanoid] Building env config...")
     env_cfg = PickPlaceGR1T2MimicEnvCfg()
-    env_cfg.num_envs = args_cli.num_envs
+    env_cfg.num_envs = 1
+
+    planner_cfg = CuroboPlannerCfg()
+    planner_cfg.visualize_plan = True
+    planner_cfg.visualize_spheres = False
+    planner_cfg.debug_planner = args_cli.debug
+
+    # Build robot YAML before the env is created to avoid PhysX invalidation
+    usd_path = env_cfg.scene.robot.spawn.usd_path
+    print(f"[PlanHumanoid] Detected robot USD: {usd_path}")
+    robot_yaml = _build_temp_robot_yaml_from_usd(usd_path, args_cli.arm)
+    print(f"[PlanHumanoid] Generated cuRobo robot YAML: {robot_yaml}")
 
     print("[PlanHumanoid] Creating env...")
     try:
@@ -204,26 +237,14 @@ def main():
         raise e
     print("[PlanHumanoid] Env ready.")
 
-    # Let robot settle
     if args_cli.rest > 0:
-        rest_robot(env, env.scene["robot"], args_cli.rest)
+        rest_with_idle_action(env, steps=args_cli.rest)
 
-    # Build planner config
-    planner_cfg = CuroboPlannerCfg()
-    planner_cfg.visualize_plan = True
-    planner_cfg.visualize_spheres = False
-    planner_cfg.debug_planner = args_cli.debug
-
-    # Configure for GR1 robot
-    usd_path = _detect_robot_usd_path(env)
-    print(f"[PlanHumanoid] Detected robot USD: {usd_path}")
-    robot_yaml = _build_temp_robot_yaml_from_usd(usd_path, args_cli.arm)
-    print(f"[PlanHumanoid] Generated cuRobo robot YAML: {robot_yaml}")
-
+    # Finish planner config
     planner_cfg.robot_config_file = robot_yaml
     planner_cfg.robot_name = "gr1"
-    planner_cfg.approach_distance = 0.01  # Small approach for safety
-    planner_cfg.retreat_distance = 0.01  # Small retreat for safety
+    planner_cfg.approach_distance = 0.01
+    planner_cfg.retreat_distance = 0.01
     planner_cfg.time_dilation_factor = 0.5
     planner_cfg.enable_finetune_trajopt = True
     planner_cfg.ee_link_name = _tool_link_for_arm(args_cli.arm)
@@ -283,6 +304,7 @@ def main():
     # Configure retiming
     step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
 
+    print(f"target_pose: {target_pose}")
     print("[PlanHumanoid] Planning...")
     try:
         ok = planner.update_world_and_plan_motion(
@@ -315,75 +337,66 @@ def main():
     # Execute the plan
     print(f"[PlanHumanoid] Executing {len(planned_poses)} waypoints...")
 
-    # Get the other arm's current pose to keep it fixed
-    other_arm = "left" if args_cli.arm == "right" else "right"
-    other_link = _tool_link_for_arm(other_arm)
-    other_eef = planner.get_attached_pose(other_link, cu_js)
-    other_pos = planner._to_env_device(other_eef.position)
-    other_rot = planner._to_env_device(other_eef.get_rotation())
-    other_fixed = PoseUtils.make_pose(other_pos, other_rot)[0]
+    # Idle action (device/dtype aligned)
+    idle = env.cfg.idle_action
+    if not isinstance(idle, torch.Tensor):
+        idle = torch.tensor(idle, dtype=torch.float32)
+    else:
+        idle = idle.to(dtype=torch.float32)
+    idle = idle.to(device=env.device)
 
-    # Get current hand joint states
-    hand_state = env.obs_buf["policy"]["hand_joint_state"][0].to(env.device, dtype=torch.float32)
-    left_hand = hand_state[:11]
-    right_hand = hand_state[11:22]
+    # Helper: build a 4x4 pose from idle slices for a given arm
+    def _pose_from_idle(_idle: torch.Tensor, arm: str) -> torch.Tensor:
+        if arm == "left":
+            pos = _idle[0:3]
+            quat = _idle[3:7]
+        else:
+            pos = _idle[7:10]
+            quat = _idle[10:14]
+        rot = PoseUtils.matrix_from_quat(quat.unsqueeze(0))[0]
+        return PoseUtils.make_pose(pos.unsqueeze(0), rot.unsqueeze(0))[0].to(env.device)
+
+    fixed_arm = "left" if args_cli.arm == "right" else "right"
+    fixed_pose = _pose_from_idle(idle, fixed_arm)
 
     # Execute waypoints
-    for idx, target_ee_pose in enumerate(planned_poses):
-        try:
-            # Set up target poses for both arms
-            if args_cli.arm == "right":
-                target_dict = {
-                    "left": other_fixed,
-                    "right": target_ee_pose,
-                }
-            else:
-                target_dict = {
-                    "left": target_ee_pose,
-                    "right": other_fixed,
-                }
+    for _ in range(args_cli.replay_trials):
+        print(f"[PlanHumanoid] Replaying trial {_ + 1}/{args_cli.replay_trials}")
+        env.reset()
+        for idx, target_ee_pose in enumerate(planned_poses):
+            # sanitize target pose to 4x4 homogeneous, device/dtype
+            if target_ee_pose.dim() == 3 and target_ee_pose.size(0) == 1:
+                target_ee_pose = target_ee_pose[0]
+            target_ee_pose = target_ee_pose.to(device=env.device, dtype=torch.float32)
+            target_ee_pose[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
 
-            # Convert to action
+            if args_cli.arm == "right":
+                target_dict = {"left": fixed_pose, "right": target_ee_pose}
+            else:
+                target_dict = {"left": target_ee_pose, "right": fixed_pose}
+
             action = env.target_eef_pose_to_action(
                 target_eef_pose_dict=target_dict,
-                gripper_action_dict={
-                    "left": left_hand,
-                    "right": right_hand,
-                },
+                gripper_action_dict={"left": idle[14:25], "right": idle[25:36]},  # keep fixed grippers truly idle
                 action_noise_dict=None,
                 env_id=0,
             )
-        except Exception as e:
-            import traceback
+            if action.ndim == 1:
+                action = action.unsqueeze(0)
+            action = action.to(device=env.device, dtype=torch.float32)
 
-            traceback.print_exc()
-            print(f"[PlanHumanoid] Error converting waypoint {idx + 1}: {e}")
-            raise e
+            # Force the fixed arm slices to idle, regardless of conversion internals
+            if args_cli.arm == "right":
+                action[:, 0:7] = idle[0:7]  # left arm pose (pos+quat)
+                action[:, 14:25] = idle[14:25]  # left hand joints
+            else:
+                action[:, 7:14] = idle[7:14]  # right arm pose (pos+quat)
+                action[:, 25:36] = idle[25:36]  # right hand joints
 
-        # Ensure action has correct shape
-        if action.ndim == 1:
-            action = action.unsqueeze(0)
-        action = action.to(device=env.device, dtype=torch.float32)
-
-        # Step environment
-        try:
             env.step(action)
-        except Exception as e:
-            import traceback
 
-            traceback.print_exc()
-            print(f"[PlanHumanoid] Error executing step {idx + 1}: {e}")
-            raise e
-
-        # Progress logging
-        if (idx + 1) % 10 == 0 or idx == 0 or idx == len(planned_poses) - 1:
-            print(f"[PlanHumanoid] Step {idx + 1}/{len(planned_poses)}")
-
-    print("[PlanHumanoid] Execution complete!")
-
-    # Final rest to observe result
-    print("[PlanHumanoid] Final rest...")
-    rest_robot(env, robot, 20)
+            if (idx + 1) % 10 == 0 or idx == 0 or idx == len(planned_poses) - 1:
+                print(f"[PlanHumanoid] Step {idx + 1}/{len(planned_poses)}")
 
 
 if __name__ == "__main__":

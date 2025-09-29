@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import torch
-from typing import Any
 from collections.abc import Iterable
 
 from curobo.types.state import JointState
@@ -52,7 +51,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         # Populate hand_link_names from substrings if provided
         if self.hand_link_substrings:
             all_links = list(self.robot_cfg["kinematics"]["collision_link_names"])
-            inferred = [l for l in all_links if any(s in l for s in self.hand_link_substrings)]
+            inferred = [link for link in all_links if any(s in link for s in self.hand_link_substrings)]
             if inferred:
                 self.config.hand_link_names = inferred
                 self.logger.info(f"Using hand links for contact planning: {self.config.hand_link_names}")
@@ -70,16 +69,38 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
 
         # Keep active arm links and essential torso/base links
         keep_tokens = tuple(self.active_joint_substrings) + ("waist_", "base_link", "torso_", "pelvis_")
-        active_links = [l for l in all_links if any(t in l for t in keep_tokens)]
+        active_links = [link for link in all_links if any(t in link for t in keep_tokens)]
 
         # Inactive links are everything else
-        inactive = [l for l in all_links if l not in set(active_links)]
+        inactive = [link for link in all_links if link not in set(active_links)]
 
         # Don't disable attached object link even if it's on the inactive side
         if self.config.attached_object_link_name in inactive:
             inactive.remove(self.config.attached_object_link_name)
 
         return inactive
+
+    def _get_current_joint_state_for_curobo(self) -> JointState:
+        """Get current joint state clamped to cuRobo limits to avoid INVALID_START_STATE_JOINT_LIMITS."""
+        js = super()._get_current_joint_state_for_curobo()
+
+        # Joint limits: [2, N] -> [low, high]
+        limits = self.motion_gen.kinematics.get_joint_limits().position
+        low, high = limits[0], limits[1]
+        margin = 1e-4
+
+        # Clamp and log if any values changed
+        pos = torch.clamp(js.position, low + margin, high - margin)
+        if not torch.allclose(pos, js.position):
+            self.logger.debug("Clamped start state within joint limits")
+
+        return JointState(
+            position=pos,
+            velocity=torch.zeros_like(pos),
+            acceleration=torch.zeros_like(pos),
+            joint_names=js.joint_names,
+            tensor_args=self.tensor_args,
+        ).get_ordered_joint_state(self.motion_gen.kinematics.joint_names)
 
     # ---- Main planning entry ----
     def update_world_and_plan_motion(
