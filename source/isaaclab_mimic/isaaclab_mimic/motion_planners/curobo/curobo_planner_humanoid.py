@@ -12,6 +12,7 @@ from curobo.types.state import JointState
 
 from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
+import isaaclab.utils.math as PoseUtils
 
 
 class HumanoidArmCuroboPlanner(CuroboPlanner):
@@ -63,35 +64,69 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             return True
         return any(s in joint_name for s in self.active_joint_substrings)
 
-    def _inactive_collision_links(self) -> list[str]:
-        """Get collision links to disable for the inactive arm."""
+    def _arm_side(self) -> str | None:
+        """Infer arm side ('left' or 'right') from the configured ee_link_name."""
+        ee_link = self.config.ee_link_name or self.robot_cfg["kinematics"].get("ee_link")
+        if not isinstance(ee_link, str):
+            return None
+        if "left_" in ee_link or "_L_" in ee_link:
+            return "left"
+        if "right_" in ee_link or "_R_" in ee_link:
+            return "right"
+        return None
+
+    def _active_arm_links(self) -> list[str]:
+        """Derive active arm link names based on side; keep essential trunk/base links enabled.
+
+        Mirrors demo_motion_planning's approach of selecting the kinematic chain for the chosen arm
+        while retaining trunk links like waist/base/torso/pelvis.
+        """
         all_links = list(self.robot_cfg["kinematics"]["collision_link_names"])
+        side = self._arm_side()
+        if side is None:
+            # Fallback: if side cannot be inferred, keep all links active
+            return all_links
 
-        # Keep active arm links and essential torso/base links
-        keep_tokens = tuple(self.active_joint_substrings) + ("waist_", "base_link", "torso_", "pelvis_")
-        active_links = [link for link in all_links if any(t in link for t in keep_tokens)]
+        arm_token = f"{side}_"
+        arm_links = [link for link in all_links if arm_token in link]
 
-        # Inactive links are everything else
-        inactive = [link for link in all_links if link not in set(active_links)]
+        # Keep essential trunk/base links in the collision model
+        trunk_tokens = ("waist_", "base_link", "torso_", "pelvis_")
+        trunk_links = [link for link in all_links if any(t in link for t in trunk_tokens)]
 
-        # Don't disable attached object link even if it's on the inactive side
+        # Preserve the configured attached object link if present
+        attached = getattr(self.config, "attached_object_link_name", None)
+        if attached and attached not in arm_links and attached in all_links:
+            trunk_links.append(attached)
+
+        return list({*arm_links, *trunk_links})
+
+    def _inactive_collision_links(self) -> list[str]:
+        """Get collision links to disable for the inactive arm using side-aware link selection."""
+        all_links = list(self.robot_cfg["kinematics"]["collision_link_names"])
+        active_links = set(self._active_arm_links())
+
+        inactive = [link for link in all_links if link not in active_links]
+
+        # Ensure we don't disable the attached object link
         if self.config.attached_object_link_name in inactive:
             inactive.remove(self.config.attached_object_link_name)
 
         return inactive
 
     def _get_current_joint_state_for_curobo(self) -> JointState:
-        """Get current joint state clamped to cuRobo limits to avoid INVALID_START_STATE_JOINT_LIMITS."""
+        """
+        Construct the current joint state for cuRobo with zero velocity and acceleration.
+        """
         js = super()._get_current_joint_state_for_curobo()
 
-        # Joint limits: [2, N] -> [low, high]
         limits = self.motion_gen.kinematics.get_joint_limits().position
         low, high = limits[0], limits[1]
         margin = 1e-4
 
-        # Clamp and log if any values changed
-        pos = torch.clamp(js.position, low + margin, high - margin)
-        if not torch.allclose(pos, js.position):
+        pos_tensor = js.position if isinstance(js.position, torch.Tensor) else torch.tensor(js.position, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+        pos = torch.clamp(pos_tensor, low + margin, high - margin)
+        if not torch.allclose(pos, pos_tensor):
             self.logger.debug("Clamped start state within joint limits")
 
         return JointState(
@@ -113,35 +148,33 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
     ) -> bool:
         """Plan motion for single humanoid arm with collision management.
 
-        This method:
-        1. Disables collision spheres for inactive links
-        2. Plans motion using the base planner
-        3. Restores collision configuration
-
-        Note: We don't lock joints as this causes dimension mismatches in cuRobo.
-        Instead, we rely on collision sphere disabling to prevent interference.
+        Accepts target_pose as a world-frame tool pose and converts to planner frame.
         """
-        # Disable spheres for inactive links during planning
-        inactive_links = self._inactive_collision_links()
+        # Convert world tool pose to planner frame if needed
+        if isinstance(target_pose, torch.Tensor) and target_pose.shape == (4, 4):
+            # world->base using current robot base from env
+            base_pos = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(device=self.env.device, dtype=torch.float32)
+            base_rot = PoseUtils.matrix_from_quat(self.robot.data.root_quat_w[self.env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32))[0]
+            T_env_base = PoseUtils.make_pose(base_pos.unsqueeze(0), base_rot.unsqueeze(0))[0]
+            T_base_env = torch.linalg.inv(T_env_base)
+            target_pose_base_tool = (T_base_env @ target_pose.to(device=self.env.device, dtype=torch.float32)).clone()
+        else:
+            target_pose_base_tool = target_pose
 
+        inactive_links = self._inactive_collision_links()
         try:
-            # Temporarily disable collision checking for inactive links
             if inactive_links:
                 self.logger.debug(f"Disabling collision for {len(inactive_links)} inactive links")
                 self._set_active_links(inactive_links, active=False)
 
-            # Call parent planning method
             result = super().update_world_and_plan_motion(
-                target_pose=target_pose,
+                target_pose=target_pose_base_tool,
                 expected_attached_object=expected_attached_object,
                 env_id=env_id,
                 step_size=step_size,
                 enable_retiming=enable_retiming,
             )
-
             return result
-
         finally:
-            # Always restore collision checking
             if inactive_links:
                 self._set_active_links(inactive_links, active=True)
