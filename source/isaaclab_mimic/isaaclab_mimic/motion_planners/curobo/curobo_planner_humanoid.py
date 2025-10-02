@@ -33,6 +33,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         env_id: int = 0,
         active_joint_substrings: Iterable[str] = ("right_",),
         hand_link_substrings: Iterable[str] | None = None,
+        collision_active_link_substrings: Iterable[str] | None = None,
     ) -> None:
         """Initialize humanoid arm planner with arm-specific configuration.
 
@@ -43,12 +44,17 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             env_id: Environment ID
             active_joint_substrings: Substrings to identify active arm joints (e.g., ("right_",))
             hand_link_substrings: Substrings to identify hand links for collision filtering
+            collision_active_link_substrings: Optional substrings to force collision spheres to stay
+                active for links matching any of the substrings (e.g., ("left_", "right_"))
         """
         super().__init__(env=env, robot=robot, config=config, env_id=env_id)
 
         self.env_id = env_id
         self.active_joint_substrings = tuple(active_joint_substrings)
         self.hand_link_substrings = tuple(hand_link_substrings) if hand_link_substrings else None
+        self.collision_active_link_substrings = (
+            tuple(collision_active_link_substrings) if collision_active_link_substrings else None
+        )
 
         # Populate hand_link_names from substrings if provided
         if self.hand_link_substrings:
@@ -81,8 +87,24 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
 
         Mirrors demo_motion_planning's approach of selecting the kinematic chain for the chosen arm
         while retaining trunk links like waist/base/torso/pelvis.
+        If collision_active_link_substrings is set, links matching any of these substrings are kept
+        active in addition to trunk links.
         """
         all_links = list(self.robot_cfg["kinematics"]["collision_link_names"])
+
+        # Keep essential trunk/base links in the collision model
+        trunk_tokens = ("waist_", "base_link", "torso_", "pelvis_")
+        trunk_links = [link for link in all_links if any(t in link for t in trunk_tokens)]
+
+        # If explicitly provided, keep collisions active for these link subsets
+        if self.collision_active_link_substrings:
+            keep_links = [link for link in all_links if any(s in link for s in self.collision_active_link_substrings)]
+            # Preserve the configured attached object link if present
+            attached = getattr(self.config, "attached_object_link_name", None)
+            if attached and attached not in keep_links and attached in all_links:
+                keep_links.append(attached)
+            return list({*keep_links, *trunk_links})
+
         side = self._arm_side()
         if side is None:
             # Fallback: if side cannot be inferred, keep all links active
@@ -90,10 +112,6 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
 
         arm_token = f"{side}_"
         arm_links = [link for link in all_links if arm_token in link]
-
-        # Keep essential trunk/base links in the collision model
-        trunk_tokens = ("waist_", "base_link", "torso_", "pelvis_")
-        trunk_links = [link for link in all_links if any(t in link for t in trunk_tokens)]
 
         # Preserve the configured attached object link if present
         attached = getattr(self.config, "attached_object_link_name", None)
