@@ -16,9 +16,18 @@ parser.add_argument("--enable_pinocchio", action="store_true", default=False)
 
 parser.add_argument("--arm", type=str, default="right", choices=["right", "left", "both"])
 parser.add_argument("--goal", type=str, default="up", choices=["up", "lateral", "forward", "random"])
-parser.add_argument("--dz", type=float, default=0.05, help="Upward lift in meters (for 'up' goal).")
-parser.add_argument("--dx", type=float, default=0.05, help="Lateral motion in meters (for 'lateral' goal).")
-parser.add_argument("--dy", type=float, default=0.05, help="Forward motion in meters (for 'forward' goal).")
+# dz, dx, dy semantics:
+# - dz: upward offset in meters applied to target(s)
+# - dy: forward offset in meters (positive moves away from the torso in +Y)
+# - dx: for bimanual mode, half the lateral gap along X around the hand midpoint;
+#       total hand-to-hand separation becomes 2*|dx|. Negative dx makes the arms cross sides.
+parser.add_argument("--dz", type=float, default=0.05, help="Upward lift in meters.")
+parser.add_argument(
+    "--dx", type=float, default=0.05, help="Half lateral gap (bimanual) or lateral offset (single arm), in meters."
+)
+parser.add_argument("--dy", type=float, default=0.05, help="Forward offset in meters.")
+# Retiming: --retime_deg > 0 enables linear resampling of the joint path with approximately
+# uniform arc-length spacing of step_size = deg2rad(retime_deg). Use 0 to disable retiming.
 parser.add_argument("--retime_deg", type=float, default=1.0, help="Joint retime step (deg); 0 disables retiming.")
 parser.add_argument("--rest", type=int, default=10, help="Initial rest steps before planning.")
 parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
@@ -42,6 +51,7 @@ import os
 import tempfile
 import torch
 import yaml
+from dataclasses import replace as dc_replace
 from typing import Any, cast
 
 import isaaclab.utils.math as PoseUtils
@@ -219,7 +229,9 @@ def _build_env_and_planner(args_cli):
         inactive_joint_names = list(env_cfg.actions.pink_ik_cfg.ik_urdf_fixed_joint_names)
     except Exception:
         pass
-    robot_yaml = _build_temp_robot_yaml_from_usd(usd_path, args_cli.arm if args_cli.arm in ("left", "right") else "right", inactive_joints=inactive_joint_names)
+    robot_yaml = _build_temp_robot_yaml_from_usd(
+        usd_path, args_cli.arm if args_cli.arm in ("left", "right") else "right", inactive_joints=inactive_joint_names
+    )
     print(f"[PlanHumanoid] Generated cuRobo robot YAML: {robot_yaml}")
 
     print("[PlanHumanoid] Creating env...")
@@ -256,7 +268,9 @@ def _build_env_and_planner(args_cli):
         hand_link_substrings = ("GR1T2_fourier_hand_6dof_right_",)
     else:
         active_joint_substrings = ("left_",) if args_cli.arm == "left" else ("right_",)
-        hand_link_substrings = ("GR1T2_fourier_hand_6dof_left_",) if args_cli.arm == "left" else ("GR1T2_fourier_hand_6dof_right_",)
+        hand_link_substrings = (
+            ("GR1T2_fourier_hand_6dof_left_",) if args_cli.arm == "left" else ("GR1T2_fourier_hand_6dof_right_",)
+        )
 
     print("[PlanHumanoid] Creating planner...")
     robot = env.scene["robot"]
@@ -339,6 +353,8 @@ def _build_env_and_planners_both(args_cli):
 
     print("[PlanHumanoid] Creating planners for both arms...")
     try:
+        # Note: collision_active_link_substrings keeps collision spheres enabled for both arms
+        # during planning, so each arm's plan respects the other arm's geometry.
         planner_right = HumanoidArmCuroboPlanner(
             env=env,
             robot=robot,
@@ -479,11 +495,11 @@ def _visualize_goal(args_cli, target_pose_env_site, env, eef_name):
         viz_path_goal = "/World/Visuals/goal_pose_marker"
         viz_path_ee = "/World/Visuals/ee_pose_marker"
 
-        frame_cfg_goal = FRAME_MARKER_CFG.replace(prim_path=viz_path_goal)
-        frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)
+        frame_cfg_goal = dc_replace(FRAME_MARKER_CFG, prim_path=viz_path_goal)
+        # frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
 
-        frame_cfg_ee = FRAME_MARKER_CFG.replace(prim_path=viz_path_ee)
-        frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)
+        frame_cfg_ee = dc_replace(FRAME_MARKER_CFG, prim_path=viz_path_ee)
+        # frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
 
         goal_pose_visualizer = VisualizationMarkers(frame_cfg_goal)
         ee_pose_visualizer = VisualizationMarkers(frame_cfg_ee)
@@ -517,16 +533,16 @@ def _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_
         viz_ee_l = "/World/Visuals/ee_pose_marker_left"
 
         # Goal markers
-        frame_goal_r = FRAME_MARKER_CFG.replace(prim_path=viz_goal_r)
-        frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)
-        frame_goal_l = FRAME_MARKER_CFG.replace(prim_path=viz_goal_l)
-        frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)
+        frame_goal_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_r)
+        # frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_l)
+        # frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
 
         # EE markers
-        frame_ee_r = FRAME_MARKER_CFG.replace(prim_path=viz_ee_r)
-        frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)
-        frame_ee_l = FRAME_MARKER_CFG.replace(prim_path=viz_ee_l)
-        frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)
+        frame_ee_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_r)
+        # frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_l)
+        # frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
 
         goal_vis_r = VisualizationMarkers(frame_goal_r)
         goal_vis_l = VisualizationMarkers(frame_goal_l)
@@ -535,9 +551,13 @@ def _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_
 
         # Visualize goal frames
         goal_pos_r = target_pose_env_site_r[:3, 3].detach().to(dtype=torch.float32)
-        goal_quat_r = PoseUtils.quat_from_matrix(target_pose_env_site_r[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+        goal_quat_r = (
+            PoseUtils.quat_from_matrix(target_pose_env_site_r[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+        )
         goal_pos_l = target_pose_env_site_l[:3, 3].detach().to(dtype=torch.float32)
-        goal_quat_l = PoseUtils.quat_from_matrix(target_pose_env_site_l[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+        goal_quat_l = (
+            PoseUtils.quat_from_matrix(target_pose_env_site_l[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+        )
         goal_vis_r.visualize(translations=goal_pos_r.unsqueeze(0), orientations=goal_quat_r.unsqueeze(0))
         goal_vis_l.visualize(translations=goal_pos_l.unsqueeze(0), orientations=goal_quat_l.unsqueeze(0))
 
@@ -557,7 +577,9 @@ def _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_
         return None, None
 
 
-def _execute_plan(env, robot, planner, env_origin, site_from_curobo, eef_name, args_cli, ee_pose_visualizer, active_arm=None):
+def _execute_plan(
+    env, robot, planner, env_origin, site_from_curobo, eef_name, args_cli, ee_pose_visualizer, active_arm=None
+):
     # Get planned poses
     print(f"Current plan in joint space: {planner.current_plan}")
     planned_poses = planner.get_planned_poses()
@@ -661,10 +683,16 @@ def _execute_plan(env, robot, planner, env_origin, site_from_curobo, eef_name, a
     planner.clear()
 
 
-def _build_site_goal_bimanual(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_site_goal_bimanual(
+    ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Build paired goals for both arms in site/world frame so hands are close together in front.
 
-    Uses args dx as lateral half-gap, dy as forward offset, dz as upward offset from current sites.
+    Logic:
+    - Compute the current midpoint between hands; shift it by +dy (forward) and +dz (up).
+    - Place right and left targets symmetrically at ±dx along X about that midpoint, so total
+      hand-to-hand separation is 2*|dx|. If dx < 0, the arms cross to opposite sides.
+    - Keep orientations unchanged (position-only offsets).
     """
     # Clone poses
     goal_r = ctrl_site_env_r.clone()
@@ -689,11 +717,16 @@ def _build_site_goal_bimanual(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: to
     goal_r[0, 3] = goal_r[0, 3] + half_gap
     goal_l[0, 3] = goal_l[0, 3] - half_gap
 
-    print(f"[PlanHumanoid] Bimanual goals | mid={target_mid.cpu().numpy()} | gap={2*half_gap:.3f}m, forward={forward:.3f}m, up={upward:.3f}m")
+    print(
+        f"[PlanHumanoid] Bimanual goals | mid={target_mid.cpu().numpy()} | gap={2*half_gap:.3f}m,"
+        f" forward={forward:.3f}m, up={upward:.3f}m"
+    )
     return goal_r, goal_l
 
 
-def _execute_plans_together(env, robot, planner_r, planner_l, env_origin, site_from_r, site_from_l, args_cli, ee_vis_r=None, ee_vis_l=None):
+def _execute_plans_together(
+    env, robot, planner_r, planner_l, env_origin, site_from_r, site_from_l, args_cli, ee_vis_r=None, ee_vis_l=None
+):
     print("[PlanHumanoid] Executing bimanual plans together...")
     planned_r = planner_r.get_planned_poses()
     planned_l = planner_l.get_planned_poses()
@@ -719,7 +752,9 @@ def _execute_plans_together(env, robot, planner_r, planner_l, env_origin, site_f
             base_rot_world_exec = PoseUtils.matrix_from_quat(
                 robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
             )[0]
-            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[0]
+            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[
+                0
+            ]
 
             # Get targets for this step (use last waypoint if shorter)
             pose_r_bt = planned_r[min(idx, len(planned_r) - 1)]
@@ -776,23 +811,25 @@ def main():
         env, robot, planner_right, planner_left = _build_env_and_planners_both(args_cli)
 
         # Frames and calibration per arm
-        env_origin_r, ctrl_site_env_r, T_world_base_r, T_world_tool_now_r, site_from_curobo_r = _compute_world_and_site_frames(
-            env, robot, planner_right, "right"
+        env_origin_r, ctrl_site_env_r, T_world_base_r, T_world_tool_now_r, site_from_curobo_r = (
+            _compute_world_and_site_frames(env, robot, planner_right, "right")
         )
-        env_origin_l, ctrl_site_env_l, T_world_base_l, T_world_tool_now_l, site_from_curobo_l = _compute_world_and_site_frames(
-            env, robot, planner_left, "left"
+        env_origin_l, ctrl_site_env_l, T_world_base_l, T_world_tool_now_l, site_from_curobo_l = (
+            _compute_world_and_site_frames(env, robot, planner_left, "left")
         )
 
         # Build paired goals for arms
         env_device = cast(Any, env).device
-        target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_bimanual(ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device)
+        target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_bimanual(
+            ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
+        )
 
         site_inv_r = torch.linalg.inv(site_from_curobo_r)
         site_inv_l = torch.linalg.inv(site_from_curobo_l)
         target_world_tool_r = (target_pose_env_site_r @ site_inv_r).clone()
         target_world_tool_l = (target_pose_env_site_l @ site_inv_l).clone()
 
-        # Configure retiming
+        # Configure retiming (see flag description): deg->rad step size; None disables retiming
         step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
 
         # Plan sequentially (both arms active in collisions)
@@ -839,7 +876,7 @@ def main():
     site_inv = torch.linalg.inv(site_from_curobo)
     target_world_tool = (target_pose_env_site @ site_inv).clone()
 
-    # Configure retiming
+    # Configure retiming (see flag description): deg->rad step size; None disables retiming
     step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
 
     # Plan
