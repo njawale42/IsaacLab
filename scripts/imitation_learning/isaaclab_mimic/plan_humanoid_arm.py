@@ -5,6 +5,7 @@
 
 # #!/usr/bin/env python3
 import argparse
+import traceback
 
 from isaaclab.app import AppLauncher
 
@@ -21,11 +22,11 @@ parser.add_argument("--dy", type=float, default=0.05, help="Forward motion in me
 parser.add_argument("--retime_deg", type=float, default=1.0, help="Joint retime step (deg); 0 disables retiming.")
 parser.add_argument("--rest", type=int, default=10, help="Initial rest steps before planning.")
 parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-parser.add_argument("--replay_trials", type=int, default=10, help="Number of trials to replay.")
+parser.add_argument("--replay_trials", type=int, default=2, help="Number of trials to replay.")
 parser.add_argument("--visualize_goal", action="store_true", help="Visualize target EE pose marker.")
 
 
-# append AppLauncher cli args and parse
+# Append AppLauncher cli args and parse
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.enable_pinocchio:
@@ -41,8 +42,8 @@ import os
 import tempfile
 import torch
 import yaml
+from typing import Any, cast
 
-# from isaaclab_mimic.datagen.generation import setup_env_config
 import isaaclab.utils.math as PoseUtils
 
 # Controller utils to convert USD->URDF
@@ -195,10 +196,8 @@ def generate_goal_pose(current_pose: torch.Tensor, goal_type: str, args) -> torc
     return target_pose
 
 
-def main():
-    np.random.seed(42)
-    torch.manual_seed(42)
-
+def _build_env_and_planner(args_cli):
+    """Create env, planner config, env, robot, and planner. Preserve logging."""
     # Load environment
     env_name = "Isaac-PickPlace-GR1T2-Abs-Mimic-v0"
     print(f"[PlanHumanoid] Env: {env_name}")
@@ -272,15 +271,17 @@ def main():
             hand_link_substrings=hand_link_substrings,
         )
     except Exception as e:
-        import traceback
-
         traceback.print_exc()
         print(f"[PlanHumanoid] Error creating planner: {e}")
         raise e
     print("[PlanHumanoid] Planner ready.")
 
+    return env, robot, planner
+
+
+def _compute_world_and_site_frames(env, robot, planner, eef_name: str):
+    """Compute ctrl site (world), env origin, T_W_B, T_W_T, and T_T_S mapping."""
     # Controller EEF pose (world/env-origin frame)
-    eef_name = args_cli.arm  # "left" or "right"
     ctrl_site_env = env.get_robot_eef_pose(eef_name)[0].to(device=env.device, dtype=torch.float32)
 
     # Env origin
@@ -292,15 +293,20 @@ def main():
     ee_pose_cu = planner.get_ee_pose(cu_js)
     pos = planner._to_env_device(ee_pose_cu.position).reshape(-1, 3)[0]
     cu_quat = planner._to_env_device(getattr(ee_pose_cu, "quaternion", ee_pose_cu.get_rotation())).reshape(-1, 4)[0]
+    # FK: tool pose in base frame (T_B_T)
     rot = PoseUtils.matrix_from_quat(cu_quat.unsqueeze(0))[0]
     T_base_tool_now = PoseUtils.make_pose(pos.unsqueeze(0), rot.unsqueeze(0))[0]
 
+    # Base pose in world (env-origin) (T_W_B)
     base_pos_world = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
-    base_rot_world = PoseUtils.matrix_from_quat(robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32))[0]
+    base_rot_world = PoseUtils.matrix_from_quat(
+        robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
+    )[0]
     T_world_base = PoseUtils.make_pose(base_pos_world.unsqueeze(0), base_rot_world.unsqueeze(0))[0]
+    # Compose: tool in world (T_W_T = T_W_B @ T_B_T)
     T_world_tool_now = (T_world_base @ T_base_tool_now).clone()
 
-    # Transform from cuRobo tool (world) -> controller site (world)
+    # Calibrate mapping tool->site (T_T_S = inv(T_W_T) @ T_W_S)
     site_from_curobo = torch.linalg.solve(T_world_tool_now, ctrl_site_env)
 
     # Mapping sanity check
@@ -315,26 +321,29 @@ def main():
     print(f"Position: {T_world_tool_now[:3, 3].cpu().numpy()}")
     print(f"Rotation:\n{T_world_tool_now[:3, :3].cpu().numpy()}")
 
-    # Build goal in controller site (world/env-origin) frame
+    return env_origin, ctrl_site_env, T_world_base, T_world_tool_now, site_from_curobo
+
+
+def _build_site_goal(ctrl_site_env: torch.Tensor, args_cli, device) -> torch.Tensor:
+    """Build goal in controller site (world/env-origin) frame (T_W_S_goal)."""
     target_pose_env_site = ctrl_site_env.clone()
     if args_cli.goal == "up":
         target_pose_env_site[2, 3] = target_pose_env_site[2, 3] + float(args_cli.dz)
         print(f"[PlanHumanoid] Goal: Move up by {args_cli.dz}m (site world)")
-    elif args_cli.goal == "forward":
+    elif args_cli.goal == "lateral":
         target_pose_env_site[0, 3] = target_pose_env_site[0, 3] + float(args_cli.dx)
-        print(f"[PlanHumanoid] Goal: Move forward by {args_cli.dx}m (site world)")
+        print(f"[PlanHumanoid] Goal: Move laterally by {args_cli.dx}m (site world)")
+    elif args_cli.goal == "forward":
+        target_pose_env_site[1, 3] = target_pose_env_site[1, 3] + float(args_cli.dy)
+        print(f"[PlanHumanoid] Goal: Move forward by {args_cli.dy}m (site world)")
     elif args_cli.goal == "random":
-        offset = torch.randn(3, device=env.device, dtype=torch.float32) * 0.05
+        offset = torch.randn(3, device=device, dtype=torch.float32) * 0.05
         target_pose_env_site[:3, 3] = target_pose_env_site[:3, 3] + offset
         print(f"[PlanHumanoid] Goal: Random world offset {offset.cpu().numpy()}")
+    return target_pose_env_site
 
-    # Convert site goal -> tool goal (world)
-    site_inv = torch.linalg.inv(site_from_curobo)
-    target_world_tool = (target_pose_env_site @ site_inv).clone()
 
-    # Configure retiming
-    step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
-
+def _plan_motion(planner, target_world_tool: torch.Tensor, step_size: float | None) -> bool:
     print(f"target_pose (world tool frame for cuRobo): {target_world_tool}")
     print("[PlanHumanoid] Planning...")
     try:
@@ -352,84 +361,71 @@ def main():
         print(f"[PlanHumanoid] Error planning: {e}")
         raise e
     print(f"[PlanHumanoid] Plan success: {ok}")
-    if not ok:
-        print("Planning failed.")
-        return
+    return ok
 
-    # Diagnostics: compare planned last waypoint (world tool) to target site
+
+def _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, env):
     try:
         planned_poses = planner.get_planned_poses()
         if len(planned_poses) > 0:
-            # planned poses are in planner frame (base). Map to world.
+            # planned poses are in planner frame (base). Map to world (T_W_T = T_W_B @ T_B_T)
             last_world_tool = (T_world_base @ planned_poses[-1].to(device=env.device, dtype=torch.float32)).clone()
+            # then to site/world (T_W_S = T_W_T @ T_T_S)
             last_world_site = (last_world_tool @ site_from_curobo).clone()
             goal_pos_err = torch.linalg.vector_norm(last_world_site[:3, 3] - target_pose_env_site[:3, 3]).item()
             goal_rot_err_mat = last_world_site[:3, :3].T @ target_pose_env_site[:3, :3]
             goal_rot_err_trace = torch.clamp((torch.trace(goal_rot_err_mat) - 1.0) / 2.0, -1.0, 1.0)
             goal_rot_err = torch.acos(goal_rot_err_trace).item()
-            print(f"[PlanHumanoid] Planned final vs goal (world site) | pos_err={goal_pos_err:.4e} m | rot_err={goal_rot_err:.4e} rad")
+            print(
+                f"[PlanHumanoid] Planned final vs goal (world site) | pos_err={goal_pos_err:.4e} m |"
+                f" rot_err={goal_rot_err:.4e} rad"
+            )
     except Exception as e:
         print(f"[PlanHumanoid] Planned-goal diagnostics failed: {e}")
 
-    # Visualize goal pose
-    if args_cli.visualize_goal:
-        try:
-            # Use a fresh instancer prim path each run to avoid stale Prototypes rel
-            viz_path_goal = "/World/Visuals/goal_pose_marker"
-            viz_path_ee = "/World/Visuals/ee_pose_marker"
 
-            frame_cfg_goal = FRAME_MARKER_CFG.copy()
-            frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)
-            frame_cfg_goal = frame_cfg_goal.replace(prim_path=viz_path_goal)
+def _visualize_goal(args_cli, target_pose_env_site, env, eef_name):
+    if not args_cli.visualize_goal:
+        return None
+    try:
+        # Use a fresh instancer prim path each run to avoid stale Prototypes rel
+        viz_path_goal = "/World/Visuals/goal_pose_marker"
+        viz_path_ee = "/World/Visuals/ee_pose_marker"
 
-            frame_cfg_ee = FRAME_MARKER_CFG.copy()
-            frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)
-            frame_cfg_ee = frame_cfg_ee.replace(prim_path=viz_path_ee)
+        frame_cfg_goal = FRAME_MARKER_CFG.copy()
+        frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)
+        frame_cfg_goal = frame_cfg_goal.replace(prim_path=viz_path_goal)
 
-            goal_pose_visualizer = VisualizationMarkers(frame_cfg_goal)
-            ee_pose_visualizer = VisualizationMarkers(frame_cfg_ee)
+        frame_cfg_ee = FRAME_MARKER_CFG.copy()
+        frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)
+        frame_cfg_ee = frame_cfg_ee.replace(prim_path=viz_path_ee)
 
-            goal_pos = target_pose_env_site[:3, 3].detach().to(dtype=torch.float32)
-            goal_quat = PoseUtils.quat_from_matrix(target_pose_env_site[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+        goal_pose_visualizer = VisualizationMarkers(frame_cfg_goal)
+        ee_pose_visualizer = VisualizationMarkers(frame_cfg_ee)
 
-            # Current EE pose marker at time of planning
-            cur_eef_pose = env.get_robot_eef_pose(eef_name)[0].to(device=env.device, dtype=torch.float32)
-            cur_pos = cur_eef_pose[:3, 3].detach()
-            cur_quat = PoseUtils.quat_from_matrix(cur_eef_pose[:3, :3].unsqueeze(0))[0].detach()
+        goal_pos = target_pose_env_site[:3, 3].detach().to(dtype=torch.float32)
+        goal_quat = (
+            PoseUtils.quat_from_matrix(target_pose_env_site[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+        )
 
-            goal_pose_visualizer.visualize(translations=goal_pos.unsqueeze(0), orientations=goal_quat.unsqueeze(0))
-            ee_pose_visualizer.visualize(translations=cur_pos.unsqueeze(0), orientations=cur_quat.unsqueeze(0))
-        except Exception as e:
-            print(f"[PlanHumanoid] Goal visualization failed: {e}")
+        # Current EE pose marker at time of planning
+        cur_eef_pose = env.get_robot_eef_pose(eef_name)[0].to(device=env.device, dtype=torch.float32)
+        cur_pos = cur_eef_pose[:3, 3].detach()
+        cur_quat = PoseUtils.quat_from_matrix(cur_eef_pose[:3, :3].unsqueeze(0))[0].detach()
 
+        goal_pose_visualizer.visualize(translations=goal_pos.unsqueeze(0), orientations=goal_quat.unsqueeze(0))
+        ee_pose_visualizer.visualize(translations=cur_pos.unsqueeze(0), orientations=cur_quat.unsqueeze(0))
+        return ee_pose_visualizer
+    except Exception as e:
+        print(f"[PlanHumanoid] Goal visualization failed: {e}")
+        return None
+
+
+def _execute_plan(env, robot, planner, env_origin, site_from_curobo, eef_name, args_cli, ee_pose_visualizer):
     # Get planned poses
     print(f"Current plan in joint space: {planner.current_plan}")
     planned_poses = planner.get_planned_poses()
     print(f"[PlanHumanoid] Generated {len(planned_poses)} waypoints")
-
-    # # Visualize planned path as a spline in world space (site frame)
-    # try:
-    #     from isaacsim.util.debug_draw import _debug_draw
-    #     draw = _debug_draw.acquire_debug_draw_interface()
-    #     waypoint_points = []
-    #     for _p in planned_poses:
-    #         if _p.dim() == 3 and _p.size(0) == 1:
-    #             _p = _p[0]
-    #         _p = _p.to(device=env.device, dtype=torch.float32)
-    #         # Map base tool -> world tool, then to controller site
-    #         _p_world = (T_world_base @ _p).clone()
-    #         _p_env = (_p_world @ site_from_curobo).clone()
-    #         _p_env[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
-    #         waypoint_points.append((
-    #             float(_p_env[0, 3].item()),
-    #             float(_p_env[1, 3].item()),
-    #             float(_p_env[2, 3].item()),
-    #         ))
-    #     if len(waypoint_points) >= 2:
-    #         # color: cyan, thickness: 6, cyclic: False
-    #         draw.draw_lines_spline(waypoint_points, (0.0, 0.8, 1.0, 1.0), 6, False)
-    # except Exception as e:
-    #     print(f"[PlanHumanoid] Debug draw for planned path failed: {e}")
 
     if len(planned_poses) == 0:
         print("[PlanHumanoid] No waypoints generated!")
@@ -446,7 +442,7 @@ def main():
         idle = idle.to(dtype=torch.float32)
     idle = idle.to(device=env.device)
 
-    # Helper: build a 4x4 pose from idle slices for a given arm
+    # Helper: build a 4x4 pose from idle slices for a given arm (T_W_S from pos, quat)
     def _pose_from_idle(_idle: torch.Tensor, arm: str) -> torch.Tensor:
         if arm == "left":
             pos = _idle[0:3]
@@ -469,11 +465,15 @@ def main():
             if target_ee_pose.dim() == 3 and target_ee_pose.size(0) == 1:
                 target_ee_pose = target_ee_pose[0]
             target_ee_pose = target_ee_pose.to(device=env.device, dtype=torch.float32)
-            # Recompute base pose after reset (defensive for mobile variants)
+            # Recompute base pose after reset (defensive for mobile variants): T_W_B_exec
             base_pos_world_exec = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
-            base_rot_world_exec = PoseUtils.matrix_from_quat(robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32))[0]
-            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[0]
-            # Map base tool -> world tool, then to controller site
+            base_rot_world_exec = PoseUtils.matrix_from_quat(
+                robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
+            )[0]
+            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[
+                0
+            ]
+            # Map base->tool to world->tool, then to site/world (T_W_T = T_W_B_exec @ T_B_T; T_W_S = T_W_T @ T_T_S)
             target_world_tool = (T_world_base_exec @ target_ee_pose).clone()
             target_ee_pose = (target_world_tool @ site_from_curobo).clone()
             target_ee_pose[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
@@ -493,7 +493,7 @@ def main():
                 action = action.unsqueeze(0)
             action = action.to(device=env.device, dtype=torch.float32)
 
-            # Verify action maps back to intended target
+            # Verify action maps back to intended target (error in site/world)
             try:
                 inferred_targets = env.action_to_target_eef_pose(action)
                 inf_pose = inferred_targets["right" if args_cli.arm == "right" else "left"][0].to(device=env.device)
@@ -502,11 +502,14 @@ def main():
                 inf_rot_err_trace = torch.clamp((torch.trace(inf_rot_err_mat) - 1.0) / 2.0, -1.0, 1.0)
                 inf_rot_err = torch.acos(inf_rot_err_trace).item()
                 if (idx == 0) or ((idx + 1) % 25 == 0) or (idx == len(planned_poses) - 1):
-                    print(f"[PlanHumanoid] Action inversion check | pos_err={inf_pos_err:.4e} m | rot_err={inf_rot_err:.4e} rad")
+                    print(
+                        f"[PlanHumanoid] Action inversion check | pos_err={inf_pos_err:.4e} m |"
+                        f" rot_err={inf_rot_err:.4e} rad"
+                    )
             except Exception as e:
                 print(f"[PlanHumanoid] action_to_target_eef_pose check failed: {e}")
 
-            if args_cli.visualize_goal:
+            if args_cli.visualize_goal and ee_pose_visualizer is not None:
                 cur_eef_pose = env.get_robot_eef_pose(eef_name)[0].to(device=env.device, dtype=torch.float32)
                 cur_pos = cur_eef_pose[:3, 3].detach()
                 cur_quat = PoseUtils.quat_from_matrix(cur_eef_pose[:3, :3].unsqueeze(0))[0].detach()
@@ -516,6 +519,47 @@ def main():
 
             if (idx + 1) % 10 == 0 or idx == 0 or idx == len(planned_poses) - 1:
                 print(f"[PlanHumanoid] Step {idx + 1}/{len(planned_poses)}")
+
+    planner.plan_visualizer.close()
+    planner.clear()
+
+
+def main():
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    # Build env and planner
+    env, robot, planner = _build_env_and_planner(args_cli)
+
+    # Frames and calibration
+    eef_name = args_cli.arm  # "left" or "right"
+    env_origin, ctrl_site_env, T_world_base, T_world_tool_now, site_from_curobo = _compute_world_and_site_frames(
+        env, robot, planner, eef_name
+    )
+
+    # Build goal in site/world and convert to tool/world
+    env_device = cast(Any, env).device
+    target_pose_env_site = _build_site_goal(ctrl_site_env, args_cli, env_device)
+    site_inv = torch.linalg.inv(site_from_curobo)
+    target_world_tool = (target_pose_env_site @ site_inv).clone()
+
+    # Configure retiming
+    step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
+
+    # Plan
+    ok = _plan_motion(planner, target_world_tool, step_size)
+    if not ok:
+        print("Planning failed.")
+        return
+
+    # Diagnostics
+    _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, env)
+
+    # Visualize goal and current EE pose
+    ee_pose_visualizer = _visualize_goal(args_cli, target_pose_env_site, env, eef_name)
+
+    # Execute
+    _execute_plan(env, robot, planner, env_origin, site_from_curobo, eef_name, args_cli, ee_pose_visualizer)
 
 
 if __name__ == "__main__":

@@ -10,9 +10,10 @@ from collections.abc import Iterable
 
 from curobo.types.state import JointState
 
+import isaaclab.utils.math as PoseUtils
+
 from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
-import isaaclab.utils.math as PoseUtils
 
 
 class HumanoidArmCuroboPlanner(CuroboPlanner):
@@ -124,7 +125,11 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         low, high = limits[0], limits[1]
         margin = 1e-4
 
-        pos_tensor = js.position if isinstance(js.position, torch.Tensor) else torch.tensor(js.position, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+        pos_tensor = (
+            js.position
+            if isinstance(js.position, torch.Tensor)
+            else torch.tensor(js.position, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+        )
         pos = torch.clamp(pos_tensor, low + margin, high - margin)
         if not torch.allclose(pos, pos_tensor):
             self.logger.debug("Clamped start state within joint limits")
@@ -153,8 +158,12 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         # Convert world tool pose to planner frame if needed
         if isinstance(target_pose, torch.Tensor) and target_pose.shape == (4, 4):
             # world->base using current robot base from env
-            base_pos = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(device=self.env.device, dtype=torch.float32)
-            base_rot = PoseUtils.matrix_from_quat(self.robot.data.root_quat_w[self.env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32))[0]
+            base_pos = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(
+                device=self.env.device, dtype=torch.float32
+            )
+            base_rot = PoseUtils.matrix_from_quat(
+                self.robot.data.root_quat_w[self.env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32)
+            )[0]
             T_env_base = PoseUtils.make_pose(base_pos.unsqueeze(0), base_rot.unsqueeze(0))[0]
             T_base_env = torch.linalg.inv(T_env_base)
             target_pose_base_tool = (T_base_env @ target_pose.to(device=self.env.device, dtype=torch.float32)).clone()
