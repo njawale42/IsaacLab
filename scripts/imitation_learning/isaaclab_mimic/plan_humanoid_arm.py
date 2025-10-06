@@ -496,10 +496,10 @@ def _visualize_goal(args_cli, target_pose_env_site, env, eef_name):
         viz_path_ee = "/World/Visuals/ee_pose_marker"
 
         frame_cfg_goal = dc_replace(FRAME_MARKER_CFG, prim_path=viz_path_goal)
-        # frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)
 
         frame_cfg_ee = dc_replace(FRAME_MARKER_CFG, prim_path=viz_path_ee)
-        # frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)
 
         goal_pose_visualizer = VisualizationMarkers(frame_cfg_goal)
         ee_pose_visualizer = VisualizationMarkers(frame_cfg_ee)
@@ -534,15 +534,15 @@ def _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_
 
         # Goal markers
         frame_goal_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_r)
-        # frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)
         frame_goal_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_l)
-        # frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)
 
         # EE markers
         frame_ee_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_r)
-        # frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)
         frame_ee_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_l)
-        # frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)
 
         goal_vis_r = VisualizationMarkers(frame_goal_r)
         goal_vis_l = VisualizationMarkers(frame_goal_l)

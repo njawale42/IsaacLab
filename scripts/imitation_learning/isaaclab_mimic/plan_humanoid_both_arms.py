@@ -28,12 +28,35 @@ parser.add_argument(
 parser.add_argument("--dy", type=float, default=0.05, help="Forward offset in meters.")
 # Retiming: --retime_deg > 0 enables linear resampling of the joint path with approximately
 # uniform arc-length spacing of step_size = deg2rad(retime_deg). Use 0 to disable retiming.
-parser.add_argument("--retime_deg", type=float, default=1.0, help="Joint retime step (deg); 0 disables retiming.")
+parser.add_argument("--retime_deg", type=float, default=0.0, help="Joint retime step (deg); 0 disables retiming.")
 parser.add_argument("--rest", type=int, default=10, help="Initial rest steps before planning.")
 parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
 parser.add_argument("--replay_trials", type=int, default=2, help="Number of trials to replay.")
 parser.add_argument("--visualize_goal", action="store_true", help="Visualize target EE pose marker.")
-
+parser.add_argument("--collision_aware", action="store_true", help="Enable collision-aware retiming for bimanual.")
+parser.add_argument(
+    "--collision_distance", type=float, default=0.05, help="EE proximity threshold (m) to mark a pair as colliding."
+)
+# Optional per-arm overrides: when provided, independent goals are used instead of symmetric bimanual ones
+parser.add_argument(
+    "--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set."
+)
+parser.add_argument(
+    "--right_dy", type=float, default=None, help="Right arm Y offset (site/world). Overrides --dy if set."
+)
+parser.add_argument(
+    "--right_dz", type=float, default=None, help="Right arm Z offset (site/world). Overrides --dz if set."
+)
+parser.add_argument(
+    "--left_dx", type=float, default=None, help="Left arm X offset (site/world). Overrides --dx if set."
+)
+parser.add_argument(
+    "--left_dy", type=float, default=None, help="Left arm Y offset (site/world). Overrides --dy if set."
+)
+parser.add_argument(
+    "--left_dz", type=float, default=None, help="Left arm Z offset (site/world). Overrides --dz if set."
+)
+# parser.add_argument("--headless", action="store_true", help="Headless mode.")
 
 # Append AppLauncher cli args and parse
 AppLauncher.add_app_launcher_args(parser)
@@ -53,6 +76,8 @@ import torch
 import yaml
 from dataclasses import replace as dc_replace
 from typing import Any, cast
+
+from nvplan.applications.custream.retime import retime_paths
 
 import isaaclab.utils.math as PoseUtils
 
@@ -362,7 +387,7 @@ def _build_env_and_planners_both(args_cli):
             env_id=0,
             active_joint_substrings=("right_",),
             hand_link_substrings=("GR1T2_fourier_hand_6dof_right_",),
-            collision_active_link_substrings=("left_", "right_"),
+            collision_active_link_substrings=("GR1T2_fourier_hand_6dof_left_", "GR1T2_fourier_hand_6dof_right_"),
         )
         planner_left = HumanoidArmCuroboPlanner(
             env=env,
@@ -371,7 +396,7 @@ def _build_env_and_planners_both(args_cli):
             env_id=0,
             active_joint_substrings=("left_",),
             hand_link_substrings=("GR1T2_fourier_hand_6dof_left_",),
-            collision_active_link_substrings=("left_", "right_"),
+            collision_active_link_substrings=("GR1T2_fourier_hand_6dof_left_", "GR1T2_fourier_hand_6dof_right_"),
         )
     except Exception as e:
         traceback.print_exc()
@@ -487,6 +512,67 @@ def _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, 
         print(f"[PlanHumanoid] Planned-goal diagnostics failed: {e}")
 
 
+def _compute_colliding_pairs_ee(planned_r, planned_l, T_world_base, threshold: float, device) -> list[tuple[int, int]]:
+    """Compute colliding pairs (i,j) using EE proximity in world frame.
+
+    A pair is marked colliding if the Euclidean distance between EE positions is below `threshold`.
+    """
+    # Convert base->tool to world->tool using current T_world_base
+    world_tools_r = [(T_world_base @ p.to(device=device, dtype=torch.float32)) for p in planned_r]
+    world_tools_l = [(T_world_base @ p.to(device=device, dtype=torch.float32)) for p in planned_l]
+    pos_r = torch.stack([w[:3, 3] for w in world_tools_r], dim=0)
+    pos_l = torch.stack([w[:3, 3] for w in world_tools_l], dim=0)
+
+    # Compute pairwise distances via broadcasting
+    # pos_r: [Nr,3], pos_l: [Nl,3] -> distances [Nr, Nl]
+    diff = pos_r.unsqueeze(1) - pos_l.unsqueeze(0)
+    dists = torch.linalg.norm(diff, dim=-1)
+    colliding = dists <= threshold
+    pairs = torch.nonzero(colliding, as_tuple=False)
+    return [(int(i.item()), int(j.item())) for i, j in pairs]
+
+
+def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple[int, int]], min_dt: float = 0.05):
+    """Build retimed schedules (times) for both paths using MILP-based retime.
+
+    Returns two lists of times (seconds) aligned to each waypoint index for each path.
+    """
+
+    def _compress_pairs_min_j(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        # Keep only the smallest j for each i (strict minimal collisions)
+        min_j = {}
+        for i, j in pairs:
+            if (i not in min_j) or (j < min_j[i]):
+                min_j[i] = j
+        return [(i, j) for i, j in min_j.items()]
+
+    def _cap_pairs(pairs: list[tuple[int, int]], limit: int = 1000) -> list[tuple[int, int]]:
+        if len(pairs) <= limit:
+            return pairs
+        step = max(1, len(pairs) // limit)
+        return pairs[::step]
+
+    path1 = [None] * len_r
+    path2 = [None] * len_l
+    try:
+        t1, t2 = retime_paths(
+            path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.0, verbose=False
+        )
+        return t1, t2
+    except AssertionError:
+        # Retry with reduced constraints and larger dt
+        reduced = _compress_pairs_min_j(colliding_pairs)
+        reduced = _cap_pairs(reduced, limit=500)
+        larger_dt = max(min_dt * 2.0, 0.1)
+        try:
+            t1, t2 = retime_paths(
+                path1, path2, colliding=reduced, linear=True, min_dt=larger_dt, buffer=0.0, verbose=False
+            )
+            return t1, t2
+        except AssertionError:
+            return None
+
+
 def _visualize_goal(args_cli, target_pose_env_site, env, eef_name):
     if not args_cli.visualize_goal:
         return None
@@ -496,10 +582,10 @@ def _visualize_goal(args_cli, target_pose_env_site, env, eef_name):
         viz_path_ee = "/World/Visuals/ee_pose_marker"
 
         frame_cfg_goal = dc_replace(FRAME_MARKER_CFG, prim_path=viz_path_goal)
-        # frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_cfg_goal.markers["frame"].scale = (0.1, 0.1, 0.1)
 
         frame_cfg_ee = dc_replace(FRAME_MARKER_CFG, prim_path=viz_path_ee)
-        # frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_cfg_ee.markers["frame"].scale = (0.08, 0.08, 0.08)
 
         goal_pose_visualizer = VisualizationMarkers(frame_cfg_goal)
         ee_pose_visualizer = VisualizationMarkers(frame_cfg_ee)
@@ -534,15 +620,15 @@ def _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_
 
         # Goal markers
         frame_goal_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_r)
-        # frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
         frame_goal_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_l)
-        # frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
 
         # EE markers
         frame_ee_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_r)
-        # frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
         frame_ee_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_l)
-        # frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
 
         goal_vis_r = VisualizationMarkers(frame_goal_r)
         goal_vis_l = VisualizationMarkers(frame_goal_l)
@@ -697,26 +783,21 @@ def _build_site_goal_bimanual(
     # Clone poses
     goal_r = ctrl_site_env_r.clone()
     goal_l = ctrl_site_env_l.clone()
-
     # Current mid-point between the two hands
     cur_mid = 0.5 * (ctrl_site_env_r[:3, 3] + ctrl_site_env_l[:3, 3])
-
     # Desired offsets
     half_gap = float(args_cli.dx) if hasattr(args_cli, "dx") else 0.05
     forward = float(args_cli.dy) if hasattr(args_cli, "dy") else 0.05
     upward = float(args_cli.dz) if hasattr(args_cli, "dz") else 0.05
-
     # Build a point in front of current midpoint
     target_mid = cur_mid.clone()
     target_mid[1] = target_mid[1] + forward
     target_mid[2] = target_mid[2] + upward
-
     # Place right/left around midpoint with small lateral gap along x
     goal_r[:3, 3] = target_mid
     goal_l[:3, 3] = target_mid
     goal_r[0, 3] = goal_r[0, 3] + half_gap
     goal_l[0, 3] = goal_l[0, 3] - half_gap
-
     print(
         f"[PlanHumanoid] Bimanual goals | mid={target_mid.cpu().numpy()} | gap={2*half_gap:.3f}m,"
         f" forward={forward:.3f}m, up={upward:.3f}m"
@@ -724,9 +805,63 @@ def _build_site_goal_bimanual(
     return goal_r, goal_l
 
 
+def _build_site_goal_independent(
+    ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-arm goals in site/world with independent offsets (dx,dy,dz for each arm).
+
+    If an arm-specific offset is None, fall back to the global dx/dy/dz for that component.
+    """
+
+    def pick(val_specific, val_global, default):
+        return (
+            float(val_specific)
+            if val_specific is not None
+            else (float(val_global) if val_global is not None else default)
+        )
+
+    # Resolve offsets
+    rdx = pick(args_cli.right_dx, args_cli.dx, 0.0)
+    rdy = pick(args_cli.right_dy, args_cli.dy, 0.0)
+    rdz = pick(args_cli.right_dz, args_cli.dz, 0.0)
+    ldx = pick(args_cli.left_dx, args_cli.dx, 0.0)
+    ldy = pick(args_cli.left_dy, args_cli.dy, 0.0)
+    ldz = pick(args_cli.left_dz, args_cli.dz, 0.0)
+
+    # Clone base poses
+    goal_r = ctrl_site_env_r.clone()
+    goal_l = ctrl_site_env_l.clone()
+
+    # Apply per-arm deltas directly in site/world
+    goal_r[0, 3] = goal_r[0, 3] + rdx
+    goal_r[1, 3] = goal_r[1, 3] + rdy
+    goal_r[2, 3] = goal_r[2, 3] + rdz
+
+    goal_l[0, 3] = goal_l[0, 3] + ldx
+    goal_l[1, 3] = goal_l[1, 3] + ldy
+    goal_l[2, 3] = goal_l[2, 3] + ldz
+
+    print(
+        f"[PlanHumanoid] Independent goals | R dpos=({rdx:.3f},{rdy:.3f},{rdz:.3f}) m |"
+        f" L dpos=({ldx:.3f},{ldy:.3f},{ldz:.3f}) m"
+    )
+    return goal_r, goal_l
+
+
 def _execute_plans_together(
-    env, robot, planner_r, planner_l, env_origin, site_from_r, site_from_l, args_cli, ee_vis_r=None, ee_vis_l=None
-):
+    env,
+    robot,
+    planner_r,
+    planner_l,
+    env_origin,
+    site_from_r,
+    site_from_l,
+    args_cli,
+    ee_vis_r=None,
+    ee_vis_l=None,
+    *,
+    retime_schedules: tuple[list[float], list[float]] | None = None,
+) -> None:
     print("[PlanHumanoid] Executing bimanual plans together...")
     planned_r = planner_r.get_planned_poses()
     planned_l = planner_l.get_planned_poses()
@@ -742,11 +877,29 @@ def _execute_plans_together(
         idle = idle.to(dtype=torch.float32)
     idle = idle.to(device=env.device)
 
-    total = max(len(planned_r), len(planned_l))
-    for _ in range(args_cli.replay_trials):
-        print(f"[PlanHumanoid] Replaying trial {_ + 1}/{args_cli.replay_trials}")
+    # Build discrete timeline if retimed schedules provided
+    if retime_schedules is not None:
+        times_r, times_l = retime_schedules
+        # Discretize timeline at env steps based on the union of both time sequences
+        all_times = sorted(set([float(t) for t in times_r] + [float(t) for t in times_l]))
+        # Map each time to the latest index <= time
+        import bisect
+
+        def idx_at_time(times, t):
+            k = bisect.bisect_right(times, t) - 1
+            return max(0, min(k, len(times) - 1))
+
+        schedule = [(idx_at_time(times_r, t), idx_at_time(times_l, t)) for t in all_times]
+    else:
+        schedule = list(zip(range(len(planned_r)), [min(i, len(planned_l) - 1) for i in range(len(planned_r))]))
+        if len(planned_l) > len(planned_r):
+            extra = [(len(planned_r) - 1, j) for j in range(len(planned_r), len(planned_l))]
+            schedule.extend(extra)
+
+    for trial in range(args_cli.replay_trials):
+        print(f"[PlanHumanoid] Replaying trial {trial + 1}/{args_cli.replay_trials}")
         env.reset()
-        for idx in range(total):
+        for idx_r, idx_l in schedule:
             # Base pose in world (recompute each step)
             base_pos_world_exec = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
             base_rot_world_exec = PoseUtils.matrix_from_quat(
@@ -757,8 +910,8 @@ def _execute_plans_together(
             ]
 
             # Get targets for this step (use last waypoint if shorter)
-            pose_r_bt = planned_r[min(idx, len(planned_r) - 1)]
-            pose_l_bt = planned_l[min(idx, len(planned_l) - 1)]
+            pose_r_bt = planned_r[idx_r]
+            pose_l_bt = planned_l[idx_l]
             pose_r_bt = pose_r_bt.to(device=env.device, dtype=torch.float32)
             pose_l_bt = pose_l_bt.to(device=env.device, dtype=torch.float32)
 
@@ -793,13 +946,12 @@ def _execute_plans_together(
                 ee_vis_l.visualize(translations=cur_pos_l.unsqueeze(0), orientations=cur_quat_l.unsqueeze(0))
 
             env.step(action)
-            if (idx + 1) % 10 == 0 or idx == 0 or idx == total - 1:
-                print(f"[PlanHumanoid] Bimanual Step {idx + 1}/{total}")
+        print("[PlanHumanoid] Trial complete")
 
-    planner_r.plan_visualizer.close()
-    planner_l.plan_visualizer.close()
-    planner_r.clear()
-    planner_l.clear()
+    # planner_r.plan_visualizer.close()
+    # planner_l.plan_visualizer.close()
+    # planner_r.clear()
+    # planner_l.clear()
 
 
 def main():
@@ -820,9 +972,25 @@ def main():
 
         # Build paired goals for arms
         env_device = cast(Any, env).device
-        target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_bimanual(
-            ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
+        use_independent = any(
+            x is not None
+            for x in (
+                args_cli.right_dx,
+                args_cli.right_dy,
+                args_cli.right_dz,
+                args_cli.left_dx,
+                args_cli.left_dy,
+                args_cli.left_dz,
+            )
         )
+        if use_independent:
+            target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_independent(
+                ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
+            )
+        else:
+            target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_bimanual(
+                ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
+            )
 
         site_inv_r = torch.linalg.inv(site_from_curobo_r)
         site_inv_l = torch.linalg.inv(site_from_curobo_l)
@@ -833,20 +1001,64 @@ def main():
         step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
 
         # Plan sequentially (both arms active in collisions)
+        try:
+            print(f"[PlanHumanoid] RIGHT: inactive collision links = {len(planner_right._inactive_collision_links())}")
+        except Exception:
+            pass
+        print("[PlanHumanoid] Planning RIGHT arm...")
         ok_r = _plan_motion(planner_right, target_world_tool_r, step_size)
         if not ok_r:
             print("Planning failed for right arm.")
             return
+        try:
+            print(f"[PlanHumanoid] RIGHT planned waypoints: {len(planner_right.get_planned_poses())}")
+        except Exception:
+            pass
+        try:
+            print(f"[PlanHumanoid] LEFT: inactive collision links = {len(planner_left._inactive_collision_links())}")
+        except Exception:
+            pass
+        print("[PlanHumanoid] Planning LEFT arm...")
         ok_l = _plan_motion(planner_left, target_world_tool_l, step_size)
         if not ok_l:
             print("Planning failed for left arm.")
             return
+        try:
+            print(f"[PlanHumanoid] LEFT planned waypoints: {len(planner_left.get_planned_poses())}")
+        except Exception:
+            pass
 
         # Visualize goals and current EE frames for both arms
         ee_vis_r, ee_vis_l = _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_site_l, env)
 
-        # Execute both together in one trial
-        # Note: use env_origin_r for base frame; both share same env/robot
+        # Collision-aware retiming (optional)
+        retime_sched = None
+        if args_cli.collision_aware:
+            # Use current T_world_base_r for both (same base)
+            colliding_pairs = _compute_colliding_pairs_ee(
+                planner_right.get_planned_poses(),
+                planner_left.get_planned_poses(),
+                T_world_base_r,
+                threshold=float(args_cli.collision_distance),
+                device=env_device,
+            )
+            if colliding_pairs:
+                print(f"[PlanHumanoid] Colliding pairs: {len(colliding_pairs)}")
+                retime_sched = _build_retimed_schedules(
+                    len(planner_right.get_planned_poses()),
+                    len(planner_left.get_planned_poses()),
+                    colliding_pairs,
+                    min_dt=0.05,
+                )
+                if retime_sched is None:
+                    print(
+                        "[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware"
+                        " retime."
+                    )
+            else:
+                print("[PlanHumanoid] No colliding pairs detected under EE threshold")
+
+        # Execute both together in one trial (with optional retime)
         _execute_plans_together(
             env,
             robot,
@@ -858,6 +1070,7 @@ def main():
             args_cli,
             ee_vis_r=ee_vis_r,
             ee_vis_l=ee_vis_l,
+            retime_schedules=retime_sched,
         )
         return
 
