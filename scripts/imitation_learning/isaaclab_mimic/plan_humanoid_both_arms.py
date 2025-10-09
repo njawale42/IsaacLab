@@ -22,6 +22,7 @@ parser.add_argument("--goal", type=str, default="up", choices=["up", "lateral", 
 # - dx: for bimanual mode, half the lateral gap along X around the hand midpoint;
 #       total hand-to-hand separation becomes 2*|dx|. Negative dx makes the arms cross sides.
 parser.add_argument("--dz", type=float, default=0.05, help="Upward lift in meters.")
+
 parser.add_argument(
     "--dx", type=float, default=0.05, help="Half lateral gap (bimanual) or lateral offset (single arm), in meters."
 )
@@ -34,28 +35,18 @@ parser.add_argument("--debug", action="store_true", help="Enable debug logging."
 parser.add_argument("--replay_trials", type=int, default=2, help="Number of trials to replay.")
 parser.add_argument("--visualize_goal", action="store_true", help="Visualize target EE pose marker.")
 parser.add_argument("--collision_aware", action="store_true", help="Enable collision-aware retiming for bimanual.")
-parser.add_argument(
-    "--collision_distance", type=float, default=0.05, help="EE proximity threshold (m) to mark a pair as colliding."
-)
+parser.add_argument("--collision_distance", type=float, default=0.05, help="EE proximity threshold (m) to mark a pair as colliding.")
+parser.add_argument("--pair_densify", type=int, default=1, help="Subdivisions per segment for joint-level collision checks (>=1).")
+parser.add_argument("--joint_collision_margin", type=float, default=0.002, help="Self-collision activation distance (m) for joint-level pairing.")
+parser.add_argument("--pair_visualize", action="store_true", help="Visualize sampled colliding and collision-free joint pairs.")
+parser.add_argument("--pair_vis_samples", type=int, default=8, help="Number of samples per class to visualize.")
 # Optional per-arm overrides: when provided, independent goals are used instead of symmetric bimanual ones
-parser.add_argument(
-    "--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set."
-)
-parser.add_argument(
-    "--right_dy", type=float, default=None, help="Right arm Y offset (site/world). Overrides --dy if set."
-)
-parser.add_argument(
-    "--right_dz", type=float, default=None, help="Right arm Z offset (site/world). Overrides --dz if set."
-)
-parser.add_argument(
-    "--left_dx", type=float, default=None, help="Left arm X offset (site/world). Overrides --dx if set."
-)
-parser.add_argument(
-    "--left_dy", type=float, default=None, help="Left arm Y offset (site/world). Overrides --dy if set."
-)
-parser.add_argument(
-    "--left_dz", type=float, default=None, help="Left arm Z offset (site/world). Overrides --dz if set."
-)
+parser.add_argument("--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set.")
+parser.add_argument("--right_dy", type=float, default=None, help="Right arm Y offset (site/world). Overrides --dy if set.")
+parser.add_argument("--right_dz", type=float, default=None, help="Right arm Z offset (site/world). Overrides --dz if set.")
+parser.add_argument("--left_dx", type=float, default=None, help="Left arm X offset (site/world). Overrides --dx if set.")
+parser.add_argument("--left_dy", type=float, default=None, help="Left arm Y offset (site/world). Overrides --dy if set.")
+parser.add_argument("--left_dz", type=float, default=None, help="Left arm Z offset (site/world). Overrides --dz if set.")
 # parser.add_argument("--headless", action="store_true", help="Headless mode.")
 
 # Append AppLauncher cli args and parse
@@ -77,8 +68,6 @@ import yaml
 from dataclasses import replace as dc_replace
 from typing import Any, cast
 
-from nvplan.applications.custream.retime import retime_paths
-
 import isaaclab.utils.math as PoseUtils
 
 # Controller utils to convert USD->URDF
@@ -92,6 +81,7 @@ from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlann
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_humanoid import HumanoidArmCuroboPlanner
 
 import isaaclab_tasks  # noqa: F401
+from nvplan.applications.custream.retime import retime_paths
 
 
 def _tool_link_for_arm(arm: str) -> str:
@@ -527,9 +517,310 @@ def _compute_colliding_pairs_ee(planned_r, planned_l, T_world_base, threshold: f
     # pos_r: [Nr,3], pos_l: [Nl,3] -> distances [Nr, Nl]
     diff = pos_r.unsqueeze(1) - pos_l.unsqueeze(0)
     dists = torch.linalg.norm(diff, dim=-1)
-    colliding = dists <= threshold
+    colliding = (dists <= threshold)
     pairs = torch.nonzero(colliding, as_tuple=False)
     return [(int(i.item()), int(j.item())) for i, j in pairs]
+
+
+def _densify_plan_positions(pos: torch.Tensor, factor: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Linearly densify a joint path by integer factor; return dense path and map to coarse indices.
+
+    Returns (pos_dense, idx_map) where idx_map[k] gives the source coarse index for dense index k.
+    """
+    if factor <= 1 or pos.shape[0] <= 1:
+        idx_map = torch.arange(pos.shape[0], device=pos.device, dtype=torch.long)
+        return pos, idx_map
+    segments = pos.shape[0] - 1
+    steps_per_seg = factor
+    # For each segment, sample steps_per_seg points excluding the last one to avoid duplication; add final point after loop
+    out = []
+    imap = []
+    for i in range(segments):
+        p0 = pos[i]
+        p1 = pos[i + 1]
+        for s in range(steps_per_seg):
+            t = float(s) / float(steps_per_seg)
+            out.append((1.0 - t) * p0 + t * p1)
+            imap.append(i)
+    out.append(pos[-1])
+    imap.append(segments)
+    return torch.stack(out, dim=0), torch.tensor(imap, device=pos.device, dtype=torch.long)
+
+
+# def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
+#     """Compute colliding waypoint pairs using self-collision on combined joint states.
+
+#     Builds all pairwise combined joint configurations where the right-arm joints come
+#     from the right plan at index i and the left-arm joints come from the left plan at
+#     index j. Other joints (torso/base/grippers) are taken from the right plan baseline.
+#     Uses cuRobo's RobotWorld self-collision cost to classify collisions.
+#     """
+#     import pdb; pdb.set_trace()
+#     plan_r = getattr(planner_r, "current_plan", None)
+#     plan_l = getattr(planner_l, "current_plan", None)
+#     if plan_r is None or plan_l is None:
+#         return []
+
+#     pos_r = plan_r.position # pos_r.shape: [32, 21]
+#     pos_l = plan_l.position # pos_l.shape: [32, 21]
+#     if not isinstance(pos_r, torch.Tensor):
+#         pos_r = torch.tensor(pos_r, dtype=torch.float32, device=planner_r.tensor_args.device)
+#     if not isinstance(pos_l, torch.Tensor):
+#         pos_l = torch.tensor(pos_l, dtype=torch.float32, device=planner_r.tensor_args.device)
+
+#     # Densify per CLI factor
+#     factor = max(1, int(getattr(args_cli, "pair_densify", 1)))
+#     pos_r_dense, map_r = _densify_plan_positions(pos_r, factor)
+#     pos_l_dense, map_l = _densify_plan_positions(pos_l, factor)
+#     Nr = int(pos_r_dense.shape[0])
+#     Nl = int(pos_l_dense.shape[0])
+#     if Nr == 0 or Nl == 0:
+#         return []
+
+#     # Joint masks for each arm based on configured substrings
+#     joint_names: list[str] = list(plan_r.joint_names)
+
+#     def _mask_for(substrings: tuple[str, ...]) -> torch.Tensor:
+#         return torch.tensor([any(s in name for s in substrings) for name in joint_names], dtype=torch.bool, device=planner_r.tensor_args.device)
+
+#     substr_l = getattr(planner_l, "active_joint_substrings", ("left_",))
+#     mask_l = _mask_for(tuple(substr_l))
+
+#     # Build all pairwise combined configurations: baseline from right plan, override left-arm joints from left plan
+#     q = pos_r_dense.repeat_interleave(Nl, dim=0).clone()  # [Nr*Nl, dof]
+#     left_all = pos_l_dense.repeat(Nr, 1)                  # [Nr*Nl, dof]
+#     q[:, mask_l] = left_all[:, mask_l]
+
+#     # Evaluate self-collision on the combined configurations
+#     from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
+
+#     # Set self-collision activation distance from CLI margin to treat near-contacts as collisions
+#     rw_cfg = RobotWorldConfig.load_from_config(
+#         robot_config=planner_r.robot_cfg,
+#         world_model=None,
+#         tensor_args=planner_r.tensor_args,
+#         n_envs=1,
+#         self_collision_activation_distance=float(getattr(args_cli, "joint_collision_margin", 0.0)),
+#     )
+#     robot_world = RobotWorld(rw_cfg)
+
+#     state = robot_world.get_kinematics(q)
+#     spheres = state.link_spheres_tensor.view(q.shape[0], 1, -1, 4)
+#     d_self = robot_world.get_self_collision(spheres).view(-1)
+
+#     if getattr(args_cli, "pair_visualize", False):
+#         # Visualize a few colliding and non-colliding samples in the viewer by setting joint targets
+#         k_collide = torch.nonzero(d_self > 0.0, as_tuple=False).flatten().tolist()
+#         k_free = torch.nonzero(d_self <= 0.0, as_tuple=False).flatten().tolist()
+#         import random
+#         random.shuffle(k_collide)
+#         random.shuffle(k_free)
+#         show_c = k_collide[: int(getattr(args_cli, "pair_vis_samples", 8))]
+#         show_f = k_free[: int(getattr(args_cli, "pair_vis_samples", 8))]
+
+#         # Use env robot to set joint position targets for brief frames
+#         rob = planner_r.robot
+#         device = rob.device
+#         def _show_config(conf: torch.Tensor):
+#             env_q = conf.to(device=planner_r.env.device, dtype=torch.float32).unsqueeze(0)
+#             rob.set_joint_position_target(env_q, env_ids=[planner_r.env_id])
+#             # step a few frames to let renderer update
+#             for _ in range(3):
+#                 planner_r.env.step(planner_r.env.cfg.idle_action if isinstance(planner_r.env.cfg.idle_action, torch.Tensor) else torch.tensor(planner_r.env.cfg.idle_action, device=planner_r.env.device).unsqueeze(0))
+
+#         print(f"[PlanHumanoid] Visualizing {len(show_c)} colliding and {len(show_f)} free samples")
+#         for k in show_c:
+#             _show_config(q[k])
+#         for k in show_f:
+#             _show_config(q[k])
+
+#     colliding_rows = torch.nonzero(d_self > 0.0, as_tuple=False).flatten()
+#     if colliding_rows.numel() == 0:
+#         return []
+
+#     pairs: list[tuple[int, int]] = []
+#     for idx in colliding_rows.tolist():
+#         i_dense = idx // Nl
+#         j_dense = idx % Nl
+#         # Map back to original coarse waypoint indices
+#         i_coarse = int(map_r[i_dense].item())
+#         j_coarse = int(map_l[j_dense].item())
+#         pairs.append((i_coarse, j_coarse))
+#     return pairs
+
+
+# Version 2: Using independent kinematics from both the planners
+# def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
+#     """Compute colliding waypoint pairs using self-collision on combined joint states.
+
+#     Mirrors streams.py: build a full-DOF grid from the two joint paths by assigning
+#     each path's joint subset via name->index arrays into a full baseline configuration.
+#     """
+#     import pdb; pdb.set_trace()
+#     from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
+
+#     plan_r = getattr(planner_r, "current_plan", None)
+#     plan_l = getattr(planner_l, "current_plan", None)
+#     if plan_r is None or plan_l is None:
+#         return []
+
+#     dev = planner_r.tensor_args.device
+#     # Paths as tensors
+#     pos_r = plan_r.position if isinstance(plan_r.position, torch.Tensor) else torch.tensor(plan_r.position, dtype=torch.float32, device=dev)
+#     pos_l = plan_l.position if isinstance(plan_l.position, torch.Tensor) else torch.tensor(plan_l.position, dtype=torch.float32, device=dev)
+#     pos_r = pos_r.to(device=dev, dtype=torch.float32)
+#     pos_l = pos_l.to(device=dev, dtype=torch.float32)
+
+#     # Optional densification
+#     factor = max(1, int(getattr(args_cli, "pair_densify", 1)))
+#     pos_r_dense, map_r = _densify_plan_positions(pos_r, factor)
+#     pos_l_dense, map_l = _densify_plan_positions(pos_l, factor)
+#     Nr, Nl = int(pos_r_dense.shape[0]), int(pos_l_dense.shape[0])
+#     if Nr == 0 or Nl == 0:
+#         return []
+
+#     # Full robot joint ordering
+#     full_joint_names_r: list[str] = list(planner_r.motion_gen.kinematics.joint_names)
+#     full_joint_names_l: list[str] = list(planner_l.motion_gen.kinematics.joint_names)
+
+#     # Map each plan’s joint names into the full ordering (streams.py uses get_joint_indices)
+#     name_to_full_r = {n: i for i, n in enumerate(full_joint_names_r)}
+#     name_to_full_l = {n: i for i, n in enumerate(full_joint_names_l)}
+#     idx_r = torch.tensor([name_to_full_r[n] for n in plan_r.joint_names], dtype=torch.long, device=dev)
+#     idx_l = torch.tensor([name_to_full_l[n] for n in plan_l.joint_names], dtype=torch.long, device=dev)
+
+#     # Full-DOF baseline like world.retract_conf in streams.py
+#     base_js = planner_r._get_current_joint_state_for_curobo()
+#     base = base_js.position.squeeze(0).to(device=dev, dtype=torch.float32)  # [dof]
+
+#     # Build cross product configurations on the full DOF vector
+#     num = Nr * Nl
+#     confs = base.repeat(num, 1)  # [Nr*Nl, dof]
+#     # Right subset written for each i, repeated over Nl
+#     confs[:, idx_r] = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)
+#     # Left subset written for each j, tiled across Nr
+#     confs[:, idx_l] = pos_l_dense.repeat(Nr, 1)
+
+#     # Self-collision classification (like world.get_self_collisions)
+#     rw_cfg = RobotWorldConfig.load_from_config(
+#         robot_config=planner_r.robot_cfg,
+#         world_model=None,
+#         tensor_args=planner_r.tensor_args,
+#         n_envs=1,
+#         self_collision_activation_distance=float(getattr(args_cli, "joint_collision_margin", 0.0)),
+#     )
+#     robot_world = RobotWorld(rw_cfg)
+#     state = robot_world.get_kinematics(confs)
+#     spheres = state.link_spheres_tensor.view(num, 1, -1, 4)
+#     d_self = robot_world.get_self_collision(spheres).view(-1)
+
+#     rows = torch.nonzero(d_self > 0.0, as_tuple=False).flatten()
+#     if rows.numel() == 0:
+#         return []
+
+#     pairs: list[tuple[int, int]] = []
+#     for k in rows.tolist():
+#         i_dense = k // Nl
+#         j_dense = k % Nl
+#         pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
+#     return pairs
+
+def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
+    """Find colliding waypoint pairs by checking right-vs-left sphere overlaps per pair.
+
+    Uses each planner's own kinematics to compute spheres and detects inter-arm overlaps.
+    Avoids mapping left joint names into the right planner's joint list.
+    """
+    #
+
+    plan_r = getattr(planner_r, "current_plan", None)
+    plan_l = getattr(planner_l, "current_plan", None)
+    if plan_r is None or plan_l is None:
+        return []
+
+    dev = planner_r.tensor_args.device
+    # Paths as tensors
+    pos_r = plan_r.position if isinstance(plan_r.position, torch.Tensor) else torch.tensor(plan_r.position, dtype=torch.float32, device=dev)
+    pos_l = plan_l.position if isinstance(plan_l.position, torch.Tensor) else torch.tensor(plan_l.position, dtype=torch.float32, device=dev)
+    pos_r = pos_r.to(device=dev, dtype=torch.float32)
+    pos_l = pos_l.to(device=dev, dtype=torch.float32)
+
+    # Optional densification
+    factor = max(1, int(getattr(args_cli, "pair_densify", 1)))
+    pos_r_dense, map_r = _densify_plan_positions(pos_r, factor)
+    pos_l_dense, map_l = _densify_plan_positions(pos_l, factor)
+    Nr, Nl = int(pos_r_dense.shape[0]), int(pos_l_dense.shape[0])
+    if Nr == 0 or Nl == 0:
+        return []
+
+    # Cross-product joint sequences for each arm separately
+    q_r = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)  # [Nr*Nl, dof_r]
+    q_l = pos_l_dense.repeat(Nr, 1)                                # [Nr*Nl, dof_l]
+    num = q_r.shape[0]
+
+    # Compute min proximity per combined config without allocating [num, nR, nL]
+    kin_r = planner_r.motion_gen.kinematics
+    kin_l = planner_l.motion_gen.kinematics
+
+    B_NUM = int(getattr(args_cli, "pair_batch", 4096))      # batch over cross-product rows
+    CR = int(getattr(args_cli, "pair_chunk_r", 64))         # chunk right spheres
+    CL = int(getattr(args_cli, "pair_chunk_l", 64))         # chunk left spheres
+    margin = float(getattr(args_cli, "joint_collision_margin", 0.0))
+
+    colliding_rows = []
+
+    num = q_r.shape[0]
+    for bi in range(0, num, B_NUM):
+        bj = min(num, bi + B_NUM)
+        q_r_b = q_r[bi:bj]
+        q_l_b = q_l[bi:bj]
+        bsz = q_r_b.shape[0]
+
+        state_r = kin_r.get_state(q_r_b)
+        state_l = kin_l.get_state(q_l_b)
+        sph_r = state_r.link_spheres_tensor.view(bsz, -1, 4)  # [bsz, nR, 4]
+        sph_l = state_l.link_spheres_tensor.view(bsz, -1, 4)  # [bsz, nL, 4]
+        nR = sph_r.shape[1]
+        nL = sph_l.shape[1]
+
+        c_r = sph_r[..., :3]
+        r_r = sph_r[..., 3]
+        c_l = sph_l[..., :3]
+        r_l = sph_l[..., 3]
+
+        min_prox_b = torch.full((bsz,), float("inf"), device=c_r.device, dtype=c_r.dtype)
+
+        for r0 in range(0, nR, CR):
+            r1 = min(nR, r0 + CR)
+            c_r_ch = c_r[:, r0:r1, :]          # [bsz, cr, 3]
+            r_r_ch = r_r[:, r0:r1]             # [bsz, cr]
+            for l0 in range(0, nL, CL):
+                l1 = min(nL, l0 + CL)
+                c_l_ch = c_l[:, l0:l1, :]      # [bsz, cl, 3]
+                r_l_ch = r_l[:, l0:l1]         # [bsz, cl]
+
+                diff = c_r_ch.unsqueeze(2) - c_l_ch.unsqueeze(1)   # [bsz, cr, cl, 3]
+                d = torch.linalg.norm(diff, dim=-1)                # [bsz, cr, cl]
+                rs = r_r_ch.unsqueeze(2) + r_l_ch.unsqueeze(1)     # [bsz, cr, cl]
+                prox = d - rs                                      # [bsz, cr, cl]
+                local_min = prox.view(bsz, -1).min(dim=1).values
+                min_prox_b = torch.minimum(min_prox_b, local_min)
+
+        # rows that collide for this batch
+        local_rows = torch.nonzero(min_prox_b <= margin, as_tuple=False).flatten()
+        if local_rows.numel() > 0:
+            colliding_rows.extend((bi + k.item()) for k in local_rows)
+
+    if len(colliding_rows) == 0:
+        return []
+
+    # Map dense rows -> (i,j) -> coarse indices via map_r/map_l
+    pairs = []
+    for k in colliding_rows:
+        i_dense = k // Nl
+        j_dense = k % Nl
+        pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
+    return pairs
 
 
 def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple[int, int]], min_dt: float = 0.05):
@@ -537,7 +828,6 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
 
     Returns two lists of times (seconds) aligned to each waypoint index for each path.
     """
-
     def _compress_pairs_min_j(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
         # Keep only the smallest j for each i (strict minimal collisions)
         min_j = {}
@@ -555,9 +845,7 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
     path1 = [None] * len_r
     path2 = [None] * len_l
     try:
-        t1, t2 = retime_paths(
-            path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.0, verbose=False
-        )
+        t1, t2 = retime_paths(path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.02, verbose=False)
         return t1, t2
     except AssertionError:
         # Retry with reduced constraints and larger dt
@@ -565,9 +853,7 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
         reduced = _cap_pairs(reduced, limit=500)
         larger_dt = max(min_dt * 2.0, 0.1)
         try:
-            t1, t2 = retime_paths(
-                path1, path2, colliding=reduced, linear=True, min_dt=larger_dt, buffer=0.0, verbose=False
-            )
+            t1, t2 = retime_paths(path1, path2, colliding=reduced, linear=True, min_dt=larger_dt, buffer=0.02, verbose=False)
             return t1, t2
         except AssertionError:
             return None
@@ -620,15 +906,15 @@ def _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_
 
         # Goal markers
         frame_goal_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_r)
-        frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_r.markers["frame"].scale = (0.1, 0.1, 0.1)
         frame_goal_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_goal_l)
-        frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)  # disabled to satisfy linter typing
+        frame_goal_l.markers["frame"].scale = (0.1, 0.1, 0.1)
 
         # EE markers
         frame_ee_r = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_r)
-        frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_r.markers["frame"].scale = (0.08, 0.08, 0.08)
         frame_ee_l = dc_replace(FRAME_MARKER_CFG, prim_path=viz_ee_l)
-        frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)  # disabled to satisfy linter typing
+        frame_ee_l.markers["frame"].scale = (0.08, 0.08, 0.08)
 
         goal_vis_r = VisualizationMarkers(frame_goal_r)
         goal_vis_l = VisualizationMarkers(frame_goal_l)
@@ -769,9 +1055,7 @@ def _execute_plan(
     planner.clear()
 
 
-def _build_site_goal_bimanual(
-    ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_site_goal_bimanual(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device) -> tuple[torch.Tensor, torch.Tensor]:
     """Build paired goals for both arms in site/world frame so hands are close together in front.
 
     Logic:
@@ -805,20 +1089,13 @@ def _build_site_goal_bimanual(
     return goal_r, goal_l
 
 
-def _build_site_goal_independent(
-    ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_site_goal_independent(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device) -> tuple[torch.Tensor, torch.Tensor]:
     """Build per-arm goals in site/world with independent offsets (dx,dy,dz for each arm).
 
     If an arm-specific offset is None, fall back to the global dx/dy/dz for that component.
     """
-
     def pick(val_specific, val_global, default):
-        return (
-            float(val_specific)
-            if val_specific is not None
-            else (float(val_global) if val_global is not None else default)
-        )
+        return float(val_specific) if val_specific is not None else (float(val_global) if val_global is not None else default)
 
     # Resolve offsets
     rdx = pick(args_cli.right_dx, args_cli.dx, 0.0)
@@ -849,18 +1126,8 @@ def _build_site_goal_independent(
 
 
 def _execute_plans_together(
-    env,
-    robot,
-    planner_r,
-    planner_l,
-    env_origin,
-    site_from_r,
-    site_from_l,
-    args_cli,
-    ee_vis_r=None,
-    ee_vis_l=None,
-    *,
-    retime_schedules: tuple[list[float], list[float]] | None = None,
+    env, robot, planner_r, planner_l, env_origin, site_from_r, site_from_l, args_cli, ee_vis_r=None, ee_vis_l=None,
+    *, retime_schedules: tuple[list[float], list[float]] | None = None,
 ) -> None:
     print("[PlanHumanoid] Executing bimanual plans together...")
     planned_r = planner_r.get_planned_poses()
@@ -880,40 +1147,90 @@ def _execute_plans_together(
     # Build discrete timeline if retimed schedules provided
     if retime_schedules is not None:
         times_r, times_l = retime_schedules
-        # Discretize timeline at env steps based on the union of both time sequences
+        # Discretize timeline at union of both time sequences
         all_times = sorted(set([float(t) for t in times_r] + [float(t) for t in times_l]))
-        # Map each time to the latest index <= time
+        # Prepare joint-space paths for interpolation
+        js_r = planner_r.current_plan.position
+        js_l = planner_l.current_plan.position
+        if not isinstance(js_r, torch.Tensor):
+            js_r = torch.tensor(js_r, dtype=torch.float32, device=env.device)
+        else:
+            js_r = js_r.to(device=env.device, dtype=torch.float32)
+        if not isinstance(js_l, torch.Tensor):
+            js_l = torch.tensor(js_l, dtype=torch.float32, device=env.device)
+        else:
+            js_l = js_l.to(device=env.device, dtype=torch.float32)
+
+        # For time-based interpolation, store as Python lists for bisect
         import bisect
+        times_r_list = [float(t) for t in times_r]
+        times_l_list = [float(t) for t in times_l]
 
-        def idx_at_time(times, t):
-            k = bisect.bisect_right(times, t) - 1
-            return max(0, min(k, len(times) - 1))
+        def interp(times_list, path_tensor, t):
+            k = max(0, bisect.bisect_right(times_list, float(t)) - 1)
+            if k >= len(times_list) - 1:
+                return path_tensor[-1]
+            t0 = times_list[k]
+            t1 = times_list[k + 1]
+            if t1 <= t0:
+                return path_tensor[k]
+            w = (float(t) - t0) / (t1 - t0)
+            return (1.0 - w) * path_tensor[k] + w * path_tensor[k + 1]
 
-        schedule = [(idx_at_time(times_r, t), idx_at_time(times_l, t)) for t in all_times]
+        # Build a synthetic schedule of callable interpolants at each time
+        schedule = []  # list of (t) to be used below for FK per time
+        schedule = all_times
     else:
         schedule = list(zip(range(len(planned_r)), [min(i, len(planned_l) - 1) for i in range(len(planned_r))]))
         if len(planned_l) > len(planned_r):
             extra = [(len(planned_r) - 1, j) for j in range(len(planned_r), len(planned_l))]
             schedule.extend(extra)
-
+    
     for trial in range(args_cli.replay_trials):
         print(f"[PlanHumanoid] Replaying trial {trial + 1}/{args_cli.replay_trials}")
         env.reset()
-        for idx_r, idx_l in schedule:
+        for step in schedule:
             # Base pose in world (recompute each step)
             base_pos_world_exec = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
             base_rot_world_exec = PoseUtils.matrix_from_quat(
                 robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
             )[0]
-            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[
-                0
-            ]
+            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[0]
 
-            # Get targets for this step (use last waypoint if shorter)
-            pose_r_bt = planned_r[idx_r]
-            pose_l_bt = planned_l[idx_l]
-            pose_r_bt = pose_r_bt.to(device=env.device, dtype=torch.float32)
-            pose_l_bt = pose_l_bt.to(device=env.device, dtype=torch.float32)
+            if retime_schedules is not None:
+                t = step
+                # Interpolate joint positions per arm
+                q_r_t = interp(times_r_list, js_r, t)
+                q_l_t = interp(times_l_list, js_l, t)
+                # FK to base->tool
+                state_r = planner_r.motion_gen.kinematics.get_state(q_r_t.unsqueeze(0))
+                state_l = planner_l.motion_gen.kinematics.get_state(q_l_t.unsqueeze(0))
+                pose_r_bt = getattr(state_r, "ee_pose", None)
+                pose_l_bt = getattr(state_l, "ee_pose", None)
+                # Convert cuRobo Pose objects to 4x4 tensors (fallback to position/quaternion if needed)
+                def _pose_to_mat(pose_obj, state):
+                    if pose_obj is not None and hasattr(pose_obj, "position"):
+                        pos = pose_obj.position
+                        if hasattr(pose_obj, "quaternion"):
+                            quat = pose_obj.quaternion.view(1, 4)
+                            rot_m = PoseUtils.matrix_from_quat(quat)[0]
+                        else:
+                            rot_m = pose_obj.get_rotation()
+                            if rot_m.dim() == 3:
+                                rot_m = rot_m[0]
+                        return PoseUtils.make_pose(pos.view(1, 3), rot_m.unsqueeze(0))[0]
+                    ee_pos = getattr(state, "ee_position").view(1, 3)
+                    ee_rot = getattr(state, "ee_quaternion").view(1, 4)
+                    rot_m = PoseUtils.matrix_from_quat(ee_rot)[0]
+                    return PoseUtils.make_pose(ee_pos, rot_m.unsqueeze(0))[0]
+
+                pose_r_bt = _pose_to_mat(pose_r_bt, state_r).to(device=env.device, dtype=torch.float32)
+                pose_l_bt = _pose_to_mat(pose_l_bt, state_l).to(device=env.device, dtype=torch.float32)
+            else:
+                # Index-based default
+                idx_r, idx_l = step
+                pose_r_bt = planned_r[idx_r].to(device=env.device, dtype=torch.float32)
+                pose_l_bt = planned_l[idx_l].to(device=env.device, dtype=torch.float32)
 
             # base->tool to world->tool then to site/world per arm
             target_world_tool_r = (T_world_base_exec @ pose_r_bt).clone()
@@ -948,10 +1265,10 @@ def _execute_plans_together(
             env.step(action)
         print("[PlanHumanoid] Trial complete")
 
-    # planner_r.plan_visualizer.close()
-    # planner_l.plan_visualizer.close()
-    # planner_r.clear()
-    # planner_l.clear()
+    planner_r.plan_visualizer.close()
+    planner_l.plan_visualizer.close()
+    planner_r.clear()
+    planner_l.clear()
 
 
 def main():
@@ -975,12 +1292,8 @@ def main():
         use_independent = any(
             x is not None
             for x in (
-                args_cli.right_dx,
-                args_cli.right_dy,
-                args_cli.right_dz,
-                args_cli.left_dx,
-                args_cli.left_dy,
-                args_cli.left_dz,
+                args_cli.right_dx, args_cli.right_dy, args_cli.right_dz,
+                args_cli.left_dx, args_cli.left_dy, args_cli.left_dz,
             )
         )
         if use_independent:
@@ -1001,32 +1314,21 @@ def main():
         step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
 
         # Plan sequentially (both arms active in collisions)
-        try:
-            print(f"[PlanHumanoid] RIGHT: inactive collision links = {len(planner_right._inactive_collision_links())}")
-        except Exception:
-            pass
+        print(f"[PlanHumanoid] RIGHT: inactive collision links = {len(planner_right._inactive_collision_links())}")
         print("[PlanHumanoid] Planning RIGHT arm...")
         ok_r = _plan_motion(planner_right, target_world_tool_r, step_size)
         if not ok_r:
             print("Planning failed for right arm.")
             return
-        try:
-            print(f"[PlanHumanoid] RIGHT planned waypoints: {len(planner_right.get_planned_poses())}")
-        except Exception:
-            pass
-        try:
-            print(f"[PlanHumanoid] LEFT: inactive collision links = {len(planner_left._inactive_collision_links())}")
-        except Exception:
-            pass
+        print(f"[PlanHumanoid] RIGHT planned waypoints: {len(planner_right.get_planned_poses())}")
+
+        print(f"[PlanHumanoid] LEFT: inactive collision links = {len(planner_left._inactive_collision_links())}")
         print("[PlanHumanoid] Planning LEFT arm...")
         ok_l = _plan_motion(planner_left, target_world_tool_l, step_size)
         if not ok_l:
             print("Planning failed for left arm.")
             return
-        try:
-            print(f"[PlanHumanoid] LEFT planned waypoints: {len(planner_left.get_planned_poses())}")
-        except Exception:
-            pass
+        print(f"[PlanHumanoid] LEFT planned waypoints: {len(planner_left.get_planned_poses())}")
 
         # Visualize goals and current EE frames for both arms
         ee_vis_r, ee_vis_l = _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_site_l, env)
@@ -1034,29 +1336,30 @@ def main():
         # Collision-aware retiming (optional)
         retime_sched = None
         if args_cli.collision_aware:
-            # Use current T_world_base_r for both (same base)
-            colliding_pairs = _compute_colliding_pairs_ee(
-                planner_right.get_planned_poses(),
-                planner_left.get_planned_poses(),
-                T_world_base_r,
-                threshold=float(args_cli.collision_distance),
-                device=env_device,
-            )
+            # Prefer joint-level collision detection across both arms
+            colliding_pairs = _compute_colliding_pairs_joint(planner_right, planner_left)
+            # if not colliding_pairs:
+            #     # Fallback to EE proximity if joint-level yields none
+            #     print("[PlanHumanoid] No colliding joint waypoint pairs detected")
+            #     colliding_pairs = _compute_colliding_pairs_ee(
+            #         planner_right.get_planned_poses(),
+            #         planner_left.get_planned_poses(),
+            #         T_world_base_r,
+            #         threshold=float(args_cli.collision_distance),
+            #         device=env_device,
+            #     )
             if colliding_pairs:
-                print(f"[PlanHumanoid] Colliding pairs: {len(colliding_pairs)}")
+                print(f"[PlanHumanoid] Colliding pairs (joint-level preferred): {len(colliding_pairs)}")
                 retime_sched = _build_retimed_schedules(
                     len(planner_right.get_planned_poses()),
                     len(planner_left.get_planned_poses()),
                     colliding_pairs,
-                    min_dt=0.05,
+                    min_dt=0.01,
                 )
                 if retime_sched is None:
-                    print(
-                        "[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware"
-                        " retime."
-                    )
+                    print("[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware retime.")
             else:
-                print("[PlanHumanoid] No colliding pairs detected under EE threshold")
+                print("[PlanHumanoid] No colliding waypoint pairs detected")
 
         # Execute both together in one trial (with optional retime)
         _execute_plans_together(
