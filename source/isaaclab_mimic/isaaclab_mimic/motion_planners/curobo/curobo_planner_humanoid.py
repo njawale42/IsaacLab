@@ -168,6 +168,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         env_id: int = 0,
         step_size: float | None = None,
         enable_retiming: bool | None = None,
+        link_target_poses_base: dict[str, torch.Tensor] | None = None,
     ) -> bool:
         """Plan motion for single humanoid arm with collision management.
 
@@ -200,6 +201,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
                 env_id=env_id,
                 step_size=step_size,
                 enable_retiming=enable_retiming,
+                link_target_poses_base=link_target_poses_base,
             )
             return result
         finally:

@@ -35,18 +35,41 @@ parser.add_argument("--debug", action="store_true", help="Enable debug logging."
 parser.add_argument("--replay_trials", type=int, default=2, help="Number of trials to replay.")
 parser.add_argument("--visualize_goal", action="store_true", help="Visualize target EE pose marker.")
 parser.add_argument("--collision_aware", action="store_true", help="Enable collision-aware retiming for bimanual.")
-parser.add_argument("--collision_distance", type=float, default=0.05, help="EE proximity threshold (m) to mark a pair as colliding.")
-parser.add_argument("--pair_densify", type=int, default=1, help="Subdivisions per segment for joint-level collision checks (>=1).")
-parser.add_argument("--joint_collision_margin", type=float, default=0.002, help="Self-collision activation distance (m) for joint-level pairing.")
-parser.add_argument("--pair_visualize", action="store_true", help="Visualize sampled colliding and collision-free joint pairs.")
+parser.add_argument(
+    "--collision_distance", type=float, default=0.05, help="EE proximity threshold (m) to mark a pair as colliding."
+)
+parser.add_argument(
+    "--pair_densify", type=int, default=1, help="Subdivisions per segment for joint-level collision checks (>=1)."
+)
+parser.add_argument(
+    "--joint_collision_margin",
+    type=float,
+    default=0.002,
+    help="Self-collision activation distance (m) for joint-level pairing.",
+)
+parser.add_argument(
+    "--pair_visualize", action="store_true", help="Visualize sampled colliding and collision-free joint pairs."
+)
 parser.add_argument("--pair_vis_samples", type=int, default=8, help="Number of samples per class to visualize.")
 # Optional per-arm overrides: when provided, independent goals are used instead of symmetric bimanual ones
-parser.add_argument("--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set.")
-parser.add_argument("--right_dy", type=float, default=None, help="Right arm Y offset (site/world). Overrides --dy if set.")
-parser.add_argument("--right_dz", type=float, default=None, help="Right arm Z offset (site/world). Overrides --dz if set.")
-parser.add_argument("--left_dx", type=float, default=None, help="Left arm X offset (site/world). Overrides --dx if set.")
-parser.add_argument("--left_dy", type=float, default=None, help="Left arm Y offset (site/world). Overrides --dy if set.")
-parser.add_argument("--left_dz", type=float, default=None, help="Left arm Z offset (site/world). Overrides --dz if set.")
+parser.add_argument(
+    "--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set."
+)
+parser.add_argument(
+    "--right_dy", type=float, default=None, help="Right arm Y offset (site/world). Overrides --dy if set."
+)
+parser.add_argument(
+    "--right_dz", type=float, default=None, help="Right arm Z offset (site/world). Overrides --dz if set."
+)
+parser.add_argument(
+    "--left_dx", type=float, default=None, help="Left arm X offset (site/world). Overrides --dx if set."
+)
+parser.add_argument(
+    "--left_dy", type=float, default=None, help="Left arm Y offset (site/world). Overrides --dy if set."
+)
+parser.add_argument(
+    "--left_dz", type=float, default=None, help="Left arm Z offset (site/world). Overrides --dz if set."
+)
 # parser.add_argument("--headless", action="store_true", help="Headless mode.")
 
 # Append AppLauncher cli args and parse
@@ -68,6 +91,10 @@ import yaml
 from dataclasses import replace as dc_replace
 from typing import Any, cast
 
+from nvplan.applications.custream.config import create_robot_config
+from nvplan.applications.custream.retime import retime_paths
+from nvplan.applications.custream.spheres import load_spheres
+
 import isaaclab.utils.math as PoseUtils
 
 # Controller utils to convert USD->URDF
@@ -81,7 +108,6 @@ from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlann
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_humanoid import HumanoidArmCuroboPlanner
 
 import isaaclab_tasks  # noqa: F401
-from nvplan.applications.custream.retime import retime_paths
 
 
 def _tool_link_for_arm(arm: str) -> str:
@@ -111,13 +137,6 @@ def _build_temp_robot_yaml_from_usd(usd_path: str, arm: str, inactive_joints: li
     print(f"[PlanHumanoid] URDF: {urdf_path}")
 
     print("[PlanHumanoid] Creating robot config...")
-    try:
-        from nvplan.applications.custream.config import create_robot_config
-        from nvplan.applications.custream.spheres import load_spheres
-    except Exception as e:
-        print(f"[PlanHumanoid] Error importing custream: {e}")
-        raise e
-
     print("[PlanHumanoid] Loading spheres...")
     tool_links = [_tool_link_for_arm(arm)]
     robot_config = create_robot_config(
@@ -328,6 +347,7 @@ def _build_env_and_planners_both(args_cli):
         pass
     robot_yaml_right = _build_temp_robot_yaml_from_usd(usd_path, "right", inactive_joints=inactive_joint_names)
     robot_yaml_left = _build_temp_robot_yaml_from_usd(usd_path, "left", inactive_joints=inactive_joint_names)
+    robot_yaml_both = _build_temp_robot_yaml_both_arms(usd_path)
 
     print("[PlanHumanoid] Creating env...")
     try:
@@ -363,6 +383,7 @@ def _build_env_and_planners_both(args_cli):
 
     cfg_right = _make_cfg(robot_yaml_right, "right")
     cfg_left = _make_cfg(robot_yaml_left, "left")
+    # cfg_both = _make_cfg(robot_yaml_both, "both")
 
     robot = env.scene["robot"]
 
@@ -388,13 +409,14 @@ def _build_env_and_planners_both(args_cli):
             hand_link_substrings=("GR1T2_fourier_hand_6dof_left_",),
             collision_active_link_substrings=("GR1T2_fourier_hand_6dof_left_", "GR1T2_fourier_hand_6dof_right_"),
         )
+
     except Exception as e:
         traceback.print_exc()
         print(f"[PlanHumanoid] Error creating planners: {e}")
         raise e
     print("[PlanHumanoid] Planners ready.")
 
-    return env, robot, planner_right, planner_left
+    return env, robot, planner_right, planner_left, robot_yaml_both
 
 
 def _compute_world_and_site_frames(env, robot, planner, eef_name: str):
@@ -517,7 +539,7 @@ def _compute_colliding_pairs_ee(planned_r, planned_l, T_world_base, threshold: f
     # pos_r: [Nr,3], pos_l: [Nl,3] -> distances [Nr, Nl]
     diff = pos_r.unsqueeze(1) - pos_l.unsqueeze(0)
     dists = torch.linalg.norm(diff, dim=-1)
-    colliding = (dists <= threshold)
+    colliding = dists <= threshold
     pairs = torch.nonzero(colliding, as_tuple=False)
     return [(int(i.item()), int(j.item())) for i, j in pairs]
 
@@ -725,6 +747,7 @@ def _densify_plan_positions(pos: torch.Tensor, factor: int) -> tuple[torch.Tenso
 #         pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
 #     return pairs
 
+
 def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
     """Find colliding waypoint pairs by checking right-vs-left sphere overlaps per pair.
 
@@ -740,8 +763,16 @@ def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]
 
     dev = planner_r.tensor_args.device
     # Paths as tensors
-    pos_r = plan_r.position if isinstance(plan_r.position, torch.Tensor) else torch.tensor(plan_r.position, dtype=torch.float32, device=dev)
-    pos_l = plan_l.position if isinstance(plan_l.position, torch.Tensor) else torch.tensor(plan_l.position, dtype=torch.float32, device=dev)
+    pos_r = (
+        plan_r.position
+        if isinstance(plan_r.position, torch.Tensor)
+        else torch.tensor(plan_r.position, dtype=torch.float32, device=dev)
+    )
+    pos_l = (
+        plan_l.position
+        if isinstance(plan_l.position, torch.Tensor)
+        else torch.tensor(plan_l.position, dtype=torch.float32, device=dev)
+    )
     pos_r = pos_r.to(device=dev, dtype=torch.float32)
     pos_l = pos_l.to(device=dev, dtype=torch.float32)
 
@@ -755,16 +786,16 @@ def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]
 
     # Cross-product joint sequences for each arm separately
     q_r = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)  # [Nr*Nl, dof_r]
-    q_l = pos_l_dense.repeat(Nr, 1)                                # [Nr*Nl, dof_l]
+    q_l = pos_l_dense.repeat(Nr, 1)  # [Nr*Nl, dof_l]
     num = q_r.shape[0]
 
     # Compute min proximity per combined config without allocating [num, nR, nL]
     kin_r = planner_r.motion_gen.kinematics
     kin_l = planner_l.motion_gen.kinematics
 
-    B_NUM = int(getattr(args_cli, "pair_batch", 4096))      # batch over cross-product rows
-    CR = int(getattr(args_cli, "pair_chunk_r", 64))         # chunk right spheres
-    CL = int(getattr(args_cli, "pair_chunk_l", 64))         # chunk left spheres
+    B_NUM = int(getattr(args_cli, "pair_batch", 4096))  # batch over cross-product rows
+    CR = int(getattr(args_cli, "pair_chunk_r", 64))  # chunk right spheres
+    CL = int(getattr(args_cli, "pair_chunk_l", 64))  # chunk left spheres
     margin = float(getattr(args_cli, "joint_collision_margin", 0.0))
 
     colliding_rows = []
@@ -792,17 +823,17 @@ def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]
 
         for r0 in range(0, nR, CR):
             r1 = min(nR, r0 + CR)
-            c_r_ch = c_r[:, r0:r1, :]          # [bsz, cr, 3]
-            r_r_ch = r_r[:, r0:r1]             # [bsz, cr]
+            c_r_ch = c_r[:, r0:r1, :]  # [bsz, cr, 3]
+            r_r_ch = r_r[:, r0:r1]  # [bsz, cr]
             for l0 in range(0, nL, CL):
                 l1 = min(nL, l0 + CL)
-                c_l_ch = c_l[:, l0:l1, :]      # [bsz, cl, 3]
-                r_l_ch = r_l[:, l0:l1]         # [bsz, cl]
+                c_l_ch = c_l[:, l0:l1, :]  # [bsz, cl, 3]
+                r_l_ch = r_l[:, l0:l1]  # [bsz, cl]
 
-                diff = c_r_ch.unsqueeze(2) - c_l_ch.unsqueeze(1)   # [bsz, cr, cl, 3]
-                d = torch.linalg.norm(diff, dim=-1)                # [bsz, cr, cl]
-                rs = r_r_ch.unsqueeze(2) + r_l_ch.unsqueeze(1)     # [bsz, cr, cl]
-                prox = d - rs                                      # [bsz, cr, cl]
+                diff = c_r_ch.unsqueeze(2) - c_l_ch.unsqueeze(1)  # [bsz, cr, cl, 3]
+                d = torch.linalg.norm(diff, dim=-1)  # [bsz, cr, cl]
+                rs = r_r_ch.unsqueeze(2) + r_l_ch.unsqueeze(1)  # [bsz, cr, cl]
+                prox = d - rs  # [bsz, cr, cl]
                 local_min = prox.view(bsz, -1).min(dim=1).values
                 min_prox_b = torch.minimum(min_prox_b, local_min)
 
@@ -828,6 +859,7 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
 
     Returns two lists of times (seconds) aligned to each waypoint index for each path.
     """
+
     def _compress_pairs_min_j(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
         # Keep only the smallest j for each i (strict minimal collisions)
         min_j = {}
@@ -845,7 +877,9 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
     path1 = [None] * len_r
     path2 = [None] * len_l
     try:
-        t1, t2 = retime_paths(path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.02, verbose=False)
+        t1, t2 = retime_paths(
+            path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.02, verbose=False
+        )
         return t1, t2
     except AssertionError:
         # Retry with reduced constraints and larger dt
@@ -853,7 +887,9 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
         reduced = _cap_pairs(reduced, limit=500)
         larger_dt = max(min_dt * 2.0, 0.1)
         try:
-            t1, t2 = retime_paths(path1, path2, colliding=reduced, linear=True, min_dt=larger_dt, buffer=0.02, verbose=False)
+            t1, t2 = retime_paths(
+                path1, path2, colliding=reduced, linear=True, min_dt=larger_dt, buffer=0.02, verbose=False
+            )
             return t1, t2
         except AssertionError:
             return None
@@ -1055,7 +1091,9 @@ def _execute_plan(
     planner.clear()
 
 
-def _build_site_goal_bimanual(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_site_goal_bimanual(
+    ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Build paired goals for both arms in site/world frame so hands are close together in front.
 
     Logic:
@@ -1089,13 +1127,20 @@ def _build_site_goal_bimanual(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: to
     return goal_r, goal_l
 
 
-def _build_site_goal_independent(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_site_goal_independent(
+    ctrl_site_env_r: torch.Tensor, ctrl_site_env_l: torch.Tensor, args_cli, device
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Build per-arm goals in site/world with independent offsets (dx,dy,dz for each arm).
 
     If an arm-specific offset is None, fall back to the global dx/dy/dz for that component.
     """
+
     def pick(val_specific, val_global, default):
-        return float(val_specific) if val_specific is not None else (float(val_global) if val_global is not None else default)
+        return (
+            float(val_specific)
+            if val_specific is not None
+            else (float(val_global) if val_global is not None else default)
+        )
 
     # Resolve offsets
     rdx = pick(args_cli.right_dx, args_cli.dx, 0.0)
@@ -1126,8 +1171,18 @@ def _build_site_goal_independent(ctrl_site_env_r: torch.Tensor, ctrl_site_env_l:
 
 
 def _execute_plans_together(
-    env, robot, planner_r, planner_l, env_origin, site_from_r, site_from_l, args_cli, ee_vis_r=None, ee_vis_l=None,
-    *, retime_schedules: tuple[list[float], list[float]] | None = None,
+    env,
+    robot,
+    planner_r,
+    planner_l,
+    env_origin,
+    site_from_r,
+    site_from_l,
+    args_cli,
+    ee_vis_r=None,
+    ee_vis_l=None,
+    *,
+    retime_schedules: tuple[list[float], list[float]] | None = None,
 ) -> None:
     print("[PlanHumanoid] Executing bimanual plans together...")
     planned_r = planner_r.get_planned_poses()
@@ -1163,6 +1218,7 @@ def _execute_plans_together(
 
         # For time-based interpolation, store as Python lists for bisect
         import bisect
+
         times_r_list = [float(t) for t in times_r]
         times_l_list = [float(t) for t in times_l]
 
@@ -1185,7 +1241,7 @@ def _execute_plans_together(
         if len(planned_l) > len(planned_r):
             extra = [(len(planned_r) - 1, j) for j in range(len(planned_r), len(planned_l))]
             schedule.extend(extra)
-    
+
     for trial in range(args_cli.replay_trials):
         print(f"[PlanHumanoid] Replaying trial {trial + 1}/{args_cli.replay_trials}")
         env.reset()
@@ -1195,7 +1251,9 @@ def _execute_plans_together(
             base_rot_world_exec = PoseUtils.matrix_from_quat(
                 robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
             )[0]
-            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[0]
+            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[
+                0
+            ]
 
             if retime_schedules is not None:
                 t = step
@@ -1207,6 +1265,7 @@ def _execute_plans_together(
                 state_l = planner_l.motion_gen.kinematics.get_state(q_l_t.unsqueeze(0))
                 pose_r_bt = getattr(state_r, "ee_pose", None)
                 pose_l_bt = getattr(state_l, "ee_pose", None)
+
                 # Convert cuRobo Pose objects to 4x4 tensors (fallback to position/quaternion if needed)
                 def _pose_to_mat(pose_obj, state):
                     if pose_obj is not None and hasattr(pose_obj, "position"):
@@ -1271,13 +1330,146 @@ def _execute_plans_together(
     planner_l.clear()
 
 
+def _build_temp_robot_yaml_both_arms(usd_path: str) -> str:
+    # import pdb; pdb.set_trace()
+    tmp_dir = tempfile.mkdtemp(prefix="gr1_curobo_full_")
+    urdf_path, _ = ControllerUtils.convert_usd_to_urdf(usd_path, tmp_dir, force_conversion=True)
+
+    tool_links = [
+        "GR1T2_fourier_hand_6dof_right_hand_pitch_link",
+        "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
+    ]
+    robot_config = create_robot_config(
+        urdf_path,
+        tool_links=tool_links,
+        inactive_joints=[],
+        depth=2,
+        verbose=False,
+    )
+    max_spheres = 225 - len(tool_links) * 50
+    load_spheres(robot_config, max_spheres=max_spheres, max_link_spheres=int(1e9))
+
+    robot_cfg_yaml = robot_config["robot_cfg"]
+    robot_cfg_yaml = to_python(robot_cfg_yaml)
+
+    def _strip_keys(obj, keys):
+        """Remove specified keys from nested dictionary."""
+        if isinstance(obj, dict):
+            for k in list(obj.keys()):
+                if k in keys:
+                    obj.pop(k, None)
+                else:
+                    _strip_keys(obj[k], keys)
+        elif isinstance(obj, list):
+            for v in obj:
+                _strip_keys(v, keys)
+
+    # Remove lock_joints and cspace as they'll be configured dynamically
+    _strip_keys(robot_cfg_yaml, {"lock_joints", "cspace"})
+    # Ensure ee_link exists; pick right tool by default (doesn’t affect collisions)
+    if isinstance(robot_cfg_yaml, dict):
+        kin = robot_cfg_yaml.get("kinematics", None)
+        if isinstance(kin, dict):
+            kin["ee_link"] = "GR1T2_fourier_hand_6dof_right_hand_pitch_link"
+
+    out_dir = tempfile.mkdtemp(prefix="curobo_robot_cfg_full_")
+    out_path = os.path.join(out_dir, "gr1_full.yml")
+    with open(out_path, "w") as f:
+        yaml.safe_dump({"robot_cfg": robot_cfg_yaml}, f, sort_keys=False)
+    return out_path
+
+
+def _compute_colliding_pairs_joint_singlecall(planner_r, planner_l, full_robot_yaml: str) -> list[tuple[int, int]]:
+    from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
+
+    plan_r = getattr(planner_r, "current_plan", None)
+    plan_l = getattr(planner_l, "current_plan", None)
+    if plan_r is None or plan_l is None:
+        return []
+
+    dev = planner_r.tensor_args.device
+
+    pos_r = (
+        plan_r.position
+        if isinstance(plan_r.position, torch.Tensor)
+        else torch.tensor(plan_r.position, dtype=torch.float32, device=dev)
+    )
+    pos_l = (
+        plan_l.position
+        if isinstance(plan_l.position, torch.Tensor)
+        else torch.tensor(plan_l.position, dtype=torch.float32, device=dev)
+    )
+    pos_r = pos_r.to(device=dev, dtype=torch.float32)
+    pos_l = pos_l.to(device=dev, dtype=torch.float32)
+
+    factor = max(1, int(getattr(args_cli, "pair_densify", 1)))
+    pos_r_dense, map_r = _densify_plan_positions(pos_r, factor)
+    pos_l_dense, map_l = _densify_plan_positions(pos_l, factor)
+    Nr, Nl = int(pos_r_dense.shape[0]), int(pos_l_dense.shape[0])
+    if Nr == 0 or Nl == 0:
+        return []
+
+    # Build full-robot RobotWorld (both arms)
+    rw_cfg = RobotWorldConfig.load_from_config(
+        robot_config=full_robot_yaml,
+        world_model=None,
+        tensor_args=planner_r.tensor_args,
+        n_envs=1,
+        self_collision_activation_distance=float(getattr(args_cli, "joint_collision_margin", 0.0)),
+    )
+    robot_world = RobotWorld(rw_cfg)
+    full_joint_names = list(robot_world.kinematics.joint_names)
+    name_to_full = {n: i for i, n in enumerate(full_joint_names)}
+
+    # Map plan joints into full model indices
+    idx_r_full = torch.tensor([name_to_full[n] for n in plan_r.joint_names], dtype=torch.long, device=dev)
+    idx_l_full = torch.tensor([name_to_full[n] for n in plan_l.joint_names], dtype=torch.long, device=dev)
+
+    # Base full-DOF conf from env’s current joint state
+    env_joint_names = list(planner_r.robot.data.joint_names)
+    env_name_to_idx = {n: i for i, n in enumerate(env_joint_names)}
+    env_q = planner_r.robot.data.joint_pos[planner_r.env_id, :].to(device=dev, dtype=torch.float32)
+    base = torch.zeros(len(full_joint_names), device=dev, dtype=torch.float32)
+    for n, j in name_to_full.items():
+        if n in env_name_to_idx:
+            base[j] = env_q[env_name_to_idx[n]]
+
+    # Cross-product in the full model
+    num = Nr * Nl
+    confs = base.repeat(num, 1)
+    confs[:, idx_r_full] = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)
+    confs[:, idx_l_full] = pos_l_dense.repeat(Nr, 1)
+
+    # Single call: self-collision on full robot (captures inter-arm collisions)
+    B_NUM = int(getattr(args_cli, "pair_batch", 4096))
+    rows = []
+    for b0 in range(0, num, B_NUM):
+        b1 = min(num, b0 + B_NUM)
+        state = robot_world.get_kinematics(confs[b0:b1])
+        spheres = state.link_spheres_tensor.view(b1 - b0, 1, -1, 4)
+        d_self = robot_world.get_self_collision(spheres).view(-1)  # >0 => collision
+        local = torch.nonzero(d_self > 0.0, as_tuple=False).flatten()
+        if local.numel() > 0:
+            rows.extend((b0 + k.item()) for k in local)
+
+    if not rows:
+        return []
+
+    pairs = []
+    for k in rows:
+        i_dense = k // Nl
+        j_dense = k % Nl
+        pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
+    return pairs
+
+
 def main():
     np.random.seed(42)
     torch.manual_seed(42)
 
     # Build env and planner(s)
     if args_cli.arm == "both":
-        env, robot, planner_right, planner_left = _build_env_and_planners_both(args_cli)
+        env, robot, planner_right, planner_left, robot_yaml_both = _build_env_and_planners_both(args_cli)
 
         # Frames and calibration per arm
         env_origin_r, ctrl_site_env_r, T_world_base_r, T_world_tool_now_r, site_from_curobo_r = (
@@ -1292,8 +1484,12 @@ def main():
         use_independent = any(
             x is not None
             for x in (
-                args_cli.right_dx, args_cli.right_dy, args_cli.right_dz,
-                args_cli.left_dx, args_cli.left_dy, args_cli.left_dz,
+                args_cli.right_dx,
+                args_cli.right_dy,
+                args_cli.right_dz,
+                args_cli.left_dx,
+                args_cli.left_dy,
+                args_cli.left_dz,
             )
         )
         if use_independent:
@@ -1337,7 +1533,9 @@ def main():
         retime_sched = None
         if args_cli.collision_aware:
             # Prefer joint-level collision detection across both arms
-            colliding_pairs = _compute_colliding_pairs_joint(planner_right, planner_left)
+            colliding_pairs = _compute_colliding_pairs_joint(
+                planner_right, planner_left
+            )  # _compute_colliding_pairs_joint_singlecall(planner_right, planner_left, robot_yaml_both)
             # if not colliding_pairs:
             #     # Fallback to EE proximity if joint-level yields none
             #     print("[PlanHumanoid] No colliding joint waypoint pairs detected")
@@ -1357,7 +1555,10 @@ def main():
                     min_dt=0.01,
                 )
                 if retime_sched is None:
-                    print("[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware retime.")
+                    print(
+                        "[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware"
+                        " retime."
+                    )
             else:
                 print("[PlanHumanoid] No colliding waypoint pairs detected")
 

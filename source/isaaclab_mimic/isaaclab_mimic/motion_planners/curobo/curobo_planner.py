@@ -7,7 +7,7 @@ import logging
 import numpy as np
 import torch
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, List, cast
 
 from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModelState
 from curobo.geom.sdf.world import CollisionCheckerType
@@ -1055,6 +1055,8 @@ class CuroboPlanner(MotionPlannerBase):
         target_pose: torch.Tensor,
         step_size: float | None = None,
         enable_retiming: bool | None = None,
+        *,
+        link_target_poses_base: dict[str, torch.Tensor] | None = None,
     ) -> bool:
         """Plan collision-free motion to target pose.
 
@@ -1088,18 +1090,59 @@ class CuroboPlanner(MotionPlannerBase):
 
         self.logger.debug(f"Retiming enabled: {enable_retiming}, Step size: {step_size}")
 
-        success: bool = self._plan_to_contact(
-            start_state=start_state,
-            goal_pose=target_curobo_pose,
-            retreat_distance=self.config.retreat_distance,
-            approach_distance=self.config.approach_distance,
-            retime_plan=enable_retiming,
-            step_size=step_size,
-            contact=False,
-        )
+        # If multi-link targets provided, do a direct single attempt with link poses
+        if link_target_poses_base:
+            # Build a dict[name->Pose] for only the constrained links (robust to cuRobo variants)
+            link_pose_dict: dict[str, Pose] = {}
+            for name, T_base_link in link_target_poses_base.items():
+                pos_l, rot_l = PoseUtils.unmake_pose(
+                    T_base_link.to(device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+                )
+                link_pose_dict[name] = self._make_pose(position=pos_l, quaternion=PoseUtils.quat_from_matrix(rot_l))
+            # Prefer start-state-as-retract to bias IK/trajopt to current configuration
+            prev_use_start = getattr(self.plan_config, "use_start_state_as_retract", None)
+            if prev_use_start is not None:
+                self.plan_config.use_start_state_as_retract = True
+            result: Any = self.motion_gen.plan_single(
+                start_state,
+                target_curobo_pose,
+                self.plan_config,
+                link_poses=link_pose_dict,
+            )
+            if prev_use_start is not None:
+                self.plan_config.use_start_state_as_retract = prev_use_start
 
-        # Visualize plan if enabled
+            success = bool(result.success.item()) if hasattr(result, "success") else False
+            if success:
+                if result.optimized_plan is not None and len(result.optimized_plan.position) != 0:
+                    self._current_plan = result.optimized_plan
+                else:
+                    self._current_plan = result.get_interpolated_plan()
+
+                self._current_plan = self.motion_gen.get_full_js(self._current_plan)
+                common_js_names: list[str] = [
+                    x for x in self.robot.data.joint_names if x in self._current_plan.joint_names
+                ]
+                self._current_plan = self._current_plan.get_ordered_joint_state(common_js_names)
+            else:
+                self._current_plan = None
+        else:
+            success: bool = self._plan_to_contact(
+                start_state=start_state,
+                goal_pose=target_curobo_pose,
+                retreat_distance=self.config.retreat_distance,
+                approach_distance=self.config.approach_distance,
+                retime_plan=enable_retiming,
+                step_size=step_size,
+                contact=False,
+            )
+
+        # Visualize plan if enabled (ensure cuRobo kinematic joint ordering for FK)
         if success and self.visualize_plan and self._current_plan is not None:
+            try:
+                viz_plan = self._current_plan.get_ordered_joint_state(self.motion_gen.kinematics.joint_names)
+            except Exception:
+                viz_plan = self._current_plan
             # Get current spheres for visualization
             self._sync_object_poses_with_isaaclab()
             cu_js = self._get_current_joint_state_for_curobo()
@@ -1131,8 +1174,8 @@ class CuroboPlanner(MotionPlannerBase):
             # Compute end-effector positions for visualization
             ee_positions_list = []
             try:
-                for i in range(len(self._current_plan.position)):
-                    js: JointState = self._current_plan[i]
+                for i in range(len(viz_plan.position)):
+                    js: JointState = viz_plan[i]
                     kin = self.motion_gen.compute_kinematics(js)
                     ee_pos = kin.ee_position if hasattr(kin, "ee_position") else kin.ee_pose.position
                     ee_positions_list.append(ee_pos.cpu().numpy().squeeze())
@@ -1152,7 +1195,7 @@ class CuroboPlanner(MotionPlannerBase):
 
             # Visualize plan
             self.plan_visualizer.visualize_plan(
-                plan=self._current_plan,
+                plan=viz_plan,
                 target_pose=target_pose,
                 robot_spheres=robot_spheres,
                 attached_spheres=attached_spheres,
@@ -1166,7 +1209,7 @@ class CuroboPlanner(MotionPlannerBase):
 
             # Animate spheres along the path for collision visualization
             self.plan_visualizer.animate_spheres_along_path(
-                plan=self._current_plan,
+                plan=viz_plan,
                 robot_spheres_at_start=robot_spheres,
                 attached_spheres_at_start=attached_spheres,
                 timeline="sphere_animation",
@@ -1180,6 +1223,8 @@ class CuroboPlanner(MotionPlannerBase):
         start_state: JointState,
         goal_pose: Pose,
         contact: bool = True,
+        *,
+        link_poses: dict[str, Pose] | None = None,
     ) -> bool:
         """Plan motion with configurable collision checking for contact scenarios.
 
@@ -1233,7 +1278,22 @@ class CuroboPlanner(MotionPlannerBase):
 
         planning_success = False
         try:
-            result: Any = self.motion_gen.plan_single(start_state, goal_pose, self.plan_config)
+            # Convert dict link poses to list aligned with kinematics link order if provided
+            link_pose_list: list[Pose] | None = None
+            if link_poses is not None and len(link_poses) > 0:
+                names = list(self.motion_gen.kinematics.link_names)
+                link_pose_list = []
+                for name in names:
+                    if name in link_poses:
+                        link_pose_list.append(link_poses[name])
+                    else:
+                        link_pose_list.append(None)
+            result: Any = self.motion_gen.plan_single(
+                start_state,
+                goal_pose,
+                self.plan_config,
+                link_poses=cast(list[Pose], link_pose_list) if link_pose_list is not None else None,
+            )
 
             if result.success.item():
                 if result.optimized_plan is not None and len(result.optimized_plan.position) != 0:
@@ -1274,6 +1334,8 @@ class CuroboPlanner(MotionPlannerBase):
         contact: bool = False,
         retime_plan: bool = False,
         step_size: float | None = None,
+        *,
+        link_poses: dict[str, Pose] | None = None,
     ) -> bool:
         """Execute multi-phase contact planning with approach and retreat phases.
 
@@ -1331,6 +1393,7 @@ class CuroboPlanner(MotionPlannerBase):
                 start_state=current_state,
                 goal_pose=target_pose,
                 contact=contact_flag,
+                link_poses=link_poses,
             )
 
             if not success:
@@ -1749,6 +1812,7 @@ class CuroboPlanner(MotionPlannerBase):
         env_id: int = 0,
         step_size: float | None = None,
         enable_retiming: bool | None = None,
+        link_target_poses_base: dict[str, torch.Tensor] | None = None,
     ) -> bool:
         """Complete planning pipeline with world updates and object attachment handling.
 
@@ -1837,7 +1901,12 @@ class CuroboPlanner(MotionPlannerBase):
 
         self.logger.debug(f"Planning motion with attached objects: {self.get_attached_objects()}")
 
-        plan_success = self.plan_motion(target_pose, step_size, enable_retiming)
+        plan_success = self.plan_motion(
+            target_pose,
+            step_size,
+            enable_retiming,
+            link_target_poses_base=link_target_poses_base,
+        )
 
         self.logger.debug(f"Planning result: {plan_success}")
         self.logger.debug("=== END POST-GRASP DEBUG ===")
