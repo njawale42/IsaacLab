@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+import yaml
 import torch
 from collections.abc import Iterable
 
@@ -47,6 +50,22 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             collision_active_link_substrings: Optional substrings to force collision spheres to stay
                 active for links matching any of the substrings (e.g., ("left_", "right_"))
         """
+        # Pre-apply collision_sphere_buffer into the robot YAML so cuRobo kinematics picks it up
+        if isinstance(config.robot_config_file, str) and os.path.isfile(config.robot_config_file):
+            with open(config.robot_config_file, "r") as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict) and "robot_cfg" in data and "kinematics" in data["robot_cfg"]:
+                kin = data["robot_cfg"]["kinematics"]
+                # Mirror behavior of extra_collision_spheres: set buffer as a kinematics key
+                if getattr(config, "collision_sphere_buffer", None) is not None:
+                    kin["collision_sphere_buffer"] = float(config.collision_sphere_buffer)
+            tmp_dir = tempfile.mkdtemp(prefix="curobo_robot_cfg_")
+            out_path = os.path.join(tmp_dir, os.path.basename(config.robot_config_file))
+            with open(out_path, "w") as f:
+                yaml.safe_dump(data, f, sort_keys=False)
+            config.robot_config_file = out_path
+
+
         super().__init__(env=env, robot=robot, config=config, env_id=env_id)
 
         self.env_id = env_id

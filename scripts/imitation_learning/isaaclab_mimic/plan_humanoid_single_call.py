@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# Copyright (c) 2024-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import traceback
 
@@ -46,6 +51,9 @@ import yaml
 from dataclasses import replace as dc_replace
 from typing import Any, cast
 
+from nvplan.applications.custream.config import create_robot_config
+from nvplan.applications.custream.spheres import load_spheres
+
 import isaaclab.utils.math as PoseUtils
 from isaaclab.controllers import utils as ControllerUtils
 from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
@@ -53,13 +61,11 @@ from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
 import isaaclab_mimic.envs  # noqa: F401
 import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
 from isaaclab_mimic.envs.pinocchio_envs.pickplace_gr1t2_mimic_env_cfg import PickPlaceGR1T2MimicEnvCfg
-from isaaclab_mimic.motion_planners.curobo.curobo_planner_humanoid import HumanoidArmCuroboPlanner
-from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
 from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
+from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
+from isaaclab_mimic.motion_planners.curobo.curobo_planner_humanoid import HumanoidArmCuroboPlanner
 
 import isaaclab_tasks  # noqa: F401
-from nvplan.applications.custream.config import create_robot_config
-from nvplan.applications.custream.spheres import load_spheres
 
 
 def _tool_link_for_arm(arm: str) -> str:
@@ -155,6 +161,8 @@ def _build_env_and_planner_bimanual_single(args_cli):
 
     usd_path = cast(Any, env_cfg).scene.robot.spawn.usd_path
     inactive_joint_names = list(env_cfg.actions.pink_ik_cfg.ik_urdf_fixed_joint_names) or []
+    # inactive_joint_names.extend(env_cfg.actions.pink_ik_cfg.hand_joint_names)  # add finger joints here
+    print(f"Inactive joint names: {inactive_joint_names}")
     robot_yaml_both = _build_temp_robot_yaml_both_arms(usd_path, inactive_joints=inactive_joint_names)
 
     env = gym.make(env_name, cfg=env_cfg).unwrapped
@@ -171,6 +179,8 @@ def _build_env_and_planner_bimanual_single(args_cli):
     cfg.approach_distance = 0.0
     cfg.retreat_distance = 0.0
     cfg.time_dilation_factor = 0.5
+    cfg.collision_activation_distance = 0.04
+    cfg.collision_sphere_buffer = 0.015
     cfg.enable_finetune_trajopt = True
     cfg.ee_link_name = _tool_link_for_arm("right")  # primary for MotionGen; we’ll set link_poses for both
     cfg.enable_graph = True
@@ -178,7 +188,7 @@ def _build_env_and_planner_bimanual_single(args_cli):
     cfg.max_planning_attempts = 10
     cfg.gripper_open_positions = {}
     cfg.gripper_closed_positions = {}
-
+    
     robot = cast(Any, env).scene["robot"]
     # For single-call bimanual, keep collisions active only for the primary arm (right) and trunk
     # to avoid inter-arm self-collision over-constraints during planning
@@ -205,7 +215,11 @@ def _link_pose_base(planner: CuroboPlanner, link_name: str, device) -> torch.Ten
     # Compute current base->link pose using cuRobo kinematics
     js = planner._get_current_joint_state_for_curobo()
     kin = planner.motion_gen.kinematics
-    q = js.position if isinstance(js.position, torch.Tensor) else torch.tensor(js.position, dtype=planner.tensor_args.dtype, device=planner.tensor_args.device)
+    q = (
+        js.position
+        if isinstance(js.position, torch.Tensor)
+        else torch.tensor(js.position, dtype=planner.tensor_args.dtype, device=planner.tensor_args.device)
+    )
     if q.dim() == 1:
         q = q.unsqueeze(0)
     state = kin.get_state(q)
@@ -234,7 +248,11 @@ def _compute_site_mapping_for_link(env, planner, link_name: str, ctrl_site_eef_n
 
 def _build_site_goal_independent(ctrl_site_env_r, ctrl_site_env_l, args_cli, device):
     def pick(val_specific, val_global, default):
-        return float(val_specific) if val_specific is not None else (float(val_global) if val_global is not None else default)
+        return (
+            float(val_specific)
+            if val_specific is not None
+            else (float(val_global) if val_global is not None else default)
+        )
 
     rdx = pick(args_cli.right_dx, args_cli.dx, 0.0)
     rdy = pick(args_cli.right_dy, args_cli.dy, 0.0)
@@ -251,7 +269,10 @@ def _build_site_goal_independent(ctrl_site_env_r, ctrl_site_env_l, args_cli, dev
     goal_l[0, 3] = goal_l[0, 3] + ldx
     goal_l[1, 3] = goal_l[1, 3] + ldy
     goal_l[2, 3] = goal_l[2, 3] + ldz
-    print(f"[SingleCall] Independent goals | R dpos=({rdx:.3f},{rdy:.3f},{rdz:.3f}) m | L dpos=({ldx:.3f},{ldy:.3f},{ldz:.3f}) m")
+    print(
+        f"[SingleCall] Independent goals | R dpos=({rdx:.3f},{rdy:.3f},{rdz:.3f}) m | L"
+        f" dpos=({ldx:.3f},{ldy:.3f},{ldz:.3f}) m"
+    )
     return goal_r, goal_l
 
 
@@ -269,7 +290,10 @@ def _build_site_goal_bimanual(ctrl_site_env_r, ctrl_site_env_l, args_cli, device
     goal_l[:3, 3] = target_mid
     goal_r[0, 3] = goal_r[0, 3] + half_gap
     goal_l[0, 3] = goal_l[0, 3] - half_gap
-    print(f"[SingleCall] Bimanual goals | mid={target_mid.cpu().numpy()} | gap={2*half_gap:.3f}m, forward={forward:.3f}m, up={upward:.3f}m")
+    print(
+        f"[SingleCall] Bimanual goals | mid={target_mid.cpu().numpy()} | gap={2*half_gap:.3f}m, forward={forward:.3f}m,"
+        f" up={upward:.3f}m"
+    )
     return goal_r, goal_l
 
 
@@ -288,6 +312,7 @@ def _visualize_goals(args_cli, env, goal_r_env_site, goal_l_env_site):
 
         def as_quat(T):
             return PoseUtils.quat_from_matrix(T[:3, :3].unsqueeze(0))[0].detach().to(dtype=torch.float32)
+
         pos_r, quat_r = goal_r_env_site[:3, 3].float(), as_quat(goal_r_env_site)
         pos_l, quat_l = goal_l_env_site[:3, 3].float(), as_quat(goal_l_env_site)
         goal_vis_r.visualize(translations=pos_r.unsqueeze(0), orientations=quat_r.unsqueeze(0))
@@ -310,6 +335,16 @@ def _execute_bimanual_plan(env, robot, planner: CuroboPlanner, T_tool_site_r, T_
     link_r = _tool_link_for_arm("right")
     link_l = _tool_link_for_arm("left")
 
+    # Precompute hand joint names and index map in cuRobo order (same as plan_exec)
+    hand_names = env.cfg.actions.pink_ik_cfg.hand_joint_names
+    left_hand_names = [n for n in hand_names if n.startswith("L_")]
+    right_hand_names = [n for n in hand_names if n.startswith("R_")]
+    cu_order = list(planner.motion_gen.kinematics.joint_names)
+    name_to_cu_idx = {n: i for i, n in enumerate(cu_order)}
+    # Idle fallbacks for any missing joints in plan
+    idle_left = idle[14:25].to(device=env.device, dtype=torch.float32)
+    idle_right = idle[25:36].to(device=env.device, dtype=torch.float32)
+
     for trial in range(args_cli.replay_trials if hasattr(args_cli, "replay_trials") else 1):
         print(f"[SingleCall] Replaying trial {trial + 1}")
         env.reset()
@@ -322,16 +357,21 @@ def _execute_bimanual_plan(env, robot, planner: CuroboPlanner, T_tool_site_r, T_
         except Exception:
             T_tool_site_r_exec = T_tool_site_r
             T_tool_site_l_exec = T_tool_site_l
-        # Reorder plan to cuRobo kinematic order for FK-consistent playback (diagnostics and mapping)
-        cu_order = list(planner.motion_gen.kinematics.joint_names)
+        # Reorder plan to cuRobo kinematic order for FK-consistent playback and gripper sampling
         plan_exec = plan_js.get_ordered_joint_state(cu_order)
         for k in range(len(plan_js.position)):
             base_pos_world = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
-            base_rot_world = PoseUtils.matrix_from_quat(robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32))[0]
+            base_rot_world = PoseUtils.matrix_from_quat(
+                robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
+            )[0]
             T_world_base = PoseUtils.make_pose(base_pos_world.unsqueeze(0), base_rot_world.unsqueeze(0))[0]
 
             js_k = plan_exec[k]
-            qk = js_k.position if isinstance(js_k.position, torch.Tensor) else torch.tensor(js_k.position, dtype=planner.tensor_args.dtype, device=planner.tensor_args.device)
+            qk = (
+                js_k.position
+                if isinstance(js_k.position, torch.Tensor)
+                else torch.tensor(js_k.position, dtype=planner.tensor_args.dtype, device=planner.tensor_args.device)
+            )
             if qk.dim() == 1:
                 qk = qk.unsqueeze(0)
             state = kin.get_state(qk)
@@ -357,9 +397,29 @@ def _execute_bimanual_plan(env, robot, planner: CuroboPlanner, T_tool_site_r, T_
             T_site_r[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
             T_site_l[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
 
+            # Build per-step gripper commands from the plan in cuRobo order (fallback to idle per joint if absent)
+            js_k = plan_exec[k]
+            pos_vec = (
+                js_k.position
+                if isinstance(js_k.position, torch.Tensor)
+                else torch.tensor(js_k.position, dtype=planner.tensor_args.dtype, device=planner.tensor_args.device)
+            )
+            pos_vec = pos_vec.to(device=env.device, dtype=torch.float32)
+            if pos_vec.dim() == 2:
+                pos_vec = pos_vec.squeeze(0)
+
+            gr_left = torch.stack([
+                pos_vec[name_to_cu_idx[n]] if n in name_to_cu_idx else idle_left[i]
+                for i, n in enumerate(left_hand_names)
+            ])
+            gr_right = torch.stack([
+                pos_vec[name_to_cu_idx[n]] if n in name_to_cu_idx else idle_right[i]
+                for i, n in enumerate(right_hand_names)
+            ])
+
             action = env.target_eef_pose_to_action(
                 target_eef_pose_dict={"left": T_site_l, "right": T_site_r},
-                gripper_action_dict={"left": idle[14:25], "right": idle[25:36]},
+                gripper_action_dict={"left": gr_left, "right": gr_right},
                 action_noise_dict=None,
                 env_id=0,
             )
@@ -377,7 +437,10 @@ def _execute_bimanual_plan(env, robot, planner: CuroboPlanner, T_tool_site_r, T_
                 re_l_rot_m = inf_l[:3, :3].T @ T_site_l[:3, :3]
                 re_l_rot = torch.acos(torch.clamp((torch.trace(re_l_rot_m) - 1.0) / 2.0, -1.0, 1.0)).item()
                 if (k == 0) or ((k + 1) % 25 == 0) or (k == len(plan_js.position) - 1):
-                    print(f"[SingleCall][ExecDiag] inversion | R pos={re_r_pos:.3e} rot={re_r_rot:.3e} | L pos={re_l_pos:.3e} rot={re_l_rot:.3e}")
+                    print(
+                        f"[SingleCall][ExecDiag] inversion | R pos={re_r_pos:.3e} rot={re_r_rot:.3e} | L"
+                        f" pos={re_l_pos:.3e} rot={re_l_rot:.3e}"
+                    )
             except Exception as e:
                 print(f"[SingleCall][ExecDiag] inversion failed: {e}")
             env.step(action)
@@ -400,10 +463,20 @@ def main():
 
     # Build target goals in site/world
     use_independent = any(
-        x is not None for x in (args_cli.right_dx, args_cli.right_dy, args_cli.right_dz, args_cli.left_dx, args_cli.left_dy, args_cli.left_dz)
+        x is not None
+        for x in (
+            args_cli.right_dx,
+            args_cli.right_dy,
+            args_cli.right_dz,
+            args_cli.left_dx,
+            args_cli.left_dy,
+            args_cli.left_dz,
+        )
     )
     if use_independent:
-        goal_env_site_r, goal_env_site_l = _build_site_goal_independent(ctrl_site_env_r, ctrl_site_env_l, args_cli, device)
+        goal_env_site_r, goal_env_site_l = _build_site_goal_independent(
+            ctrl_site_env_r, ctrl_site_env_l, args_cli, device
+        )
     else:
         goal_env_site_r, goal_env_site_l = _build_site_goal_bimanual(ctrl_site_env_r, ctrl_site_env_l, args_cli, device)
 
@@ -415,7 +488,6 @@ def main():
     T_world_tool_goal_r = (goal_env_site_r @ T_site_inv_r).clone()
     T_world_tool_goal_l = (goal_env_site_l @ T_site_inv_l).clone()
     T_base_world = torch.linalg.inv(T_world_base)
-    T_base_tool_goal_r = (T_base_world @ T_world_tool_goal_r).clone()
     T_base_tool_goal_l = (T_base_world @ T_world_tool_goal_l).clone()
 
     # Plan once via humanoid wrapper; pass world-frame target (wrapper converts to base)
@@ -427,30 +499,27 @@ def main():
         link_targets = {link_l: T_base_tool_goal_l}
 
         # --- Diagnostics to validate frames and link names before planning ---
-        try:
-            kin_names = set([str(n) for n in planner.motion_gen.kinematics.link_names])
-            print(f"[SingleCall][Debug] ee_link_name (planner): {planner.config.ee_link_name}")
-            print(f"[SingleCall][Debug] link_targets keys: {list(link_targets.keys())}")
-            for ln in [link_r, link_l]:
-                print(f"[SingleCall][Debug] link '{ln}' in kinematics: {ln in kin_names}")
+        kin_names = {str(n) for n in planner.motion_gen.kinematics.link_names}
+        print(f"[SingleCall][Debug] ee_link_name (planner): {planner.config.ee_link_name}")
+        print(f"[SingleCall][Debug] link_targets keys: {list(link_targets.keys())}")
+        for ln in [link_r, link_l]:
+            print(f"[SingleCall][Debug] link '{ln}' in kinematics: {ln in kin_names}")
 
-            # World/site consistency for RIGHT: T_world_tool_goal_r @ T_tool_site_r should match goal_env_site_r
-            T_world_site_goal_r_calc = (T_world_tool_goal_r @ T_tool_site_r).clone()
-            pos_err_r = torch.linalg.vector_norm(T_world_site_goal_r_calc[:3, 3] - goal_env_site_r[:3, 3]).item()
-            rot_err_mat_r = T_world_site_goal_r_calc[:3, :3].T @ goal_env_site_r[:3, :3]
-            rot_err_trace_r = torch.clamp((torch.trace(rot_err_mat_r) - 1.0) / 2.0, -1.0, 1.0)
-            rot_err_r = torch.acos(rot_err_trace_r).item()
-            print(f"[SingleCall][Debug] RIGHT site frame check | pos_err={pos_err_r:.4e} m | rot_err={rot_err_r:.4e} rad")
+        # World/site consistency for RIGHT: T_world_tool_goal_r @ T_tool_site_r should match goal_env_site_r
+        T_world_site_goal_r_calc = (T_world_tool_goal_r @ T_tool_site_r).clone()
+        pos_err_r = torch.linalg.vector_norm(T_world_site_goal_r_calc[:3, 3] - goal_env_site_r[:3, 3]).item()
+        rot_err_mat_r = T_world_site_goal_r_calc[:3, :3].T @ goal_env_site_r[:3, :3]
+        rot_err_trace_r = torch.clamp((torch.trace(rot_err_mat_r) - 1.0) / 2.0, -1.0, 1.0)
+        rot_err_r = torch.acos(rot_err_trace_r).item()
+        print(f"[SingleCall][Debug] RIGHT site frame check | pos_err={pos_err_r:.4e} m | rot_err={rot_err_r:.4e} rad")
 
-            # Base/tool consistency for LEFT: T_base_world @ T_world_tool_goal_l should equal T_base_tool_goal_l
-            T_base_tool_goal_l_from_world = (T_base_world @ T_world_tool_goal_l).clone()
-            pos_err_l = torch.linalg.vector_norm(T_base_tool_goal_l_from_world[:3, 3] - T_base_tool_goal_l[:3, 3]).item()
-            rot_err_mat_l = T_base_tool_goal_l_from_world[:3, :3].T @ T_base_tool_goal_l[:3, :3]
-            rot_err_trace_l = torch.clamp((torch.trace(rot_err_mat_l) - 1.0) / 2.0, -1.0, 1.0)
-            rot_err_l = torch.acos(rot_err_trace_l).item()
-            print(f"[SingleCall][Debug] LEFT base frame check | pos_err={pos_err_l:.4e} m | rot_err={rot_err_l:.4e} rad")
-        except Exception as e:
-            print(f"[SingleCall][Debug] Diagnostics failed: {e}")
+        # Base/tool consistency for LEFT: T_base_world @ T_world_tool_goal_l should equal T_base_tool_goal_l
+        T_base_tool_goal_l_from_world = (T_base_world @ T_world_tool_goal_l).clone()
+        pos_err_l = torch.linalg.vector_norm(T_base_tool_goal_l_from_world[:3, 3] - T_base_tool_goal_l[:3, 3]).item()
+        rot_err_mat_l = T_base_tool_goal_l_from_world[:3, :3].T @ T_base_tool_goal_l[:3, :3]
+        rot_err_trace_l = torch.clamp((torch.trace(rot_err_mat_l) - 1.0) / 2.0, -1.0, 1.0)
+        rot_err_l = torch.acos(rot_err_trace_l).item()
+        print(f"[SingleCall][Debug] LEFT base frame check | pos_err={pos_err_l:.4e} m | rot_err={rot_err_l:.4e} rad")
 
         ok = planner.update_world_and_plan_motion(
             target_pose=T_world_tool_goal_r,
@@ -481,49 +550,54 @@ def main():
             plan_js = tmp
 
     # --- Post-plan diagnostics: does the last planned pose match the goals? ---
-    try:
-        # Reorder to cuRobo kinematics joint order for FK diagnostics
-        cu_order = list(planner.motion_gen.kinematics.joint_names)
-        cu_plan = plan_js.get_ordered_joint_state(cu_order)
-        q_last = cu_plan.position[-1]
-        if q_last.dim() == 1:
-            q_last = q_last.unsqueeze(0)
-        state_last = planner.motion_gen.kinematics.get_state(q_last)
-        names_last = list(cast(Any, state_last).link_names)
-        idx_r = names_last.index(link_r)
-        idx_l = names_last.index(link_l)
+    # Reorder to cuRobo kinematics joint order for FK diagnostics
+    cu_order = list(planner.motion_gen.kinematics.joint_names)
+    cu_plan = plan_js.get_ordered_joint_state(cu_order)
+    q_last_val = cu_plan.position[-1]
+    q_last = (
+        q_last_val
+        if isinstance(q_last_val, torch.Tensor)
+        else torch.tensor(q_last_val, dtype=planner.tensor_args.dtype, device=planner.tensor_args.device)
+    )
+    if q_last.dim() == 1:
+        q_last = q_last.unsqueeze(0)
+    state_last = planner.motion_gen.kinematics.get_state(q_last)
+    names_last = list(cast(Any, state_last).link_names)
+    idx_r = names_last.index(link_r)
+    idx_l = names_last.index(link_l)
 
-        pos_r = cast(Any, state_last).links_position[..., idx_r, :]
-        quat_r = cast(Any, state_last).links_quaternion[..., idx_r, :]
-        R_r = PoseUtils.matrix_from_quat(quat_r.view(1, 4))[0]
-        pose_r_bt = PoseUtils.make_pose(pos_r.view(1, 3), R_r.unsqueeze(0))[0]
+    pos_r = cast(Any, state_last).links_position[..., idx_r, :]
+    quat_r = cast(Any, state_last).links_quaternion[..., idx_r, :]
+    R_r = PoseUtils.matrix_from_quat(quat_r.view(1, 4))[0]
+    pose_r_bt = PoseUtils.make_pose(pos_r.view(1, 3), R_r.unsqueeze(0))[0]
 
-        pos_l = cast(Any, state_last).links_position[..., idx_l, :]
-        quat_l = cast(Any, state_last).links_quaternion[..., idx_l, :]
-        R_l = PoseUtils.matrix_from_quat(quat_l.view(1, 4))[0]
-        pose_l_bt = PoseUtils.make_pose(pos_l.view(1, 3), R_l.unsqueeze(0))[0]
+    pos_l = cast(Any, state_last).links_position[..., idx_l, :]
+    quat_l = cast(Any, state_last).links_quaternion[..., idx_l, :]
+    R_l = PoseUtils.matrix_from_quat(quat_l.view(1, 4))[0]
+    pose_l_bt = PoseUtils.make_pose(pos_l.view(1, 3), R_l.unsqueeze(0))[0]
 
-        T_world_tool_r_final = (T_world_base @ pose_r_bt).clone()
-        T_world_tool_l_final = (T_world_base @ pose_l_bt).clone()
+    T_world_tool_r_final = (T_world_base @ pose_r_bt).clone()
+    # T_world_tool_l_final not used; avoid computing to keep linter clean
 
-        # Compare in site/world for right
-        T_world_site_r_final = (T_world_tool_r_final @ T_tool_site_r).clone()
-        pos_err_r = torch.linalg.vector_norm(T_world_site_r_final[:3, 3] - goal_env_site_r[:3, 3]).item()
-        rot_err_mat_r = T_world_site_r_final[:3, :3].T @ goal_env_site_r[:3, :3]
-        rot_err_trace_r = torch.clamp((torch.trace(rot_err_mat_r) - 1.0) / 2.0, -1.0, 1.0)
-        rot_err_r = torch.acos(rot_err_trace_r).item()
-        print(f"[SingleCall][PlanDiag] RIGHT final vs goal (site) | pos_err={pos_err_r:.4e} m | rot_err={rot_err_r:.4e} rad")
+    # Compare in site/world for right
+    T_world_site_r_final = (T_world_tool_r_final @ T_tool_site_r).clone()
+    pos_err_r = torch.linalg.vector_norm(T_world_site_r_final[:3, 3] - goal_env_site_r[:3, 3]).item()
+    rot_err_mat_r = T_world_site_r_final[:3, :3].T @ goal_env_site_r[:3, :3]
+    rot_err_trace_r = torch.clamp((torch.trace(rot_err_mat_r) - 1.0) / 2.0, -1.0, 1.0)
+    rot_err_r = torch.acos(rot_err_trace_r).item()
+    print(
+        f"[SingleCall][PlanDiag] RIGHT final vs goal (site) | pos_err={pos_err_r:.4e} m | rot_err={rot_err_r:.4e} rad"
+    )
 
-        # Compare base/tool for left
-        pos_err_l = torch.linalg.vector_norm(pose_l_bt[:3, 3] - T_base_tool_goal_l[:3, 3]).item()
-        rot_err_mat_l = pose_l_bt[:3, :3].T @ T_base_tool_goal_l[:3, :3]
-        rot_err_trace_l = torch.clamp((torch.trace(rot_err_mat_l) - 1.0) / 2.0, -1.0, 1.0)
-        rot_err_l = torch.acos(rot_err_trace_l).item()
-        print(f"[SingleCall][PlanDiag] LEFT final vs goal (base) | pos_err={pos_err_l:.4e} m | rot_err={rot_err_l:.4e} rad")
-    except Exception as e:
-        print(f"[SingleCall][PlanDiag] Failed: {e}")
-
+    # Compare base/tool for left
+    pos_err_l = torch.linalg.vector_norm(pose_l_bt[:3, 3] - T_base_tool_goal_l[:3, 3]).item()
+    rot_err_mat_l = pose_l_bt[:3, :3].T @ T_base_tool_goal_l[:3, :3]
+    rot_err_trace_l = torch.clamp((torch.trace(rot_err_mat_l) - 1.0) / 2.0, -1.0, 1.0)
+    rot_err_l = torch.acos(rot_err_trace_l).item()
+    print(f"[SingleCall][PlanDiag] LEFT final vs goal (base) | pos_err={pos_err_l:.4e} m | rot_err={rot_err_l:.4e} rad")
     print(f"[SingleCall] Planned waypoints: {len(plan_js.position)}")
+
+    # Execute the plan
     _execute_bimanual_plan(env, robot, planner, T_tool_site_r, T_tool_site_l, env_origin, plan_js)
 
 

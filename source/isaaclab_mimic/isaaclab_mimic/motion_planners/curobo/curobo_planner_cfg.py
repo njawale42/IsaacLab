@@ -167,6 +167,9 @@ class CuroboPlannerCfg:
     cuda_device: int | None = 0
     """Preferred CUDA device index; None uses torch.cuda.current_device() (respects CUDA_VISIBLE_DEVICES)."""
 
+    collision_sphere_buffer: float = 0.0
+    """Buffer for collision spheres."""
+
     def get_world_config(self) -> WorldConfig:
         """Load and prepare the world configuration.
 
