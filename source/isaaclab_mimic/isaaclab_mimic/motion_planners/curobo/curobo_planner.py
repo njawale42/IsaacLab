@@ -1126,6 +1126,7 @@ class CuroboPlanner(MotionPlannerBase):
                 self._current_plan = self._current_plan.get_ordered_joint_state(common_js_names)
             else:
                 self._current_plan = None
+                print(f"Plan failed: {result.status}")
         else:
             success: bool = self._plan_to_contact(
                 start_state=start_state,
