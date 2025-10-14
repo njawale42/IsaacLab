@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import os
 import tempfile
-import yaml
 import torch
+import yaml
 from collections.abc import Iterable
 
 from curobo.types.state import JointState
@@ -52,7 +52,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         """
         # Pre-apply collision_sphere_buffer into the robot YAML so cuRobo kinematics picks it up
         if isinstance(config.robot_config_file, str) and os.path.isfile(config.robot_config_file):
-            with open(config.robot_config_file, "r") as f:
+            with open(config.robot_config_file) as f:
                 data = yaml.safe_load(f)
             if isinstance(data, dict) and "robot_cfg" in data and "kinematics" in data["robot_cfg"]:
                 kin = data["robot_cfg"]["kinematics"]
@@ -64,7 +64,6 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             with open(out_path, "w") as f:
                 yaml.safe_dump(data, f, sort_keys=False)
             config.robot_config_file = out_path
-
 
         super().__init__(env=env, robot=robot, config=config, env_id=env_id)
 

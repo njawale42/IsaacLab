@@ -179,8 +179,8 @@ def _build_env_and_planner_bimanual_single(args_cli):
     cfg.approach_distance = 0.0
     cfg.retreat_distance = 0.0
     cfg.time_dilation_factor = 0.5
-    cfg.collision_activation_distance = 0.04
-    cfg.collision_sphere_buffer = 0.015
+    cfg.collision_activation_distance = 0.05
+    # cfg.collision_sphere_buffer = 0.015
     cfg.enable_finetune_trajopt = True
     cfg.ee_link_name = _tool_link_for_arm("right")  # primary for MotionGen; we’ll set link_poses for both
     cfg.enable_graph = True
@@ -188,7 +188,7 @@ def _build_env_and_planner_bimanual_single(args_cli):
     cfg.max_planning_attempts = 10
     cfg.gripper_open_positions = {}
     cfg.gripper_closed_positions = {}
-    
+
     robot = cast(Any, env).scene["robot"]
     # For single-call bimanual, keep collisions active only for the primary arm (right) and trunk
     # to avoid inter-arm self-collision over-constraints during planning
