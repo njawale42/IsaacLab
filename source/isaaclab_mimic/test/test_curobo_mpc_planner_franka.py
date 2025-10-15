@@ -1,5 +1,11 @@
+# Copyright (c) 2024-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import random
-from typing import Any, Generator
+from collections.abc import Generator
+from typing import Any
 
 import pytest
 
@@ -15,19 +21,27 @@ simulation_app: Any = app_launcher.app
 import gymnasium as gym
 import torch
 
+import isaaclab.utils.assets as _al_assets
 import isaaclab.utils.math as math_utils
+from isaaclab.assets import RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLMimicEnv
+from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
+from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 
 from isaaclab_mimic.motion_planners.curobo.curobo_mpc_planner import CuroboMPCPlanner
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
-from isaaclab_tasks.manager_based.manipulation.stack.config.franka.stack_joint_pos_env_cfg import (
-    FrankaCubeStackEnvCfg,
-)
-from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
-import isaaclab.utils.assets as _al_assets
-from isaaclab.assets import RigidObjectCfg
-from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
-from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
+
+from isaaclab_tasks.manager_based.manipulation.stack.config.franka.stack_joint_pos_env_cfg import FrankaCubeStackEnvCfg
+
+# Predefined EE goals for the test (env frame, behind the wall)
+# Each entry is a tuple of: (goal specification, goal ID)
+predefined_ee_goals_and_ids = [
+    ({"pos": [0.70, -0.25, 0.25], "quat": [0.0, 0.707, 0.0, 0.707]}, "Behind wall, left"),
+    ({"pos": [0.70, 0.25, 0.25], "quat": [0.0, 0.707, 0.0, 0.707]}, "Behind wall, right"),
+    ({"pos": [0.65, 0.0, 0.45], "quat": [0.0, 1.0, 0.0, 0.0]}, "Behind wall, center, high"),
+    ({"pos": [0.80, -0.15, 0.35], "quat": [0.0, 0.5, 0.0, 0.866]}, "Behind wall, far left"),
+]
 
 
 @pytest.fixture(scope="class")
@@ -52,9 +66,11 @@ def mpc_test_env() -> Generator[dict[str, Any], None, None]:
     ).unwrapped
     env.reset()
     planner = CuroboMPCPlanner(env=env, robot=env.scene["robot"], config=CuroboPlannerCfg.franka_config())  # type: ignore[abstract]
+    if not headless:
+        planner.enable_visual_rollouts(True)
     goal_pose_visualizer = None
     if not headless:
-        goal_marker_cfg = FRAME_MARKER_CFG.replace(prim_path="/World/Visuals/goal_poses_mpc")
+        goal_marker_cfg = FRAME_MARKER_CFG.replace(prim_path="/World/Visuals/goal_poses_mpc")  # type: ignore[attr-defined]
         goal_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
         goal_pose_visualizer = VisualizationMarkers(goal_marker_cfg)
     yield {"env": env, "planner": planner, "goal_pose_visualizer": goal_pose_visualizer}
@@ -69,59 +85,63 @@ class TestCuroboMPCPlanner:
         self.goal_pose_visualizer: VisualizationMarkers | None = mpc_test_env["goal_pose_visualizer"]
 
     def test_reactive_reach(self) -> None:
-        # Define a reachable offset goal from current ee pose
-        ee_frame = self.env.scene["ee_frame"]
         origin = self.env.scene.env_origins[0]
-        pos = ee_frame.data.target_pos_w[0, 0, :] - origin
-        quat = ee_frame.data.target_quat_w[0, 0, :]
-        pos = pos + torch.tensor([0.10, 0.05, 0.00], device=pos.device, dtype=pos.dtype)
-        goal = math_utils.make_pose(pos, math_utils.matrix_from_quat(quat.unsqueeze(0))[0])[0]
 
-        # Plan first so the planner caches the goal transform for viz
-        self.planner.update_world_and_plan_motion(goal, env_id=0)
+        for goal_spec, goal_id in predefined_ee_goals_and_ids:
+            # Goal specified in world frame in config; convert to env frame
+            pos_world = torch.tensor(goal_spec["pos"], device=self.env.device, dtype=torch.float32)
+            quat = torch.tensor(goal_spec["quat"], device=self.env.device, dtype=torch.float32)
+            pos_env = pos_world - origin
 
-        # Visualize goal in the correct env EE world frame provided by the planner
-        if not headless and self.goal_pose_visualizer is not None:
-            T_goal_env_world = self.planner.get_goal_env_world_pose()
-            if T_goal_env_world is not None:
-                g_pos, g_rot = math_utils.unmake_pose(T_goal_env_world)
-                g_quat = math_utils.quat_from_matrix(g_rot.unsqueeze(0) if g_rot.dim() == 2 else g_rot)
-                self.goal_pose_visualizer.visualize(
-                    translations=g_pos.unsqueeze(0) if g_pos.dim() == 1 else g_pos,
-                    orientations=g_quat,
-                )
+            # Sanity: ensure goals are behind the wall (x > 0.55 in world frame)
+            assert pos_world[0] > 0.55, f"Goal '{goal_id}' is not behind the wall (x={pos_world[0].item():.3f})"
 
-        # Run for a bounded number of steps and check progress
-        max_steps = int(1e10)
-        for _ in range(max_steps):
-            if self.planner.has_next_waypoint():
-                next_pose = self.planner.get_next_waypoint_ee_pose()
-            else:
-                break
-            cmd_q = self.planner.get_last_joint_positions()
-            if cmd_q is not None:
-                if cmd_q.dim() == 1:
-                    cmd_q = cmd_q.unsqueeze(0)
-                # Append default finger positions if only arm joints are present
-                if cmd_q.shape[-1] == 7:
-                    fingers = torch.tensor([0.04, 0.04], device=cmd_q.device, dtype=cmd_q.dtype).unsqueeze(0)
-                    cmd_q = torch.cat([cmd_q, fingers], dim=-1)
-                # Use target controller for smoother tracking rather than teleporting
-                # self.env.scene["robot"].set_joint_position_target(cmd_q, env_ids=[0])
-                self.env.scene["robot"].write_joint_position_to_sim(cmd_q)
-                self.env.sim.step()
-            else:
-                play_action = self.env.target_eef_pose_to_action(  # type: ignore[attr-defined]
-                    target_eef_pose_dict={"eef": next_pose},
-                    gripper_action_dict={"eef": torch.zeros(2, device=self.env.device)},
-                    action_noise_dict={"eef": 0.0},
-                    env_id=0,
-                )
-                if play_action.dim() == 1:
-                    play_action = play_action.unsqueeze(0)
-                self.env.step(play_action)
+            goal = math_utils.make_pose(pos_env, math_utils.matrix_from_quat(quat.unsqueeze(0))[0])[0]
 
-        # Validate we moved closer to goal position using actual EE pose via the planner
-        pos_err, _ = self.planner._current_pose_error()  # type: ignore[attr-defined]
-        # pos_err = torch.linalg.vector_norm((ee_frame.data.target_pos_w[0, 0, :] - origin) - pos).item()
-        assert pos_err < 0.05
+            # Plan first so the planner caches the goal transform for viz
+            planned = self.planner.update_world_and_plan_motion(goal, env_id=0)
+            assert planned, f"Planner failed to find a plan for goal: {goal_id}"
+
+            # Visualize goal in the correct env EE world frame provided by the planner
+            if not headless and self.goal_pose_visualizer is not None:
+                T_goal_env_world = self.planner.get_goal_env_world_pose()
+                if T_goal_env_world is not None:
+                    g_pos, g_rot = math_utils.unmake_pose(T_goal_env_world)
+                    g_quat = math_utils.quat_from_matrix(g_rot.unsqueeze(0) if g_rot.dim() == 2 else g_rot)
+                    self.goal_pose_visualizer.visualize(
+                        translations=g_pos.unsqueeze(0) if g_pos.dim() == 1 else g_pos,
+                        orientations=g_quat,
+                    )
+
+            # Run for a bounded number of steps and check progress
+            max_steps = int(1e10)  # make this infinite
+            for _ in range(max_steps):
+                if self.planner.has_next_waypoint():
+                    next_pose = self.planner.get_next_waypoint_ee_pose()
+                else:
+                    break
+                cmd_q = self.planner.get_last_joint_positions()
+                if cmd_q is not None:
+                    if cmd_q.dim() == 1:
+                        cmd_q = cmd_q.unsqueeze(0)
+                    # Append default finger positions if only arm joints are present
+                    if cmd_q.shape[-1] == 7:
+                        fingers = torch.tensor([0.04, 0.04], device=cmd_q.device, dtype=cmd_q.dtype).unsqueeze(0)
+                        cmd_q = torch.cat([cmd_q, fingers], dim=-1)
+                    self.env.scene["robot"].write_joint_position_to_sim(cmd_q)
+                    self.env.sim.step()
+                else:
+                    play_action = self.env.target_eef_pose_to_action(  # type: ignore[attr-defined]
+                        target_eef_pose_dict={"eef": next_pose},
+                        gripper_action_dict={"eef": torch.zeros(2, device=self.env.device)},
+                        action_noise_dict={"eef": 0.0},
+                        env_id=0,
+                    )
+                    if play_action.dim() == 1:
+                        play_action = play_action.unsqueeze(0)
+                    for _ in range(10):
+                        self.env.step(play_action)
+
+            # Validate we reached the current goal using the planner's error metric
+            pos_err, _ = self.planner._current_pose_error()  # type: ignore[attr-defined]
+            assert pos_err < 0.05, f"Final position error too high for goal '{goal_id}': {pos_err:.3f}"

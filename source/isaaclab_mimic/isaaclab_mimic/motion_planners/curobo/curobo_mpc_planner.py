@@ -1,3 +1,8 @@
+# Copyright (c) 2024-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Reactive MPC-based motion planner for Isaac Lab using cuRobo MPPI.
 
@@ -10,21 +15,20 @@ state and target pose, returning the next end-effector pose to track.
 from __future__ import annotations
 
 import logging
+import torch
 from typing import Any
 
-import torch
-
-import isaaclab.utils.math as PoseUtils
-from isaaclab.assets import Articulation
-from isaaclab.envs.manager_based_env import ManagerBasedEnv
-
+from curobo.rollout.rollout_base import Goal
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 from curobo.types.state import JointState
 from curobo.util.logger import setup_curobo_logger
 from curobo.util.usd_helper import UsdHelper
-from curobo.rollout.rollout_base import Goal
 from curobo.wrap.reacher.mpc import MpcSolver, MpcSolverConfig
+
+import isaaclab.utils.math as PoseUtils
+from isaaclab.assets import Articulation
+from isaaclab.envs.manager_based_env import ManagerBasedEnv
 
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
 from isaaclab_mimic.motion_planners.motion_planner_base import MotionPlannerBase
@@ -49,7 +53,9 @@ class CuroboMPCPlanner(MotionPlannerBase):
         env_id: int = 0,
         debug: bool | None = None,
     ) -> None:
-        super().__init__(env=env, robot=robot, env_id=env_id, debug=bool(config.debug_planner if debug is None else debug))
+        super().__init__(
+            env=env, robot=robot, env_id=env_id, debug=bool(config.debug_planner if debug is None else debug)
+        )
 
         self.logger = logging.getLogger(f"CuroboMPCPlanner_{env_id}")
         if not self.logger.handlers:
@@ -89,7 +95,7 @@ class CuroboMPCPlanner(MotionPlannerBase):
             use_cuda_graph=True,
             self_collision_check=True,
             collision_checker_type=self.config.collision_checker_type,
-            store_rollouts=False,
+            store_rollouts=True,
             collision_cache=self.config.collision_cache_size,
             collision_activation_distance=self.config.collision_activation_distance,
             step_dt=self.config.interpolation_dt,
@@ -111,6 +117,7 @@ class CuroboMPCPlanner(MotionPlannerBase):
         self._max_reactive_steps: int = 200
         self._step_count: int = 0
         from typing import Any as _Any
+
         self._last_cmd_state: _Any | None = None
         # Calibration between env ee frame and cuRobo ee link (world frame transform)
         self._envEE_to_solverEE: torch.Tensor | None = None  # 4x4
@@ -120,6 +127,11 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # Cached object mappings for world sync
         self._cached_object_mappings: dict[str, str] | None = None
         self._expected_objects: set[str] | None = None
+
+        # Debug draw state for visualizing MPPI rollouts
+        self._draw_rollouts_enabled: bool = False
+        self._debug_draw_iface = None
+        self._draw_log_counter: int = 0
 
     # =============================
     # Device utilities
@@ -195,6 +207,8 @@ class CuroboMPCPlanner(MotionPlannerBase):
 
     def _get_object_mappings(self) -> dict[str, str]:
         if self._cached_object_mappings is None:
+            if self.mpc.world_coll_checker is None:  # type: ignore[truthy-bool]
+                return {}
             world_model = self.mpc.world_coll_checker.world_model
             rigid_objects = self.env.scene.rigid_objects
             mappings: dict[str, str] = {}
@@ -334,8 +348,13 @@ class CuroboMPCPlanner(MotionPlannerBase):
             try:
                 # Current env ee frame world transform
                 ee_frame = self.env.scene["ee_frame"]
-                pos_w = ee_frame.data.target_pos_w[self.env_id, 0, :]
-                quat_w = ee_frame.data.target_quat_w[self.env_id, 0, :]
+                # Guard on array shape access; fall back to zeros if indexing fails
+                try:
+                    pos_w = ee_frame.data.target_pos_w[self.env_id, 0, :]
+                    quat_w = ee_frame.data.target_quat_w[self.env_id, 0, :]
+                except Exception:
+                    pos_w = torch.zeros(3, device=self.env.device, dtype=torch.float32)
+                    quat_w = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
                 # Build batched pose → unbatch
                 pos_b = pos_w.unsqueeze(0) if pos_w.dim() == 1 else pos_w
                 rot_b = PoseUtils.matrix_from_quat(quat_w.unsqueeze(0) if quat_w.dim() == 1 else quat_w)
@@ -343,10 +362,11 @@ class CuroboMPCPlanner(MotionPlannerBase):
                 # Current solver ee world transform
                 T_solver_current_world = self._get_current_ee_pose_matrix()
                 self._envEE_to_solverEE = torch.linalg.inv(T_env_current_world) @ T_solver_current_world
-                self.logger.info(
-                    f"Calibrated envEE->solverEE (pos,deg): {self._envEE_to_solverEE[:3,3]}, "
-                    f"{torch.rad2deg(torch.tensor([0.0]))}"
-                )
+                if self._envEE_to_solverEE is not None:
+                    self.logger.info(
+                        f"Calibrated envEE->solverEE (pos,deg): {self._envEE_to_solverEE[:3,3]}, "
+                        f"{torch.rad2deg(torch.tensor([0.0]))}"
+                    )
             except Exception as e:
                 self.logger.info(f"EE calibration failed (continuing w/o): {e}")
                 self._envEE_to_solverEE = None
@@ -365,7 +385,11 @@ class CuroboMPCPlanner(MotionPlannerBase):
 
         # Convert target position from world frame to env-local frame expected by cuRobo (subtract env origin)
         try:
-            env_origin = self.env.scene.env_origins[self.env_id, :3]
+            env_origins = getattr(self.env.scene, "env_origins", None)
+            if isinstance(env_origins, torch.Tensor):
+                env_origin = env_origins[self.env_id, :3]
+            else:
+                env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
             env_origin = env_origin.to(device=self.env.device, dtype=torch.float32)
             # Explicit INFO logs so they are visible even when debug_planner is False
             self.logger.info(f"Env origin: {env_origin}")
@@ -375,8 +399,12 @@ class CuroboMPCPlanner(MotionPlannerBase):
         except Exception as e:
             self.logger.info(f"Env origin/target logging failed: {e}")
         # Cache env-local pos/quat for later error checks without unmake_pose
-        self._target_pos_env = tgt_pos if isinstance(tgt_pos, torch.Tensor) else torch.as_tensor(tgt_pos, device=self.env.device)
-        self._target_quat_env = tgt_quat if isinstance(tgt_quat, torch.Tensor) else torch.as_tensor(tgt_quat, device=self.env.device)
+        self._target_pos_env = (
+            tgt_pos if isinstance(tgt_pos, torch.Tensor) else torch.as_tensor(tgt_pos, device=self.env.device)
+        )
+        self._target_quat_env = (
+            tgt_quat if isinstance(tgt_quat, torch.Tensor) else torch.as_tensor(tgt_quat, device=self.env.device)
+        )
 
         self._target_pose_cu = self._make_pose(
             position=self._to_curobo_device(self._target_pos_env),
@@ -402,12 +430,130 @@ class CuroboMPCPlanner(MotionPlannerBase):
         """Return the goal transform in the environment EE frame, world coordinates (4x4)."""
         return self._goal_env_world_pose
 
+    def enable_visual_rollouts(self, enable: bool = True) -> None:
+        """Enable/disable drawing MPPI rollouts using the Isaac Sim debug-draw interface."""
+        self._draw_rollouts_enabled = bool(enable)
+        self.logger.info(f"Visual rollouts {'ENABLED' if self._draw_rollouts_enabled else 'DISABLED'}")
+
+    def _acquire_debug_draw_interface(self):
+        if self._debug_draw_iface is not None:
+            return self._debug_draw_iface
+        try:
+            # Preferred in Kit builds
+            from omni.isaac.debug_draw import _debug_draw  # type: ignore
+
+            self._debug_draw_iface = _debug_draw.acquire_debug_draw_interface()
+            self.logger.info("Acquired debug-draw interface from omni.isaac.debug_draw")
+            return self._debug_draw_iface
+        except Exception as e:
+            self.logger.debug(f"omni.isaac.debug_draw unavailable: {e}")
+        try:
+            # Fallback commonly available in Isaac Sim python
+            from isaacsim.util import debug_draw as _debug_draw  # type: ignore
+
+            self._debug_draw_iface = _debug_draw.acquire_debug_draw_interface()
+            self.logger.info("Acquired debug-draw interface from isaacsim.util.debug_draw")
+            return self._debug_draw_iface
+        except Exception as e:
+            self.logger.debug(f"isaacsim.util.debug_draw unavailable: {e}")
+        try:
+            # Isaac Lab tutorial import path
+            import isaacsim.util.debug_draw._debug_draw as _debug_draw_mod  # type: ignore
+
+            self._debug_draw_iface = _debug_draw_mod.acquire_debug_draw_interface()
+            self.logger.info("Acquired debug-draw interface from isaacsim.util.debug_draw._debug_draw")
+            return self._debug_draw_iface
+        except Exception as e:
+            self.logger.debug(f"isaacsim.util.debug_draw._debug_draw unavailable: {e}")
+        try:
+            # As requested: support module name "debug_drawing" if present
+            from isaacsim.util import debug_drawing as _debug_drawing  # type: ignore
+
+            # Some builds expose the same API
+            self._debug_draw_iface = _debug_drawing.acquire_debug_draw_interface()  # type: ignore[attr-defined]
+            self.logger.info("Acquired debug-draw interface from isaacsim.util.debug_drawing")
+            return self._debug_draw_iface
+        except Exception as e:
+            self.logger.debug(f"isaacsim.util.debug_drawing unavailable: {e}")
+            self._debug_draw_iface = None
+            return None
+
+    def _draw_mpc_rollouts(self) -> None:
+        if not self._draw_rollouts_enabled:
+            # First few calls print the disabled state
+            if self._draw_log_counter < 5:
+                self.logger.info("Visual rollouts disabled; skipping draw")
+                self._draw_log_counter += 1
+            return
+        try:
+            draw = self._acquire_debug_draw_interface()
+            if draw is None:
+                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                    self.logger.info("No debug-draw interface available; cannot draw rollouts")
+                    self._draw_log_counter += 1
+                return
+            # cuRobo exposes rollouts for visualization when store_rollouts=True
+            rollouts = getattr(self.mpc, "get_visual_rollouts", None)
+            if rollouts is None:
+                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                    self.logger.info("mpc.get_visual_rollouts() not available; ensure store_rollouts=True")
+                    self._draw_log_counter += 1
+                return
+            rollouts_tensor = self.mpc.get_visual_rollouts()
+            if rollouts_tensor is None:
+                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                    self.logger.info("No rollout samples returned; waiting for MPC to populate")
+                    self._draw_log_counter += 1
+                return
+            if isinstance(rollouts_tensor, torch.Tensor):
+                cpu_rollouts = rollouts_tensor.detach().to("cpu").numpy()
+            else:
+                # Unexpected type; nothing to draw
+                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                    self.logger.info(f"Unexpected rollouts type: {type(rollouts_tensor)}")
+                    self._draw_log_counter += 1
+                return
+            if cpu_rollouts.ndim != 3 or cpu_rollouts.shape[-1] < 3:
+                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                    self.logger.info(f"Rollouts have unexpected shape: {cpu_rollouts.shape}")
+                    self._draw_log_counter += 1
+                return
+            b, h, _ = cpu_rollouts.shape
+            if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                self.logger.info(f"Drawing rollouts: batches={b}, horizon={h}")
+                self._draw_log_counter += 1
+            points: list[tuple[float, float, float]] = []
+            colors: list[tuple[float, float, float, float]] = []
+            sizes: list[float] = []
+            denom = float(max(b, 1))
+            for i in range(b):
+                for j in range(h):
+                    x, y, z = cpu_rollouts[i, j, 0], cpu_rollouts[i, j, 1], cpu_rollouts[i, j, 2]
+                    points.append((float(x), float(y), float(z)))
+                    t = (i + 1.0) / denom
+                    # Increase opacity and size for better visibility
+                    colors.append((1.0 - t, 0.3 * t, 0.0, 0.5))
+                    sizes.append(12.0)
+            try:
+                draw.clear_points()
+            except Exception:
+                # Some interfaces auto-clear; ignore
+                pass
+            if points:
+                draw.draw_points(points, colors, sizes)
+                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
+                    self.logger.info(f"Drew {len(points)} rollout points")
+                    self._draw_log_counter += 1
+        except Exception as e:
+            # Keep drawing best-effort; avoid breaking planning loop
+            self.logger.debug(f"Rollout drawing skipped due to error: {e}")
+
     def _get_current_ee_pose_matrix(self) -> torch.Tensor:
         cu_js = self._get_current_joint_state_for_curobo()
         kin = self.mpc.compute_kinematics(cu_js)
-        if hasattr(kin, "ee_pos_seq") and hasattr(kin, "ee_quat_seq"):
-            pos = kin.ee_pos_seq
-            quat = kin.ee_quat_seq
+        pos = getattr(kin, "ee_pos_seq", None)
+        quat = getattr(kin, "ee_quat_seq", None)
+        if pos is not None and quat is not None:
             pos_env = self._to_env_device(pos) if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
             quat_env = self._to_env_device(quat) if isinstance(quat, torch.Tensor) else torch.as_tensor(quat)
             # ensure batch
@@ -422,8 +568,13 @@ class CuroboMPCPlanner(MotionPlannerBase):
             # Fallback to identity
             eye = torch.eye(4, device=self.env.device, dtype=torch.float32)
             return eye
-        pos_env = self._to_env_device(ee.position)
-        rot_env = self._to_env_device(ee.get_rotation())
+        pos_e = ee.position
+        rot_e = ee.get_rotation()
+        if pos_e is None or rot_e is None:  # type: ignore[truthy-bool]
+            eye = torch.eye(4, device=self.env.device, dtype=torch.float32)
+            return eye
+        pos_env = self._to_env_device(pos_e)
+        rot_env = self._to_env_device(rot_e)
         pos_env_b = pos_env.unsqueeze(0) if pos_env.dim() == 1 else pos_env
         rot_env_b = rot_env.unsqueeze(0) if rot_env.dim() == 2 else rot_env
         return PoseUtils.make_pose(pos_env_b, rot_env_b)[0]
@@ -484,17 +635,23 @@ class CuroboMPCPlanner(MotionPlannerBase):
         cu_js = self._get_current_joint_state_for_curobo()
         kin_state = self.mpc.compute_kinematics(cu_js)
         # Prefer explicit pos/quat sequences if available
-        if hasattr(kin_state, "ee_pos_seq") and hasattr(kin_state, "ee_quat_seq"):
-            cur_pos = kin_state.ee_pos_seq
-            cur_quat = kin_state.ee_quat_seq
-            cur_pos = self._to_env_device(cur_pos) if isinstance(cur_pos, torch.Tensor) else torch.as_tensor(cur_pos)
-            cur_quat = self._to_env_device(cur_quat) if isinstance(cur_quat, torch.Tensor) else torch.as_tensor(cur_quat)
+        pos_seq = getattr(kin_state, "ee_pos_seq", None)
+        quat_seq = getattr(kin_state, "ee_quat_seq", None)
+        if pos_seq is not None and quat_seq is not None:
+            cur_pos = self._to_env_device(pos_seq) if isinstance(pos_seq, torch.Tensor) else torch.as_tensor(pos_seq)
+            cur_quat = (
+                self._to_env_device(quat_seq) if isinstance(quat_seq, torch.Tensor) else torch.as_tensor(quat_seq)
+            )
         else:
             ee_pose = kin_state.ee_pose
             if ee_pose is None:
                 return 1e9, 1e9
-            cur_pos = self._to_env_device(ee_pose.position)
-            cur_rot = self._to_env_device(ee_pose.get_rotation())
+            pos_e = ee_pose.position
+            rot_e = ee_pose.get_rotation()
+            if pos_e is None or rot_e is None:  # type: ignore[truthy-bool]
+                return 1e9, 1e9
+            cur_pos = self._to_env_device(pos_e)
+            cur_rot = self._to_env_device(rot_e)
             cur_quat = PoseUtils.quat_from_matrix(cur_rot)
         # Distances using cached target pos/quat
         tgt_pos = self._target_pos_env
@@ -531,10 +688,15 @@ class CuroboMPCPlanner(MotionPlannerBase):
         self.update_world()
 
         current_js = self._get_current_joint_state_for_curobo()
+        self.logger.debug("Running MPC step ...")
         result = self.mpc.step(current_js, max_attempts=2)
+        self.logger.debug("MPC step complete; attempting rollout draw")
+        # Draw MPPI rollouts if enabled
+        self._draw_mpc_rollouts()
 
         # Convert resulting action to EE pose for the waypoint
         from typing import cast
+
         try:
             cmd_state_full = cast(JointState, result.js_action)
         except AttributeError:
@@ -546,9 +708,9 @@ class CuroboMPCPlanner(MotionPlannerBase):
 
         kin_state = self.mpc.compute_kinematics(cmd_state_full)
         # Build solver ee world transform
-        if hasattr(kin_state, "ee_pos_seq") and hasattr(kin_state, "ee_quat_seq"):
-            pos_val = kin_state.ee_pos_seq
-            rot_val = kin_state.ee_quat_seq
+        pos_val = getattr(kin_state, "ee_pos_seq", None)
+        rot_val = getattr(kin_state, "ee_quat_seq", None)
+        if pos_val is not None and rot_val is not None:
             pos_env = self._to_env_device(pos_val) if isinstance(pos_val, torch.Tensor) else torch.as_tensor(pos_val)
             rot_env = self._to_env_device(rot_val) if isinstance(rot_val, torch.Tensor) else torch.as_tensor(rot_val)
             T_solver_world = PoseUtils.make_pose(pos_env, PoseUtils.matrix_from_quat(rot_env))[0]
@@ -558,11 +720,14 @@ class CuroboMPCPlanner(MotionPlannerBase):
                 cu_js = self._get_current_joint_state_for_curobo()
                 kin_state2 = self.mpc.compute_kinematics(cu_js)
                 ee_pose = kin_state2.ee_pose
-            pos_val = ee_pose.position
-            rot_val = ee_pose.get_rotation()
-            pos_env = self._to_env_device(pos_val) if isinstance(pos_val, torch.Tensor) else torch.as_tensor(pos_val)
-            rot_env = self._to_env_device(rot_val) if isinstance(rot_val, torch.Tensor) else torch.as_tensor(rot_val)
-            T_solver_world = PoseUtils.make_pose(pos_env, rot_env)[0]
+            pos_e = ee_pose.position
+            rot_e = ee_pose.get_rotation()
+            if pos_e is None or rot_e is None:  # type: ignore[truthy-bool]
+                T_solver_world = torch.eye(4, device=self.env.device, dtype=torch.float32)
+            else:
+                pos_env = self._to_env_device(pos_e)
+                rot_env = self._to_env_device(rot_e)
+                T_solver_world = PoseUtils.make_pose(pos_env, rot_env)[0]
 
         # Convert solver ee world transform to env ee world transform using calibration
         if self._envEE_to_solverEE is not None:
@@ -583,7 +748,9 @@ class CuroboMPCPlanner(MotionPlannerBase):
         env_joint_names: list[str] = list(self.robot.data.joint_names)
         cmd_joint_names: list[str] = list(self._last_cmd_state.joint_names)
         cmd_pos_tensor: torch.Tensor = (
-            self._last_cmd_state.position if isinstance(self._last_cmd_state.position, torch.Tensor) else torch.as_tensor(self._last_cmd_state.position)
+            self._last_cmd_state.position
+            if isinstance(self._last_cmd_state.position, torch.Tensor)
+            else torch.as_tensor(self._last_cmd_state.position)
         )
         if cmd_pos_tensor.dim() == 2 and cmd_pos_tensor.shape[0] == 1:
             cmd_pos_tensor = cmd_pos_tensor[0]
@@ -634,4 +801,3 @@ class CuroboMPCPlanner(MotionPlannerBase):
     # For compatibility with SkillGen conversion util; not used in reactive path
     def get_planned_poses(self) -> list[torch.Tensor]:
         return []
-
