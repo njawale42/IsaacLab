@@ -553,6 +553,15 @@ class CuroboMPCPlanner(MotionPlannerBase):
         kin = self.mpc.compute_kinematics(cu_js)
         pos = getattr(kin, "ee_pos_seq", None)
         quat = getattr(kin, "ee_quat_seq", None)
+        # Retrieve env origin to convert solver env-local -> world coordinates
+        try:
+            env_origins = getattr(self.env.scene, "env_origins", None)
+            if isinstance(env_origins, torch.Tensor):
+                env_origin = env_origins[self.env_id, :3]
+            else:
+                env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
+        except Exception:
+            env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
         if pos is not None and quat is not None:
             pos_env = self._to_env_device(pos) if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
             quat_env = self._to_env_device(quat) if isinstance(quat, torch.Tensor) else torch.as_tensor(quat)
@@ -561,8 +570,10 @@ class CuroboMPCPlanner(MotionPlannerBase):
                 pos_env_b = pos_env.unsqueeze(0)
             else:
                 pos_env_b = pos_env
+            # convert to world coordinates
+            pos_world_b = pos_env_b + env_origin.unsqueeze(0)
             rot_b = PoseUtils.matrix_from_quat(quat_env.unsqueeze(0) if quat_env.dim() == 1 else quat_env)
-            return PoseUtils.make_pose(pos_env_b, rot_b)[0]
+            return PoseUtils.make_pose(pos_world_b, rot_b)[0]
         ee = kin.ee_pose
         if ee is None:
             # Fallback to identity
@@ -707,13 +718,23 @@ class CuroboMPCPlanner(MotionPlannerBase):
         self._last_cmd_state = cmd_state_full
 
         kin_state = self.mpc.compute_kinematics(cmd_state_full)
-        # Build solver ee world transform
+        # Build solver ee transform in WORLD coordinates
         pos_val = getattr(kin_state, "ee_pos_seq", None)
         rot_val = getattr(kin_state, "ee_quat_seq", None)
         if pos_val is not None and rot_val is not None:
             pos_env = self._to_env_device(pos_val) if isinstance(pos_val, torch.Tensor) else torch.as_tensor(pos_val)
             rot_env = self._to_env_device(rot_val) if isinstance(rot_val, torch.Tensor) else torch.as_tensor(rot_val)
-            T_solver_world = PoseUtils.make_pose(pos_env, PoseUtils.matrix_from_quat(rot_env))[0]
+            # env-local -> world
+            try:
+                env_origins = getattr(self.env.scene, "env_origins", None)
+                if isinstance(env_origins, torch.Tensor):
+                    env_origin = env_origins[self.env_id, :3]
+                else:
+                    env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
+            except Exception:
+                env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
+            pos_world = pos_env + env_origin
+            T_solver_world = PoseUtils.make_pose(pos_world, PoseUtils.matrix_from_quat(rot_env))[0]
         else:
             ee_pose = kin_state.ee_pose
             if ee_pose is None:
@@ -727,7 +748,16 @@ class CuroboMPCPlanner(MotionPlannerBase):
             else:
                 pos_env = self._to_env_device(pos_e)
                 rot_env = self._to_env_device(rot_e)
-                T_solver_world = PoseUtils.make_pose(pos_env, rot_env)[0]
+                try:
+                    env_origins = getattr(self.env.scene, "env_origins", None)
+                    if isinstance(env_origins, torch.Tensor):
+                        env_origin = env_origins[self.env_id, :3]
+                    else:
+                        env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
+                except Exception:
+                    env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
+                pos_world = pos_env + env_origin
+                T_solver_world = PoseUtils.make_pose(pos_world, rot_env)[0]
 
         # Convert solver ee world transform to env ee world transform using calibration
         if self._envEE_to_solverEE is not None:
