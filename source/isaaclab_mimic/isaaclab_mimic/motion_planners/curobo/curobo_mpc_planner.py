@@ -438,115 +438,43 @@ class CuroboMPCPlanner(MotionPlannerBase):
     def _acquire_debug_draw_interface(self):
         if self._debug_draw_iface is not None:
             return self._debug_draw_iface
-        try:
-            # Preferred in Kit builds
-            from omni.isaac.debug_draw import _debug_draw  # type: ignore
+        import isaacsim.util.debug_draw._debug_draw as _debug_draw_mod  # type: ignore
 
-            self._debug_draw_iface = _debug_draw.acquire_debug_draw_interface()
-            self.logger.info("Acquired debug-draw interface from omni.isaac.debug_draw")
-            return self._debug_draw_iface
-        except Exception as e:
-            self.logger.debug(f"omni.isaac.debug_draw unavailable: {e}")
-        try:
-            # Fallback commonly available in Isaac Sim python
-            from isaacsim.util import debug_draw as _debug_draw  # type: ignore
-
-            self._debug_draw_iface = _debug_draw.acquire_debug_draw_interface()
-            self.logger.info("Acquired debug-draw interface from isaacsim.util.debug_draw")
-            return self._debug_draw_iface
-        except Exception as e:
-            self.logger.debug(f"isaacsim.util.debug_draw unavailable: {e}")
-        try:
-            # Isaac Lab tutorial import path
-            import isaacsim.util.debug_draw._debug_draw as _debug_draw_mod  # type: ignore
-
-            self._debug_draw_iface = _debug_draw_mod.acquire_debug_draw_interface()
-            self.logger.info("Acquired debug-draw interface from isaacsim.util.debug_draw._debug_draw")
-            return self._debug_draw_iface
-        except Exception as e:
-            self.logger.debug(f"isaacsim.util.debug_draw._debug_draw unavailable: {e}")
-        try:
-            # As requested: support module name "debug_drawing" if present
-            from isaacsim.util import debug_drawing as _debug_drawing  # type: ignore
-
-            # Some builds expose the same API
-            self._debug_draw_iface = _debug_drawing.acquire_debug_draw_interface()  # type: ignore[attr-defined]
-            self.logger.info("Acquired debug-draw interface from isaacsim.util.debug_drawing")
-            return self._debug_draw_iface
-        except Exception as e:
-            self.logger.debug(f"isaacsim.util.debug_drawing unavailable: {e}")
-            self._debug_draw_iface = None
-            return None
+        self._debug_draw_iface = _debug_draw_mod.acquire_debug_draw_interface()
+        self.logger.info("Acquired debug-draw interface (isaacsim.util.debug_draw._debug_draw)")
+        return self._debug_draw_iface
 
     def _draw_mpc_rollouts(self) -> None:
         if not self._draw_rollouts_enabled:
-            # First few calls print the disabled state
-            if self._draw_log_counter < 5:
-                self.logger.info("Visual rollouts disabled; skipping draw")
-                self._draw_log_counter += 1
             return
+        draw = self._acquire_debug_draw_interface()
+        if draw is None:
+            return
+        rollouts_tensor = self.mpc.get_visual_rollouts() if hasattr(self.mpc, "get_visual_rollouts") else None
+        if not isinstance(rollouts_tensor, torch.Tensor):
+            return
+        cpu_rollouts = rollouts_tensor.detach().to("cpu").numpy()
+        if cpu_rollouts.ndim != 3 or cpu_rollouts.shape[-1] < 3:
+            return
+        b, h, _ = cpu_rollouts.shape
+        points: list[tuple[float, float, float]] = []
+        colors: list[tuple[float, float, float, float]] = []
+        sizes: list[float] = []
+        denom = float(max(b, 1))
+        for i in range(b):
+            t = (i + 1.0) / denom
+            color = (1.0 - t, 0.3 * t, 0.0, 0.5)
+            for j in range(h):
+                x, y, z = cpu_rollouts[i, j, 0], cpu_rollouts[i, j, 1], cpu_rollouts[i, j, 2]
+                points.append((float(x), float(y), float(z)))
+                colors.append(color)
+                sizes.append(12.0)
         try:
-            draw = self._acquire_debug_draw_interface()
-            if draw is None:
-                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                    self.logger.info("No debug-draw interface available; cannot draw rollouts")
-                    self._draw_log_counter += 1
-                return
-            # cuRobo exposes rollouts for visualization when store_rollouts=True
-            rollouts = getattr(self.mpc, "get_visual_rollouts", None)
-            if rollouts is None:
-                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                    self.logger.info("mpc.get_visual_rollouts() not available; ensure store_rollouts=True")
-                    self._draw_log_counter += 1
-                return
-            rollouts_tensor = self.mpc.get_visual_rollouts()
-            if rollouts_tensor is None:
-                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                    self.logger.info("No rollout samples returned; waiting for MPC to populate")
-                    self._draw_log_counter += 1
-                return
-            if isinstance(rollouts_tensor, torch.Tensor):
-                cpu_rollouts = rollouts_tensor.detach().to("cpu").numpy()
-            else:
-                # Unexpected type; nothing to draw
-                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                    self.logger.info(f"Unexpected rollouts type: {type(rollouts_tensor)}")
-                    self._draw_log_counter += 1
-                return
-            if cpu_rollouts.ndim != 3 or cpu_rollouts.shape[-1] < 3:
-                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                    self.logger.info(f"Rollouts have unexpected shape: {cpu_rollouts.shape}")
-                    self._draw_log_counter += 1
-                return
-            b, h, _ = cpu_rollouts.shape
-            if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                self.logger.info(f"Drawing rollouts: batches={b}, horizon={h}")
-                self._draw_log_counter += 1
-            points: list[tuple[float, float, float]] = []
-            colors: list[tuple[float, float, float, float]] = []
-            sizes: list[float] = []
-            denom = float(max(b, 1))
-            for i in range(b):
-                for j in range(h):
-                    x, y, z = cpu_rollouts[i, j, 0], cpu_rollouts[i, j, 1], cpu_rollouts[i, j, 2]
-                    points.append((float(x), float(y), float(z)))
-                    t = (i + 1.0) / denom
-                    # Increase opacity and size for better visibility
-                    colors.append((1.0 - t, 0.3 * t, 0.0, 0.5))
-                    sizes.append(12.0)
-            try:
-                draw.clear_points()
-            except Exception:
-                # Some interfaces auto-clear; ignore
-                pass
-            if points:
-                draw.draw_points(points, colors, sizes)
-                if self._draw_log_counter < 10 or self._draw_log_counter % 50 == 0:
-                    self.logger.info(f"Drew {len(points)} rollout points")
-                    self._draw_log_counter += 1
-        except Exception as e:
-            # Keep drawing best-effort; avoid breaking planning loop
-            self.logger.debug(f"Rollout drawing skipped due to error: {e}")
+            draw.clear_points()
+        except Exception:
+            pass
+        if points:
+            draw.draw_points(points, colors, sizes)
 
     def _get_current_ee_pose_matrix(self) -> torch.Tensor:
         cu_js = self._get_current_joint_state_for_curobo()

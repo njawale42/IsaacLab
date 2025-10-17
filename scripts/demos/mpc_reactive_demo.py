@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Modern Isaac Lab reactive MPC demo using CuroboMPCPlanner.
 
@@ -22,10 +27,10 @@ import torch
 
 import isaaclab.utils.math as PoseUtils
 from isaaclab.envs import ManagerBasedRLMimicEnv
+from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
 
 from isaaclab_mimic.motion_planners.curobo.curobo_mpc_planner import CuroboMPCPlanner
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
-from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
 
 
 def main():
@@ -110,6 +115,7 @@ def main():
         # Drop reference and collect to run __del__ while attributes still exist
         try:
             import gc  # local import to avoid top-level dependency
+
             del env
             gc.collect()
         except Exception:
@@ -121,4 +127,3 @@ if __name__ == "__main__":
         main()
     finally:
         simulation_app.close()
-
