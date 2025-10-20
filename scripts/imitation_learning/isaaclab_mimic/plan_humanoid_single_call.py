@@ -353,6 +353,7 @@ def _build_site_goal_independent(ctrl_site_env_r, ctrl_site_env_l, args_cli, dev
     Returns:
         Tuple (goal_r, goal_l) of 4x4 target poses for right and left sites.
     """
+
     def pick(val_specific, val_global, default):
         return (
             float(val_specific)
@@ -846,9 +847,7 @@ def main():
     _, _, ctrl_site_env_l, T_tool_site_l = _compute_site_mapping_for_link(env, planner, link_l, "left")
 
     # Build target goals in site/world
-    goal_env_site_r, goal_env_site_l = _build_site_goals(
-        ctrl_site_env_r, ctrl_site_env_l, args_cli, device
-    )
+    goal_env_site_r, goal_env_site_l = _build_site_goals(ctrl_site_env_r, ctrl_site_env_l, args_cli, device)
 
     _visualize_goals(args_cli, env, goal_env_site_r, goal_env_site_l)
 
@@ -858,9 +857,7 @@ def main():
         T_world_tool_goal_l,
         T_base_world,
         T_base_tool_goal_l,
-    ) = _compute_targets_for_planning(
-        T_world_base, goal_env_site_r, goal_env_site_l, T_tool_site_r, T_tool_site_l
-    )
+    ) = _compute_targets_for_planning(T_world_base, goal_env_site_r, goal_env_site_l, T_tool_site_r, T_tool_site_l)
 
     # Plan once via humanoid wrapper; pass world-frame target (wrapper converts to base)
     step_size = _get_step_size_from_args(args_cli)

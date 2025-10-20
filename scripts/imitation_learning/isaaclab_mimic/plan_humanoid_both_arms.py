@@ -51,6 +51,12 @@ parser.add_argument(
     "--pair_visualize", action="store_true", help="Visualize sampled colliding and collision-free joint pairs."
 )
 parser.add_argument("--pair_vis_samples", type=int, default=8, help="Number of samples per class to visualize.")
+# Back-and-forth planning: if enabled, plan to goal and then back to home, per arm
+parser.add_argument(
+    "--back_forth",
+    action="store_true",
+    help="If set, plan to the goal and then back to the starting pose for each arm.",
+)
 # Optional per-arm overrides: when provided, independent goals are used instead of symmetric bimanual ones
 parser.add_argument(
     "--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set."
@@ -91,6 +97,7 @@ import yaml
 from dataclasses import replace as dc_replace
 from typing import Any, cast
 
+from curobo.types.state import JointState
 from nvplan.applications.custream.config import create_robot_config
 from nvplan.applications.custream.retime import retime_paths
 from nvplan.applications.custream.spheres import load_spheres
@@ -524,6 +531,7 @@ def _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, 
         print(f"[PlanHumanoid] Planned-goal diagnostics failed: {e}")
 
 
+# TODO: Not used but keep for future reference
 def _compute_colliding_pairs_ee(planned_r, planned_l, T_world_base, threshold: float, device) -> list[tuple[int, int]]:
     """Compute colliding pairs (i,j) using EE proximity in world frame.
 
@@ -567,6 +575,54 @@ def _densify_plan_positions(pos: torch.Tensor, factor: int) -> tuple[torch.Tenso
     out.append(pos[-1])
     imap.append(segments)
     return torch.stack(out, dim=0), torch.tensor(imap, device=pos.device, dtype=torch.long)
+
+
+def _reverse_joint_state(js: JointState, drop_first: bool = True) -> JointState:
+    """Create a reversed copy of the given JointState along waypoint dimension.
+
+    If drop_first is True, the first element of the reversed sequence (which equals the
+    forward last) is dropped to avoid duplicating the turning point when concatenating.
+    """
+    pos = cast(torch.Tensor, js.position)
+    vel_t = cast(torch.Tensor, js.velocity) if getattr(js, "velocity", None) is not None else None
+    acc_t = cast(torch.Tensor, js.acceleration) if getattr(js, "acceleration", None) is not None else None
+    jerk_t = cast(torch.Tensor, js.jerk) if getattr(js, "jerk", None) is not None else None
+
+    def maybe_flip(x: torch.Tensor | None):
+        return None if x is None else torch.flip(x, dims=[0])
+
+    pos_rev = maybe_flip(pos)
+    vel_rev = maybe_flip(vel_t)
+    acc_rev = maybe_flip(acc_t)
+    jerk_rev = maybe_flip(jerk_t)
+
+    if drop_first and pos_rev.shape[0] > 0:
+        pos_rev = pos_rev[1:]
+        vel_rev = vel_rev[1:] if vel_rev is not None else None
+        acc_rev = acc_rev[1:] if acc_rev is not None else None
+        jerk_rev = jerk_rev[1:] if jerk_rev is not None else None
+
+    return JointState(
+        position=pos_rev, velocity=vel_rev, acceleration=acc_rev, jerk=jerk_rev, joint_names=js.joint_names
+    )
+
+
+def _append_return_to_start(planner) -> None:
+    """Append a reversed copy of the current plan to return to start, in-place on planner.
+
+    No-op if there is no current plan or it has < 2 waypoints.
+    """
+    js = getattr(planner, "current_plan", None)
+    if js is None or not hasattr(js, "position") or len(js.position) < 2:
+        return
+    back = _reverse_joint_state(js, drop_first=True)
+    combined = js.stack(back)
+    # Replace planner's current plan with the combined forward+back plan
+    try:
+        planner._current_plan = combined  # noqa: SLF001 (intentional internal state set)
+        planner._plan_index = 0
+    except Exception:
+        pass
 
 
 # def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
@@ -1526,6 +1582,14 @@ def main():
             return
         print(f"[PlanHumanoid] LEFT planned waypoints: {len(planner_left.get_planned_poses())}")
 
+        # If requested, append return-to-start for both arms by reversing their plans
+        if args_cli.back_forth:
+            print("[PlanHumanoid] Appending return-to-start segment for both arms (back_forth enabled)")
+            _append_return_to_start(planner_right)
+            _append_return_to_start(planner_left)
+            print(f"[PlanHumanoid] RIGHT total waypoints (forward+back): {len(planner_right.current_plan.position)}")
+            print(f"[PlanHumanoid] LEFT total waypoints (forward+back): {len(planner_left.current_plan.position)}")
+
         # Visualize goals and current EE frames for both arms
         ee_vis_r, ee_vis_l = _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_site_l, env)
 
@@ -1602,8 +1666,13 @@ def main():
         print("Planning failed.")
         return
 
-    # Diagnostics
-    _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, env)
+    if args_cli.back_forth:
+        print("[PlanHumanoid] Appending return-to-start segment (back_forth enabled)")
+        _append_return_to_start(planner)
+
+    # Diagnostics only for forward goal when not back-forth
+    if not args_cli.back_forth:
+        _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, env)
 
     # Visualize goal and current EE pose
     ee_pose_visualizer = _visualize_goal(args_cli, target_pose_env_site, env, eef_name)
