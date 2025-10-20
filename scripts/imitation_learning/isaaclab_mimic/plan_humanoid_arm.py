@@ -136,7 +136,7 @@ def _build_temp_robot_yaml_from_usd(usd_path: str, arm: str, inactive_joints: li
 
     # Ensure ee_link points to the selected arm's tool link (guard against malformed YAML)
     if isinstance(robot_cfg_yaml, dict):
-        kin = robot_cfg_yaml.get("kinematics", None)
+        kin = robot_cfg_yaml.get("kinematics")
         if isinstance(kin, dict):
             kin["ee_link"] = _tool_link_for_arm(arm)
 
@@ -227,8 +227,8 @@ def _build_env_and_planner(args_cli):
     inactive_joint_names = []
     try:
         inactive_joint_names = list(env_cfg.actions.pink_ik_cfg.ik_urdf_fixed_joint_names)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[PlanHumanoid] Error getting inactive joint names: {e}")
     robot_yaml = _build_temp_robot_yaml_from_usd(
         usd_path, args_cli.arm if args_cli.arm in ("left", "right") else "right", inactive_joints=inactive_joint_names
     )

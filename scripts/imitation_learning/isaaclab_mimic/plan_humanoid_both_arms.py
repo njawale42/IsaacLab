@@ -625,193 +625,9 @@ def _append_return_to_start(planner) -> None:
         pass
 
 
-# def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
-#     """Compute colliding waypoint pairs using self-collision on combined joint states.
-
-#     Builds all pairwise combined joint configurations where the right-arm joints come
-#     from the right plan at index i and the left-arm joints come from the left plan at
-#     index j. Other joints (torso/base/grippers) are taken from the right plan baseline.
-#     Uses cuRobo's RobotWorld self-collision cost to classify collisions.
-#     """
-#     import pdb; pdb.set_trace()
-#     plan_r = getattr(planner_r, "current_plan", None)
-#     plan_l = getattr(planner_l, "current_plan", None)
-#     if plan_r is None or plan_l is None:
-#         return []
-
-#     pos_r = plan_r.position # pos_r.shape: [32, 21]
-#     pos_l = plan_l.position # pos_l.shape: [32, 21]
-#     if not isinstance(pos_r, torch.Tensor):
-#         pos_r = torch.tensor(pos_r, dtype=torch.float32, device=planner_r.tensor_args.device)
-#     if not isinstance(pos_l, torch.Tensor):
-#         pos_l = torch.tensor(pos_l, dtype=torch.float32, device=planner_r.tensor_args.device)
-
-#     # Densify per CLI factor
-#     factor = max(1, int(getattr(args_cli, "pair_densify", 1)))
-#     pos_r_dense, map_r = _densify_plan_positions(pos_r, factor)
-#     pos_l_dense, map_l = _densify_plan_positions(pos_l, factor)
-#     Nr = int(pos_r_dense.shape[0])
-#     Nl = int(pos_l_dense.shape[0])
-#     if Nr == 0 or Nl == 0:
-#         return []
-
-#     # Joint masks for each arm based on configured substrings
-#     joint_names: list[str] = list(plan_r.joint_names)
-
-#     def _mask_for(substrings: tuple[str, ...]) -> torch.Tensor:
-#         return torch.tensor([any(s in name for s in substrings) for name in joint_names], dtype=torch.bool, device=planner_r.tensor_args.device)
-
-#     substr_l = getattr(planner_l, "active_joint_substrings", ("left_",))
-#     mask_l = _mask_for(tuple(substr_l))
-
-#     # Build all pairwise combined configurations: baseline from right plan, override left-arm joints from left plan
-#     q = pos_r_dense.repeat_interleave(Nl, dim=0).clone()  # [Nr*Nl, dof]
-#     left_all = pos_l_dense.repeat(Nr, 1)                  # [Nr*Nl, dof]
-#     q[:, mask_l] = left_all[:, mask_l]
-
-#     # Evaluate self-collision on the combined configurations
-#     from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
-
-#     # Set self-collision activation distance from CLI margin to treat near-contacts as collisions
-#     rw_cfg = RobotWorldConfig.load_from_config(
-#         robot_config=planner_r.robot_cfg,
-#         world_model=None,
-#         tensor_args=planner_r.tensor_args,
-#         n_envs=1,
-#         self_collision_activation_distance=float(getattr(args_cli, "joint_collision_margin", 0.0)),
-#     )
-#     robot_world = RobotWorld(rw_cfg)
-
-#     state = robot_world.get_kinematics(q)
-#     spheres = state.link_spheres_tensor.view(q.shape[0], 1, -1, 4)
-#     d_self = robot_world.get_self_collision(spheres).view(-1)
-
-#     if getattr(args_cli, "pair_visualize", False):
-#         # Visualize a few colliding and non-colliding samples in the viewer by setting joint targets
-#         k_collide = torch.nonzero(d_self > 0.0, as_tuple=False).flatten().tolist()
-#         k_free = torch.nonzero(d_self <= 0.0, as_tuple=False).flatten().tolist()
-#         import random
-#         random.shuffle(k_collide)
-#         random.shuffle(k_free)
-#         show_c = k_collide[: int(getattr(args_cli, "pair_vis_samples", 8))]
-#         show_f = k_free[: int(getattr(args_cli, "pair_vis_samples", 8))]
-
-#         # Use env robot to set joint position targets for brief frames
-#         rob = planner_r.robot
-#         device = rob.device
-#         def _show_config(conf: torch.Tensor):
-#             env_q = conf.to(device=planner_r.env.device, dtype=torch.float32).unsqueeze(0)
-#             rob.set_joint_position_target(env_q, env_ids=[planner_r.env_id])
-#             # step a few frames to let renderer update
-#             for _ in range(3):
-#                 planner_r.env.step(planner_r.env.cfg.idle_action if isinstance(planner_r.env.cfg.idle_action, torch.Tensor) else torch.tensor(planner_r.env.cfg.idle_action, device=planner_r.env.device).unsqueeze(0))
-
-#         print(f"[PlanHumanoid] Visualizing {len(show_c)} colliding and {len(show_f)} free samples")
-#         for k in show_c:
-#             _show_config(q[k])
-#         for k in show_f:
-#             _show_config(q[k])
-
-#     colliding_rows = torch.nonzero(d_self > 0.0, as_tuple=False).flatten()
-#     if colliding_rows.numel() == 0:
-#         return []
-
-#     pairs: list[tuple[int, int]] = []
-#     for idx in colliding_rows.tolist():
-#         i_dense = idx // Nl
-#         j_dense = idx % Nl
-#         # Map back to original coarse waypoint indices
-#         i_coarse = int(map_r[i_dense].item())
-#         j_coarse = int(map_l[j_dense].item())
-#         pairs.append((i_coarse, j_coarse))
-#     return pairs
-
-
-# Version 2: Using independent kinematics from both the planners
-# def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
-#     """Compute colliding waypoint pairs using self-collision on combined joint states.
-
-#     Mirrors streams.py: build a full-DOF grid from the two joint paths by assigning
-#     each path's joint subset via name->index arrays into a full baseline configuration.
-#     """
-#     import pdb; pdb.set_trace()
-#     from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
-
-#     plan_r = getattr(planner_r, "current_plan", None)
-#     plan_l = getattr(planner_l, "current_plan", None)
-#     if plan_r is None or plan_l is None:
-#         return []
-
-#     dev = planner_r.tensor_args.device
-#     # Paths as tensors
-#     pos_r = plan_r.position if isinstance(plan_r.position, torch.Tensor) else torch.tensor(plan_r.position, dtype=torch.float32, device=dev)
-#     pos_l = plan_l.position if isinstance(plan_l.position, torch.Tensor) else torch.tensor(plan_l.position, dtype=torch.float32, device=dev)
-#     pos_r = pos_r.to(device=dev, dtype=torch.float32)
-#     pos_l = pos_l.to(device=dev, dtype=torch.float32)
-
-#     # Optional densification
-#     factor = max(1, int(getattr(args_cli, "pair_densify", 1)))
-#     pos_r_dense, map_r = _densify_plan_positions(pos_r, factor)
-#     pos_l_dense, map_l = _densify_plan_positions(pos_l, factor)
-#     Nr, Nl = int(pos_r_dense.shape[0]), int(pos_l_dense.shape[0])
-#     if Nr == 0 or Nl == 0:
-#         return []
-
-#     # Full robot joint ordering
-#     full_joint_names_r: list[str] = list(planner_r.motion_gen.kinematics.joint_names)
-#     full_joint_names_l: list[str] = list(planner_l.motion_gen.kinematics.joint_names)
-
-#     # Map each plan’s joint names into the full ordering (streams.py uses get_joint_indices)
-#     name_to_full_r = {n: i for i, n in enumerate(full_joint_names_r)}
-#     name_to_full_l = {n: i for i, n in enumerate(full_joint_names_l)}
-#     idx_r = torch.tensor([name_to_full_r[n] for n in plan_r.joint_names], dtype=torch.long, device=dev)
-#     idx_l = torch.tensor([name_to_full_l[n] for n in plan_l.joint_names], dtype=torch.long, device=dev)
-
-#     # Full-DOF baseline like world.retract_conf in streams.py
-#     base_js = planner_r._get_current_joint_state_for_curobo()
-#     base = base_js.position.squeeze(0).to(device=dev, dtype=torch.float32)  # [dof]
-
-#     # Build cross product configurations on the full DOF vector
-#     num = Nr * Nl
-#     confs = base.repeat(num, 1)  # [Nr*Nl, dof]
-#     # Right subset written for each i, repeated over Nl
-#     confs[:, idx_r] = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)
-#     # Left subset written for each j, tiled across Nr
-#     confs[:, idx_l] = pos_l_dense.repeat(Nr, 1)
-
-#     # Self-collision classification (like world.get_self_collisions)
-#     rw_cfg = RobotWorldConfig.load_from_config(
-#         robot_config=planner_r.robot_cfg,
-#         world_model=None,
-#         tensor_args=planner_r.tensor_args,
-#         n_envs=1,
-#         self_collision_activation_distance=float(getattr(args_cli, "joint_collision_margin", 0.0)),
-#     )
-#     robot_world = RobotWorld(rw_cfg)
-#     state = robot_world.get_kinematics(confs)
-#     spheres = state.link_spheres_tensor.view(num, 1, -1, 4)
-#     d_self = robot_world.get_self_collision(spheres).view(-1)
-
-#     rows = torch.nonzero(d_self > 0.0, as_tuple=False).flatten()
-#     if rows.numel() == 0:
-#         return []
-
-#     pairs: list[tuple[int, int]] = []
-#     for k in rows.tolist():
-#         i_dense = k // Nl
-#         j_dense = k % Nl
-#         pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
-#     return pairs
-
-
 def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]]:
-    """Find colliding waypoint pairs by checking right-vs-left sphere overlaps per pair.
-
-    Uses each planner's own kinematics to compute spheres and detects inter-arm overlaps.
-    Avoids mapping left joint names into the right planner's joint list.
-    """
-    #
-
+    """Find colliding waypoint pairs by checking right-vs-left sphere overlaps per pair,
+    fully vectorized over spheres inside each batch."""
     plan_r = getattr(planner_r, "current_plan", None)
     plan_l = getattr(planner_l, "current_plan", None)
     if plan_r is None or plan_l is None:
@@ -845,63 +661,52 @@ def _compute_colliding_pairs_joint(planner_r, planner_l) -> list[tuple[int, int]
     q_l = pos_l_dense.repeat(Nr, 1)  # [Nr*Nl, dof_l]
     num = q_r.shape[0]
 
-    # Compute min proximity per combined config without allocating [num, nR, nL]
     kin_r = planner_r.motion_gen.kinematics
     kin_l = planner_l.motion_gen.kinematics
-
-    B_NUM = int(getattr(args_cli, "pair_batch", 4096))  # batch over cross-product rows
-    CR = int(getattr(args_cli, "pair_chunk_r", 64))  # chunk right spheres
-    CL = int(getattr(args_cli, "pair_chunk_l", 64))  # chunk left spheres
+    B_NUM = int(getattr(args_cli, "pair_batch", 4096))
     margin = float(getattr(args_cli, "joint_collision_margin", 0.0))
 
     colliding_rows = []
 
-    num = q_r.shape[0]
+    # Process cross-product rows in batches (keep this loop to bound memory)
     for bi in range(0, num, B_NUM):
         bj = min(num, bi + B_NUM)
-        q_r_b = q_r[bi:bj]
-        q_l_b = q_l[bi:bj]
+        q_r_b = q_r[bi:bj]  # [bsz, dof_r]
+        q_l_b = q_l[bi:bj]  # [bsz, dof_l]
         bsz = q_r_b.shape[0]
 
+        # Kinematics -> spheres
         state_r = kin_r.get_state(q_r_b)
         state_l = kin_l.get_state(q_l_b)
         sph_r = state_r.link_spheres_tensor.view(bsz, -1, 4)  # [bsz, nR, 4]
         sph_l = state_l.link_spheres_tensor.view(bsz, -1, 4)  # [bsz, nL, 4]
-        nR = sph_r.shape[1]
-        nL = sph_l.shape[1]
 
-        c_r = sph_r[..., :3]
-        r_r = sph_r[..., 3]
-        c_l = sph_l[..., :3]
-        r_l = sph_l[..., 3]
+        c_r = sph_r[..., :3]  # [bsz, nR, 3]
+        r_r = sph_r[..., 3]  # [bsz, nR]
+        c_l = sph_l[..., :3]  # [bsz, nL, 3]
+        r_l = sph_l[..., 3]  # [bsz, nL]
 
-        min_prox_b = torch.full((bsz,), float("inf"), device=c_r.device, dtype=c_r.dtype)
+        # Pairwise squared distances via Gram-matrix trick:
+        # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a·b
+        aa = (c_r * c_r).sum(dim=-1, keepdim=True)  # [bsz, nR, 1]
+        bb = (c_l * c_l).sum(dim=-1).unsqueeze(1)  # [bsz, 1, nL]
+        ab = torch.bmm(c_r, c_l.transpose(1, 2))  # [bsz, nR, nL]
+        dist2 = torch.clamp(aa + bb - 2.0 * ab, min=0.0)  # [bsz, nR, nL]
 
-        for r0 in range(0, nR, CR):
-            r1 = min(nR, r0 + CR)
-            c_r_ch = c_r[:, r0:r1, :]  # [bsz, cr, 3]
-            r_r_ch = r_r[:, r0:r1]  # [bsz, cr]
-            for l0 in range(0, nL, CL):
-                l1 = min(nL, l0 + CL)
-                c_l_ch = c_l[:, l0:l1, :]  # [bsz, cl, 3]
-                r_l_ch = r_l[:, l0:l1]  # [bsz, cl]
+        # Radii sum (+ margin) per pair (broadcast)
+        rs = r_r.unsqueeze(-1) + r_l.unsqueeze(-2)  # [bsz, nR, nL]
+        thresh2 = (rs + margin) * (rs + margin)  # [bsz, nR, nL]
 
-                diff = c_r_ch.unsqueeze(2) - c_l_ch.unsqueeze(1)  # [bsz, cr, cl, 3]
-                d = torch.linalg.norm(diff, dim=-1)  # [bsz, cr, cl]
-                rs = r_r_ch.unsqueeze(2) + r_l_ch.unsqueeze(1)  # [bsz, cr, cl]
-                prox = d - rs  # [bsz, cr, cl]
-                local_min = prox.view(bsz, -1).min(dim=1).values
-                min_prox_b = torch.minimum(min_prox_b, local_min)
-
-        # rows that collide for this batch
-        local_rows = torch.nonzero(min_prox_b <= margin, as_tuple=False).flatten()
+        # A pair (i,j) collides iff dist2 <= (r_sum + margin)^2
+        collide_any = (dist2 <= thresh2).any(dim=(1, 2))  # [bsz]
+        local_rows = torch.nonzero(collide_any, as_tuple=False).flatten()
         if local_rows.numel() > 0:
             colliding_rows.extend((bi + k.item()) for k in local_rows)
 
     if len(colliding_rows) == 0:
         return []
 
-    # Map dense rows -> (i,j) -> coarse indices via map_r/map_l
+    # Map batch rows -> dense (i,j) -> coarse indices via map_r/map_l
     pairs = []
     for k in colliding_rows:
         i_dense = k // Nl
@@ -1376,7 +1181,6 @@ def _execute_plans_together(
                 cur_pos_l = cur_eef_pose_l[:3, 3].detach()
                 cur_quat_l = PoseUtils.quat_from_matrix(cur_eef_pose_l[:3, :3].unsqueeze(0))[0].detach()
                 ee_vis_l.visualize(translations=cur_pos_l.unsqueeze(0), orientations=cur_quat_l.unsqueeze(0))
-
             env.step(action)
         print("[PlanHumanoid] Trial complete")
 
