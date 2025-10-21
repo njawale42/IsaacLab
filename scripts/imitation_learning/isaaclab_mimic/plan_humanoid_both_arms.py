@@ -57,6 +57,31 @@ parser.add_argument(
     action="store_true",
     help="If set, plan to the goal and then back to the starting pose for each arm.",
 )
+parser.add_argument(
+    "--smooth_interp",
+    type=str,
+    choices=["linear", "pchip"],
+    default="linear",
+    help="Interpolator for retimed execution: linear (default) or PCHIP (shape-preserving cubic).",
+)
+parser.add_argument(
+    "--joint_smoothing_alpha",
+    type=float,
+    default=0.0,
+    help="EMA smoothing (0..1, 0=off) on joint targets during retimed execution.",
+)
+parser.add_argument(
+    "--control_dt",
+    type=float,
+    default=None,
+    help="Controller/action step in seconds for resampling retimed schedules (default: infer or 1/60).",
+)
+parser.add_argument(
+    "--final_hold_steps",
+    type=int,
+    default=20,
+    help="Extra steps to hold the final target for settling after execution.",
+)
 # Optional per-arm overrides: when provided, independent goals are used instead of symmetric bimanual ones
 parser.add_argument(
     "--right_dx", type=float, default=None, help="Right arm X offset (site/world). Overrides --dx if set."
@@ -134,6 +159,28 @@ def to_python(obj):
     if isinstance(obj, list):
         return [to_python(v) for v in obj]
     return obj
+
+
+def _infer_control_dt(env, default: float = 1.0 / 60.0) -> float:
+    """Infer controller/action dt from environment configuration.
+
+    Prefers env.cfg.decimation * env.cfg.sim.dt if available, else env.sim.dt, else default.
+    """
+    try:
+        cfg = getattr(env, "cfg", None)
+        if cfg is not None:
+            decim = getattr(cfg, "decimation", 1)
+            sim_cfg = getattr(cfg, "sim", None)
+            sim_dt = getattr(sim_cfg, "dt", None) if sim_cfg is not None else None
+            if sim_dt is not None:
+                return float(sim_dt) * float(decim if decim is not None else 1)
+        sim = getattr(env, "sim", None)
+        sim_dt2 = getattr(sim, "dt", None) if sim is not None else None
+        if sim_dt2 is not None:
+            return float(sim_dt2)
+    except Exception:
+        pass
+    return float(default)
 
 
 def _build_temp_robot_yaml_from_usd(usd_path: str, arm: str, inactive_joints: list[str] | None = None) -> str:
@@ -615,7 +662,7 @@ def _append_return_to_start(planner) -> None:
     js = getattr(planner, "current_plan", None)
     if js is None or not hasattr(js, "position") or len(js.position) < 2:
         return
-    back = _reverse_joint_state(js, drop_first=True)
+    back = _reverse_joint_state(js, drop_first=False)
     combined = js.stack(back)
     # Replace planner's current plan with the combined forward+back plan
     try:
@@ -739,7 +786,7 @@ def _build_retimed_schedules(len_r: int, len_l: int, colliding_pairs: list[tuple
     path2 = [None] * len_l
     try:
         t1, t2 = retime_paths(
-            path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.02, verbose=False
+            path1, path2, colliding=colliding_pairs, linear=True, min_dt=min_dt, buffer=0.0, verbose=False
         )
         return t1, t2
     except AssertionError:
@@ -1083,7 +1130,7 @@ def _execute_plans_together(
         times_r_list = [float(t) for t in times_r]
         times_l_list = [float(t) for t in times_l]
 
-        def interp(times_list, path_tensor, t):
+        def _interp_linear(times_list, path_tensor, t):
             k = max(0, bisect.bisect_right(times_list, float(t)) - 1)
             if k >= len(times_list) - 1:
                 return path_tensor[-1]
@@ -1094,9 +1141,56 @@ def _execute_plans_together(
             w = (float(t) - t0) / (t1 - t0)
             return (1.0 - w) * path_tensor[k] + w * path_tensor[k + 1]
 
-        # Build a synthetic schedule of callable interpolants at each time
-        schedule = []  # list of (t) to be used below for FK per time
-        schedule = all_times
+        def _interp_pchip(times_list, path_tensor, t):
+            # Shape-preserving cubic Hermite on each joint independently using end slopes
+            k = max(0, bisect.bisect_right(times_list, float(t)) - 1)
+            if k >= len(times_list) - 1:
+                return path_tensor[-1]
+            t0 = float(times_list[k])
+            t1 = float(times_list[k + 1])
+            if t1 <= t0:
+                return path_tensor[k]
+            y0 = path_tensor[k]
+            y1 = path_tensor[k + 1]
+            # Finite difference slopes (clamped at ends)
+            if k == 0:
+                m0 = (path_tensor[1] - path_tensor[0]) / max(times_list[1] - times_list[0], 1e-6)
+            else:
+                m0 = (path_tensor[k + 1] - path_tensor[k - 1]) / max(times_list[k + 1] - times_list[k - 1], 1e-6)
+            if k + 1 >= len(times_list) - 1:
+                m1 = (path_tensor[-1] - path_tensor[-2]) / max(times_list[-1] - times_list[-2], 1e-6)
+            else:
+                m1 = (path_tensor[k + 2] - path_tensor[k]) / max(times_list[k + 2] - times_list[k], 1e-6)
+            # Normalize tangents for PCHIP-like monotonicity (approx; avoids overshoot)
+            dt = t1 - t0
+            s = (y1 - y0) / max(dt, 1e-6)
+            # Zero slopes where sign flips to preserve shape
+            same_sign = torch.sign(s) == torch.sign(m0)
+            m0 = torch.where(same_sign, m0, torch.zeros_like(m0))
+            same_sign = torch.sign(s) == torch.sign(m1)
+            m1 = torch.where(same_sign, m1, torch.zeros_like(m1))
+            # Hermite basis
+            tau = (float(t) - t0) / dt
+            h00 = (2 * tau**3) - (3 * tau**2) + 1
+            h10 = (tau**3) - (2 * tau**2) + tau
+            h01 = (-2 * tau**3) + (3 * tau**2)
+            h11 = (tau**3) - (tau**2)
+            return h00 * y0 + h10 * (dt * m0) + h01 * y1 + h11 * (dt * m1)
+
+        interp = _interp_linear if args_cli.smooth_interp == "linear" else _interp_pchip
+
+        # Build a synthetic schedule; optionally resample to a fixed control dt
+        # Infer control dt if not provided: prefer decimation * sim.dt
+        ctrl_dt = float(args_cli.control_dt) if args_cli.control_dt is not None else _infer_control_dt(env, 1.0 / 60.0)
+        T_end = max(times_r_list[-1], times_l_list[-1]) if len(times_r_list) > 0 and len(times_l_list) > 0 else 0.0
+        if ctrl_dt > 0.0 and T_end > 0.0:
+            num_steps = int(T_end / ctrl_dt) + 1
+            schedule = [i * ctrl_dt for i in range(num_steps)]
+            # Ensure exact inclusion of T_end even if it is not a multiple of ctrl_dt
+            if len(schedule) == 0 or abs(schedule[-1] - T_end) > 1e-9:
+                schedule.append(T_end)
+        else:
+            schedule = all_times
     else:
         schedule = list(zip(range(len(planned_r)), [min(i, len(planned_l) - 1) for i in range(len(planned_r))]))
         if len(planned_l) > len(planned_r):
@@ -1106,6 +1200,9 @@ def _execute_plans_together(
     for trial in range(args_cli.replay_trials):
         print(f"[PlanHumanoid] Replaying trial {trial + 1}/{args_cli.replay_trials}")
         env.reset()
+        # EMA state for smoothed joint targets (if enabled)
+        ema_r = None
+        ema_l = None
         for step in schedule:
             # Base pose in world (recompute each step)
             base_pos_world_exec = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
@@ -1121,6 +1218,19 @@ def _execute_plans_together(
                 # Interpolate joint positions per arm
                 q_r_t = interp(times_r_list, js_r, t)
                 q_l_t = interp(times_l_list, js_l, t)
+                # Optional EMA smoothing in joint space
+                alpha = float(getattr(args_cli, "joint_smoothing_alpha", 0.0))
+                if alpha > 0.0:
+                    if ema_r is None:
+                        ema_r = q_r_t.clone()
+                    else:
+                        ema_r = alpha * q_r_t + (1.0 - alpha) * ema_r
+                    if ema_l is None:
+                        ema_l = q_l_t.clone()
+                    else:
+                        ema_l = alpha * q_l_t + (1.0 - alpha) * ema_l
+                    q_r_t = ema_r
+                    q_l_t = ema_l
                 # FK to base->tool
                 state_r = planner_r.motion_gen.kinematics.get_state(q_r_t.unsqueeze(0))
                 state_l = planner_l.motion_gen.kinematics.get_state(q_l_t.unsqueeze(0))
@@ -1182,6 +1292,56 @@ def _execute_plans_together(
                 cur_quat_l = PoseUtils.quat_from_matrix(cur_eef_pose_l[:3, :3].unsqueeze(0))[0].detach()
                 ee_vis_l.visualize(translations=cur_pos_l.unsqueeze(0), orientations=cur_quat_l.unsqueeze(0))
             env.step(action)
+        # Final hold at goal to allow settling (retimed branch only)
+        if retime_schedules is not None and len(schedule) > 0:
+            # Use the true retime horizon (T_end) to compute final targets
+            t_last = max(times_r_list[-1], times_l_list[-1]) if len(times_r_list) > 0 and len(times_l_list) > 0 else schedule[-1]
+            q_r_T = interp(times_r_list, js_r, t_last)
+            q_l_T = interp(times_l_list, js_l, t_last)
+            state_r = planner_r.motion_gen.kinematics.get_state(q_r_T.unsqueeze(0))
+            state_l = planner_l.motion_gen.kinematics.get_state(q_l_T.unsqueeze(0))
+            pose_r_bt = getattr(state_r, "ee_pose", None)
+            pose_l_bt = getattr(state_l, "ee_pose", None)
+            def _pose_to_mat_final(pose_obj, state):
+                if pose_obj is not None and hasattr(pose_obj, "position"):
+                    pos = pose_obj.position
+                    if hasattr(pose_obj, "quaternion"):
+                        quat = pose_obj.quaternion.view(1, 4)
+                        rot_m = PoseUtils.matrix_from_quat(quat)[0]
+                    else:
+                        rot_m = pose_obj.get_rotation()
+                        if rot_m.dim() == 3:
+                            rot_m = rot_m[0]
+                    return PoseUtils.make_pose(pos.view(1, 3), rot_m.unsqueeze(0))[0]
+                ee_pos = getattr(state, "ee_position").view(1, 3)
+                ee_rot = getattr(state, "ee_quaternion").view(1, 4)
+                rot_m = PoseUtils.matrix_from_quat(ee_rot)[0]
+                return PoseUtils.make_pose(ee_pos, rot_m.unsqueeze(0))[0]
+            pose_r_bt = _pose_to_mat_final(pose_r_bt, state_r).to(device=env.device, dtype=torch.float32)
+            pose_l_bt = _pose_to_mat_final(pose_l_bt, state_l).to(device=env.device, dtype=torch.float32)
+            base_pos_world_exec = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
+            base_rot_world_exec = PoseUtils.matrix_from_quat(
+                robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
+            )[0]
+            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[0]
+            target_world_tool_r = (T_world_base_exec @ pose_r_bt).clone()
+            target_world_tool_l = (T_world_base_exec @ pose_l_bt).clone()
+            target_site_r = (target_world_tool_r @ site_from_r).clone()
+            target_site_l = (target_world_tool_l @ site_from_l).clone()
+            target_site_r[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
+            target_site_l[3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32)
+            target_dict_final = {"left": target_site_l, "right": target_site_r}
+            action_final = env.target_eef_pose_to_action(
+                target_eef_pose_dict=target_dict_final,
+                gripper_action_dict={"left": idle[14:25], "right": idle[25:36]},
+                action_noise_dict=None,
+                env_id=0,
+            )
+            if action_final.ndim == 1:
+                action_final = action_final.unsqueeze(0)
+            action_final = action_final.to(device=env.device, dtype=torch.float32)
+            for _ in range(int(max(0, args_cli.final_hold_steps))):
+                env.step(action_final)
         print("[PlanHumanoid] Trial complete")
 
     planner_r.plan_visualizer.close()
@@ -1420,7 +1580,7 @@ def main():
                     len(planner_right.get_planned_poses()),
                     len(planner_left.get_planned_poses()),
                     colliding_pairs,
-                    min_dt=0.01,
+                    min_dt=0.05,
                 )
                 if retime_sched is None:
                     print(
