@@ -86,21 +86,19 @@ class TestCuroboMPCPlanner:
         self.goal_pose_visualizer: VisualizationMarkers | None = mpc_test_env["goal_pose_visualizer"]
 
     def test_reactive_reach(self) -> None:
-        origin = self.env.scene.env_origins[0]
-
         for goal_spec, goal_id in predefined_ee_goals_and_ids:
-            # Goal specified in world frame in config; convert to env frame
-            pos_world = torch.tensor(goal_spec["pos"], device=self.env.device, dtype=torch.float32)
+            # Goal specified in world frame - pass directly to planner (it will handle coordinate conversion)
+            pos = torch.tensor(goal_spec["pos"], device=self.env.device, dtype=torch.float32)
             quat = torch.tensor(goal_spec["quat"], device=self.env.device, dtype=torch.float32)
-            pos_env = pos_world - origin
 
             # Sanity: ensure goals are behind the wall (x > 0.55 in world frame)
-            assert pos_world[0] > 0.55, f"Goal '{goal_id}' is not behind the wall (x={pos_world[0].item():.3f})"
+            assert pos[0] > 0.55, f"Goal '{goal_id}' is not behind the wall (x={pos[0].item():.3f})"
 
-            goal = math_utils.make_pose(pos_env, math_utils.matrix_from_quat(quat.unsqueeze(0))[0])[0]
+            rot_matrix = math_utils.matrix_from_quat(quat.unsqueeze(0))[0]
+            ee_goal = math_utils.make_pose(pos, rot_matrix)
 
             # Plan first so the planner caches the goal transform for viz
-            planned = self.planner.update_world_and_plan_motion(goal, env_id=0)
+            planned = self.planner.update_world_and_plan_motion(ee_goal, env_id=0)
             assert planned, f"Planner failed to find a plan for goal: {goal_id}"
 
             # Visualize goal in the correct env EE world frame provided by the planner
@@ -131,6 +129,7 @@ class TestCuroboMPCPlanner:
                         cmd_q = torch.cat([cmd_q, fingers], dim=-1)
                     self.env.scene["robot"].write_joint_position_to_sim(cmd_q)
                     self.env.sim.step()
+                    print("Using write_joint_position_to_sim")
                 else:
                     play_action = self.env.target_eef_pose_to_action(  # type: ignore[attr-defined]
                         target_eef_pose_dict={"eef": next_pose},
@@ -142,6 +141,7 @@ class TestCuroboMPCPlanner:
                         play_action = play_action.unsqueeze(0)
                     for _ in range(10):
                         self.env.step(play_action)
+                    print("Using target_eef_pose_to_action")
 
             # Validate we reached the current goal using the planner's error metric
             pos_err, _ = self.planner._current_pose_error()  # type: ignore[attr-defined]

@@ -309,106 +309,42 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # Sync world first
         self.update_world()
 
-        # Normalize and save target as 4x4 matrix
-        self._target_pose_env = self._normalize_target_pose_to_matrix(target_pose)
-
-        # Convert target to cuRobo pose on MPC device
-        # Extra guard in case a non-matrix sneaks in
-        if not (
-            isinstance(self._target_pose_env, torch.Tensor)
-            and self._target_pose_env.dim() == 2
-            and self._target_pose_env.shape[-2:] == (4, 4)
-        ):
-            self._target_pose_env = self._normalize_target_pose_to_matrix(self._target_pose_env)  # type: ignore[arg-type]
-
-        # Build world-frame target matrix for env ee frame
-        if isinstance(self._target_pose_env, torch.Tensor):
-            T_env_goal_world = self._target_pose_env
+        # Ensure target_pose is a 4x4 matrix on the env device first
+        if not isinstance(target_pose, torch.Tensor):
+            target_pose = torch.as_tensor(target_pose, device=self.env.device, dtype=torch.float32)
         else:
-            T_env_goal_world = torch.as_tensor(self._target_pose_env, device=self.env.device, dtype=torch.float32)
+            target_pose = target_pose.to(device=self.env.device, dtype=torch.float32)
 
-        # Guard: accept quaternion/position vectors and convert to matrix here if encountered
-        if isinstance(T_env_goal_world, torch.Tensor) and T_env_goal_world.dim() == 1:
-            cur_T = self._get_current_ee_pose_matrix()
-            cur_pos, cur_rot = PoseUtils.unmake_pose(cur_T)
-            if T_env_goal_world.shape[0] == 4:
-                rot_b = PoseUtils.matrix_from_quat(T_env_goal_world.unsqueeze(0))
-                pos_b = cur_pos.unsqueeze(0) if cur_pos.dim() == 1 else cur_pos
-                T_env_goal_world = PoseUtils.make_pose(pos_b, rot_b)[0]
-            elif T_env_goal_world.shape[0] == 3:
-                pos_b = T_env_goal_world.unsqueeze(0)
-                rot_b = cur_rot.unsqueeze(0) if cur_rot.dim() == 2 else cur_rot
-                T_env_goal_world = PoseUtils.make_pose(pos_b, rot_b)[0]
-            else:
-                self.logger.info(f"Unexpected goal shape {T_env_goal_world.shape}, using current pose")
-                T_env_goal_world = cur_T
+        # Handle batched pose (1, 4, 4) by extracting first element
+        if target_pose.dim() == 3 and target_pose.shape[0] == 1:
+            target_pose = target_pose[0]
 
-        # One-time calibration of envEE->solverEE transform in world frame
-        if self._envEE_to_solverEE is None:
-            try:
-                # Current env ee frame world transform
-                ee_frame = self.env.scene["ee_frame"]
-                # Guard on array shape access; fall back to zeros if indexing fails
-                try:
-                    pos_w = ee_frame.data.target_pos_w[self.env_id, 0, :]
-                    quat_w = ee_frame.data.target_quat_w[self.env_id, 0, :]
-                except Exception:
-                    pos_w = torch.zeros(3, device=self.env.device, dtype=torch.float32)
-                    quat_w = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
-                # Build batched pose → unbatch
-                pos_b = pos_w.unsqueeze(0) if pos_w.dim() == 1 else pos_w
-                rot_b = PoseUtils.matrix_from_quat(quat_w.unsqueeze(0) if quat_w.dim() == 1 else quat_w)
-                T_env_current_world = PoseUtils.make_pose(pos_b, rot_b)[0]
-                # Current solver ee world transform
-                T_solver_current_world = self._get_current_ee_pose_matrix()
-                self._envEE_to_solverEE = torch.linalg.inv(T_env_current_world) @ T_solver_current_world
-                if self._envEE_to_solverEE is not None:
-                    self.logger.info(
-                        f"Calibrated envEE->solverEE (pos,deg): {self._envEE_to_solverEE[:3,3]}, "
-                        f"{torch.rad2deg(torch.tensor([0.0]))}"
-                    )
-            except Exception as e:
-                self.logger.info(f"EE calibration failed (continuing w/o): {e}")
-                self._envEE_to_solverEE = None
+        # Validate shape
+        if target_pose.dim() != 2 or target_pose.shape != (4, 4):
+            raise ValueError(f"Expected 4x4 pose matrix, got shape {target_pose.shape}")
 
-        # Store goal in env ee frame (world) for visualization/debug
-        self._goal_env_world_pose = T_env_goal_world
+        # Convert target pose to cuRobo device (matching trajectory planner approach)
+        target_pose_cuda = self._to_curobo_device(target_pose)
 
-        # Convert env ee goal to solver ee goal in world frame using calibration (if available)
-        if self._envEE_to_solverEE is not None:
-            T_solver_goal_world = T_env_goal_world @ self._envEE_to_solverEE
-        else:
-            T_solver_goal_world = T_env_goal_world
+        # Extract position and rotation from 4x4 matrix
+        tgt_pos_cuda, tgt_rot_cuda = PoseUtils.unmake_pose(target_pose_cuda)
+        tgt_quat_cuda = PoseUtils.quat_from_matrix(tgt_rot_cuda)
 
-        tgt_pos, tgt_rot = PoseUtils.unmake_pose(T_solver_goal_world)
-        tgt_quat = PoseUtils.quat_from_matrix(tgt_rot)
+        # Log for debugging
+        self.logger.info(f"Goal position (cuRobo device): {tgt_pos_cuda}")
 
-        # Convert target position from world frame to env-local frame expected by cuRobo (subtract env origin)
-        try:
-            env_origins = getattr(self.env.scene, "env_origins", None)
-            if isinstance(env_origins, torch.Tensor):
-                env_origin = env_origins[self.env_id, :3]
-            else:
-                env_origin = torch.tensor([0.0, 0.0, 0.0], device=self.env.device, dtype=torch.float32)
-            env_origin = env_origin.to(device=self.env.device, dtype=torch.float32)
-            # Explicit INFO logs so they are visible even when debug_planner is False
-            self.logger.info(f"Env origin: {env_origin}")
-            self.logger.info(f"Target world pos (pre-local): {tgt_pos}")
-            tgt_pos = tgt_pos - env_origin
-            self.logger.info(f"Target env-local pos: {tgt_pos}")
-        except Exception as e:
-            self.logger.info(f"Env origin/target logging failed: {e}")
-        # Cache env-local pos/quat for later error checks without unmake_pose
-        self._target_pos_env = (
-            tgt_pos if isinstance(tgt_pos, torch.Tensor) else torch.as_tensor(tgt_pos, device=self.env.device)
-        )
-        self._target_quat_env = (
-            tgt_quat if isinstance(tgt_quat, torch.Tensor) else torch.as_tensor(tgt_quat, device=self.env.device)
-        )
+        # Store goal for visualization (already on env device from above)
+        self._target_pose_env = target_pose
+        self._goal_env_world_pose = target_pose
 
+        # Cache position and quaternion for error checking (convert to env device)
+        self._target_pos_env = tgt_pos_cuda.to(device=self.env.device)
+        self._target_quat_env = tgt_quat_cuda.to(device=self.env.device)
+
+        # Create cuRobo Pose directly (matching trajectory planner)
         self._target_pose_cu = self._make_pose(
-            position=self._to_curobo_device(self._target_pos_env),
-            quaternion=self._to_curobo_device(self._target_quat_env),
+            position=tgt_pos_cuda,
+            quaternion=tgt_quat_cuda,
         )
 
         # Build current joint state on cuRobo device
@@ -516,7 +452,9 @@ class CuroboMPCPlanner(MotionPlannerBase):
         rot_env = self._to_env_device(rot_e)
         pos_env_b = pos_env.unsqueeze(0) if pos_env.dim() == 1 else pos_env
         rot_env_b = rot_env.unsqueeze(0) if rot_env.dim() == 2 else rot_env
-        return PoseUtils.make_pose(pos_env_b, rot_env_b)[0]
+        # Convert from env-local to world coordinates
+        pos_world_b = pos_env_b + env_origin.unsqueeze(0)
+        return PoseUtils.make_pose(pos_world_b, rot_env_b)[0]
 
     def _normalize_target_pose_to_matrix(self, pose_in: torch.Tensor) -> torch.Tensor:
         # Accept 4x4, (3,) position only, (4,) quaternion only, or (7,) [pos(3), quat(4)]
@@ -687,13 +625,8 @@ class CuroboMPCPlanner(MotionPlannerBase):
                 pos_world = pos_env + env_origin
                 T_solver_world = PoseUtils.make_pose(pos_world, rot_env)[0]
 
-        # Convert solver ee world transform to env ee world transform using calibration
-        if self._envEE_to_solverEE is not None:
-            T_env_world = T_solver_world @ torch.linalg.inv(self._envEE_to_solverEE)
-        else:
-            T_env_world = T_solver_world
-
-        ee_tf = T_env_world
+        # Use solver transform directly without EE calibration (matches trajectory planner behavior)
+        ee_tf = T_solver_world
 
         self._step_count += 1
         return ee_tf
