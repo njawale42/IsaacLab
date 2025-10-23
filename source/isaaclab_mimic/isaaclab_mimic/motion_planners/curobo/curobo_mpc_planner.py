@@ -385,9 +385,11 @@ class CuroboMPCPlanner(MotionPlannerBase):
             return
         draw = self._acquire_debug_draw_interface()
         if draw is None:
+            self.logger.debug("Debug draw interface not available")
             return
         rollouts_tensor = self.mpc.get_visual_rollouts() if hasattr(self.mpc, "get_visual_rollouts") else None
         if not isinstance(rollouts_tensor, torch.Tensor):
+            self.logger.debug("No rollouts tensor available")
             return
         cpu_rollouts = rollouts_tensor.detach().to("cpu").numpy()
         if cpu_rollouts.ndim != 3 or cpu_rollouts.shape[-1] < 3:
@@ -411,6 +413,9 @@ class CuroboMPCPlanner(MotionPlannerBase):
             pass
         if points:
             draw.draw_points(points, colors, sizes)
+            if self._draw_log_counter % 10 == 0:  # Log every 10th draw to avoid spam
+                self.logger.debug(f"Drew {len(points)} rollout points from {b} trajectories")
+            self._draw_log_counter += 1
 
     def _get_current_ee_pose_matrix(self) -> torch.Tensor:
         cu_js = self._get_current_joint_state_for_curobo()

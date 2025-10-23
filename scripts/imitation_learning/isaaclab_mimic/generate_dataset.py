@@ -45,6 +45,12 @@ parser.add_argument(
     default=False,
     help="use skillgen to generate motion trajectories",
 )
+parser.add_argument(
+    "--use_mpc",
+    action="store_true",
+    default=False,
+    help="use MPC (reactive planning) instead of trajectory planning when used with --use_skillgen",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -84,6 +90,10 @@ import isaaclab_tasks  # noqa: F401
 
 def main():
     num_envs = args_cli.num_envs
+
+    # Validate arguments
+    if args_cli.use_mpc and not args_cli.use_skillgen:
+        raise ValueError("--use_mpc can only be used with --use_skillgen")
 
     # Setup output paths and get env name
     output_dir, output_file_name = setup_output_paths(args_cli.output_file)
@@ -125,8 +135,15 @@ def main():
 
     motion_planners = None
     if args_cli.use_skillgen:
-        from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
         from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
+
+        # Import the appropriate planner based on whether MPC is requested
+        if args_cli.use_mpc:
+            from isaaclab_mimic.motion_planners.curobo.curobo_mpc_planner import CuroboMPCPlanner
+            print("Using MPC (reactive) planning for motion generation")
+        else:
+            from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
+            print("Using trajectory planning for motion generation")
 
         # Create one motion planner per environment
         motion_planners = {}
@@ -142,12 +159,29 @@ def main():
                 planner_config.visualize_spheres = False
                 planner_config.visualize_plan = False
 
-            motion_planners[env_id] = CuroboPlanner(
-                env=env,
-                robot=env.scene["robot"],
-                config=planner_config,  # Pass the config object
-                env_id=env_id,  # Pass environment ID
-            )
+            # Create the appropriate planner type
+            if args_cli.use_mpc:
+                # Adjust parameters for MPC
+                planner_config.position_threshold = 0.02  # 20mm instead of 5mm
+                planner_config.rotation_threshold = 0.1   # 0.1 rad instead of 0.05 rad
+                planner_config.max_mpc_steps = 500       # Limit MPC steps for faster execution
+
+                motion_planners[env_id] = CuroboMPCPlanner(
+                    env=env,
+                    robot=env.scene["robot"],
+                    config=planner_config,  # Pass the config object
+                    env_id=env_id,  # Pass environment ID
+                )
+                # Enable visual rollouts for MPC if not in headless mode
+                if not args_cli.headless and env_id == 0:
+                    motion_planners[env_id].enable_visual_rollouts(True)
+            else:
+                motion_planners[env_id] = CuroboPlanner(
+                    env=env,
+                    robot=env.scene["robot"],
+                    config=planner_config,  # Pass the config object
+                    env_id=env_id,  # Pass environment ID
+                )
 
         env.cfg.datagen_config.use_skillgen = True
 

@@ -738,43 +738,89 @@ class DataGenerator:
                                     print(f"Target pose: {target_eef_pose}")
                                     print(f"Expected attached object: {expected_attached_object}")
 
-                                    # This call updates the planner's world model and computes the trajectory.
-                                    planning_success = motion_planner.update_world_and_plan_motion(
-                                        target_pose=target_eef_pose,
-                                        expected_attached_object=expected_attached_object,
-                                        env_id=env_id,
-                                        step_size=getattr(motion_planner, "step_size", None),
-                                        enable_retiming=hasattr(motion_planner, "step_size")
-                                        and motion_planner.step_size is not None,
-                                    )
+                                    # Check if using reactive (MPC) planner
+                                    if self._is_reactive_planner(motion_planner):
+                                        # For MPC: Just set the goal, execution happens reactively
+                                        planning_success = motion_planner.update_world_and_plan_motion(
+                                            target_pose=target_eef_pose,
+                                            expected_attached_object=expected_attached_object,
+                                            env_id=env_id,
+                                        )
 
-                                    # If planning succeeds, execute the planner's trajectory first.
-                                    if planning_success:
-                                        print(f"Env {env_id}: Motion planning succeeded")
-                                        # The original subtask trajectory is stored to be executed after the transition.
-                                        next_eef_subtask_trajectories_after_motion[eef_name] = eef_subtask_trajectory
-                                        next_eef_subtask_indices_after_motion[eef_name] = current_eef_subtask_indices[
-                                            eef_name
-                                        ]
-                                        # Mark the current subtask as invalid (-1) until the transition is done.
-                                        current_eef_subtask_indices[eef_name] = -1
-
-                                        # Convert the planner's output into a sequence of waypoints to be executed.
-                                        current_eef_subtask_trajectories[eef_name] = (
-                                            self._convert_planned_trajectory_to_waypoints(
-                                                motion_planner, target_gripper_action
+                                        if planning_success:
+                                            print(f"Env {env_id}: MPC goal set successfully")
+                                            # Execute MPC transition reactively
+                                            if env_action_queue is None:
+                                                print(f"Env {env_id}: env_action_queue is None, cannot execute MPC")
+                                                return {"success": False}
+                                            mpc_waypoints, mpc_success = await self._execute_mpc_transition(
+                                                env_id=env_id,
+                                                eef_name=eef_name,
+                                                motion_planner=motion_planner,
+                                                target_eef_pose=target_eef_pose,
+                                                target_gripper_action=target_gripper_action,
+                                                env_action_queue=env_action_queue,
+                                                success_term=success_term,
                                             )
-                                        )
-                                        current_eef_subtask_step_indices[eef_name] = 0
-                                        print(
-                                            f"Generated {len(current_eef_subtask_trajectories[eef_name])} waypoints"
-                                            " from motion plan"
+                                            if mpc_success:
+                                                print(f"Env {env_id}: MPC transition completed successfully")
+                                                print(f"Executed {len(mpc_waypoints)} MPC waypoints")
+                                                # Merge the subtask trajectory after MPC transition
+                                                # Use the last MPC waypoint as the previous trajectory for interpolation
+                                                prev_executed_traj = mpc_waypoints if mpc_waypoints else []
+                                                current_eef_subtask_trajectories[eef_name] = self.merge_eef_subtask_trajectory(
+                                                    env_id,
+                                                    eef_name,
+                                                    current_eef_subtask_indices[eef_name],
+                                                    prev_executed_traj,
+                                                    eef_subtask_trajectory,
+                                                )
+                                                current_eef_subtask_step_indices[eef_name] = 0
+                                                print(f"Merged subtask trajectory has {len(current_eef_subtask_trajectories[eef_name])} waypoints")
+                                            else:
+                                                print(f"Env {env_id}: MPC transition failed")
+                                                return {"success": False}
+                                        else:
+                                            print(f"Env {env_id}: MPC goal setting failed")
+                                            return {"success": False}
+                                    else:
+                                        # Original trajectory planning logic
+                                        planning_success = motion_planner.update_world_and_plan_motion(
+                                            target_pose=target_eef_pose,
+                                            expected_attached_object=expected_attached_object,
+                                            env_id=env_id,
+                                            step_size=getattr(motion_planner, "step_size", None),
+                                            enable_retiming=hasattr(motion_planner, "step_size")
+                                            and motion_planner.step_size is not None,
                                         )
 
-                                    else:
-                                        # If planning fails, abort the data generation trial.
-                                        print(f"Env {env_id}: Motion planning failed for {eef_name}")
-                                        return {"success": False}
+                                        # If planning succeeds, execute the planner's trajectory first.
+                                        if planning_success:
+                                            print(f"Env {env_id}: Motion planning succeeded")
+                                            # The original subtask trajectory is stored to be executed after the transition.
+                                            next_eef_subtask_trajectories_after_motion[eef_name] = eef_subtask_trajectory
+                                            next_eef_subtask_indices_after_motion[eef_name] = current_eef_subtask_indices[
+                                                eef_name
+                                            ]
+                                            # Mark the current subtask as invalid (-1) until the transition is done.
+                                            current_eef_subtask_indices[eef_name] = -1
+
+                                            # Convert the planner's output into a sequence of waypoints to be executed.
+                                            current_eef_subtask_trajectories[eef_name] = (
+                                                self._convert_planned_trajectory_to_waypoints(
+                                                    motion_planner, target_gripper_action
+                                                )
+                                            )
+                                            current_eef_subtask_step_indices[eef_name] = 0
+                                            print(
+                                                f"Generated {len(current_eef_subtask_trajectories[eef_name])} waypoints"
+                                                " from motion plan"
+                                            )
+
+                                        else:
+                                            # If planning fails, abort the data generation trial.
+                                            print(f"Env {env_id}: Motion planning failed for {eef_name}")
+                                            return {"success": False}
                             else:
                                 # Without skillgen, transition using simple interpolation.
                                 current_eef_subtask_trajectories[eef_name] = self.merge_eef_subtask_trajectory(
@@ -947,6 +993,18 @@ class DataGenerator:
         )
         return results
 
+    def _is_reactive_planner(self, motion_planner: Any) -> bool:
+        """
+        Check if the motion planner is reactive (MPC) or trajectory-based.
+
+        Args:
+            motion_planner: Motion planner instance to check.
+
+        Returns:
+            bool: True if the planner is reactive (MPC), False if trajectory-based.
+        """
+        return hasattr(motion_planner, "reactive") and motion_planner.reactive
+
     def _convert_planned_trajectory_to_waypoints(
         self, motion_planner: Any, gripper_action: torch.Tensor
     ) -> list[Waypoint]:
@@ -976,3 +1034,84 @@ class DataGenerator:
             waypoints.append(waypoint)
 
         return waypoints
+
+    async def _execute_mpc_transition(
+        self,
+        env_id: int,
+        eef_name: str,
+        motion_planner: Any,
+        target_eef_pose: torch.Tensor,
+        target_gripper_action: torch.Tensor,
+        env_action_queue: asyncio.Queue,
+        success_term: TerminationTermCfg,
+    ) -> tuple[list[Waypoint], bool]:
+        """
+        Execute reactive MPC transition to target pose.
+
+        Unlike trajectory planning which plans the full path upfront, MPC plans
+        reactively at each step, allowing it to handle moving obstacles.
+
+        Args:
+            env_id: Environment ID
+            eef_name: End-effector name
+            motion_planner: MPC planner instance
+            target_eef_pose: Target pose to reach
+            target_gripper_action: Gripper action for the transition
+            env_action_queue: Queue for sending actions
+            success_term: Success termination condition
+
+        Returns:
+            tuple: (waypoints executed, success flag)
+        """
+        executed_waypoints = []
+        motion_noise_scale = getattr(motion_planner.config, "motion_noise_scale", 0.0)
+
+        # MPC execution loop
+        # Adjust max steps based on planner config or use default
+        # TODO: Neel, decide the termination on if goal is reached
+        max_mpc_steps = getattr(motion_planner.config, "max_mpc_steps", 500)  # Reduced from 200
+        step_count = 0
+        try:
+            while motion_planner.has_next_waypoint() and step_count < max_mpc_steps:
+                # Get next waypoint from MPC
+                next_ee_pose = motion_planner.get_next_waypoint_ee_pose()
+
+                # Create waypoint with gripper action and noise
+                waypoint = Waypoint(
+                    pose=next_ee_pose,
+                    gripper_action=target_gripper_action,
+                    noise=motion_noise_scale
+                )
+
+                # Execute the waypoint using MultiWaypoint (single eef)
+                multi_waypoint = MultiWaypoint({eef_name: waypoint})
+                exec_results = await multi_waypoint.execute(
+                    env=self.env,
+                    success_term=success_term,
+                    env_id=env_id,
+                    env_action_queue=env_action_queue,
+                )
+
+                # Store executed waypoint
+                executed_waypoints.append(waypoint)
+
+                # Update visualization if enabled
+                if motion_planner.visualize_spheres:
+                    current_joints = self.env.scene["robot"].data.joint_pos[env_id]
+                    motion_planner._update_visualization_at_joint_positions(current_joints)
+
+                step_count += 1
+
+                # Check if we succeeded early
+                if exec_results.get("success", False):
+                    print(f"MPC reached goal early at step {step_count}")
+                    break
+        except Exception as e:
+            print(f"Error in MPC transition: {e}")
+            return executed_waypoints, False
+
+        success = step_count < max_mpc_steps
+        if not success:
+            print(f"MPC reached maximum steps ({max_mpc_steps}) without reaching goal")
+
+        return executed_waypoints, success

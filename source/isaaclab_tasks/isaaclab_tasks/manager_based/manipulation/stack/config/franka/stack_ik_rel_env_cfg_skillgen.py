@@ -15,6 +15,12 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
+# Additional imports for wall obstacle
+from isaaclab.assets import RigidObjectCfg
+from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+import isaaclab.utils.assets as assets_utils
+
 from ... import mdp
 from . import stack_joint_pos_env_cfg
 
@@ -159,6 +165,13 @@ class FrankaCubeStackSkillgenEnvCfg(stack_joint_pos_env_cfg.FrankaCubeStackEnvCf
             "z": (0.0203, 0.0203),
             "yaw": (-1.0, 1, 0),
         }
+
+        # Add a wall obstacle for testing MPC obstacle avoidance
+        # This wall is placed between the robot and typical cube positions
+        # The wall forces the robot to plan around it when reaching for cubes
+        # ISAAC_NUCLEUS_DIR = getattr(assets_utils, "ISAAC_NUCLEUS_DIR", "/Isaac")
+        # wall_props = RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True)
+        
 
         # Set the offset for the end effector to be 0.0
         for f in self.scene.ee_frame.target_frames:
