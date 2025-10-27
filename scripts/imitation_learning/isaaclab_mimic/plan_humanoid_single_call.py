@@ -30,6 +30,7 @@ parser.add_argument("--left_dx", type=float, default=None)
 parser.add_argument("--left_dy", type=float, default=None)
 parser.add_argument("--left_dz", type=float, default=None)
 parser.add_argument("--replay_trials", type=int, default=2)
+parser.add_argument("--ignore_arm_collisions", action="store_true", help="Ignore arm collisions for planning.")
 
 # Isaac app args
 AppLauncher.add_app_launcher_args(parser)
@@ -101,7 +102,7 @@ def to_python(obj):
     return obj
 
 
-def _build_temp_robot_yaml_both_arms(usd_path: str, inactive_joints) -> str:
+def _build_temp_robot_yaml_both_arms(usd_path: str, inactive_joints, ignore_collision_arms=False) -> str:
     """Create a temporary robot YAML for cuRobo with both arm tool links.
 
     Converts the provided USD robot to URDF, loads collision spheres, strips
@@ -130,7 +131,7 @@ def _build_temp_robot_yaml_both_arms(usd_path: str, inactive_joints) -> str:
         depth=2,
         verbose=False,
     )
-    max_spheres = 225 - len(tool_links) * 50
+    max_spheres = 225 - len(tool_links) * 50  # TODO: (Neel) remove the hard coding here for max spheres
     load_spheres(robot_config, max_spheres=max_spheres, max_link_spheres=int(1e9))
 
     robot_cfg_yaml = robot_config["robot_cfg"]
@@ -217,9 +218,15 @@ def _build_env_and_planner_bimanual_single(args_cli):
 
     usd_path = cast(Any, env_cfg).scene.robot.spawn.usd_path
     inactive_joint_names = list(env_cfg.actions.pink_ik_cfg.ik_urdf_fixed_joint_names) or []
-    # inactive_joint_names.extend(env_cfg.actions.pink_ik_cfg.hand_joint_names)  # add finger joints here
-    print(f"Inactive joint names: {inactive_joint_names}")
-    robot_yaml_both = _build_temp_robot_yaml_both_arms(usd_path, inactive_joints=inactive_joint_names)
+
+    # TODO: (Neel) remove the hard coding here for left arm joints
+    # left_arm_joints = [j for j in env_cfg.actions.pink_ik_cfg.pink_controlled_joint_names if "left_" in j]
+    # inactive_joint_names.extend(left_arm_joints)
+
+    if args_cli.ignore_arm_collisions:
+        inactive_joint_names.extend([j for j in env_cfg.actions.pink_ik_cfg.pink_controlled_joint_names if "left_" in j])
+
+    robot_yaml_both = _build_temp_robot_yaml_both_arms(usd_path, inactive_joints=inactive_joint_names, ignore_collision_arms=args_cli.ignore_arm_collisions)
 
     env = gym.make(env_name, cfg=env_cfg).unwrapped
     env.reset()
@@ -831,7 +838,7 @@ def main():
     >> Convert targets to required frames and run planning with diagnostics
     >> Emit post-plan diagnostics, then execute the plan
     """
-    # import pdb; pdb.set_trace()
+    import pdb; pdb.set_trace()
     np.random.seed(42)
     torch.manual_seed(42)
 
