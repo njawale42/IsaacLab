@@ -634,7 +634,7 @@ class CuroboMPCPlanner(MotionPlannerBase):
         ee_tf = T_solver_world
 
         self._step_count += 1
-        return ee_tf
+        return ee_tf, self._last_cmd_state
 
     def get_last_joint_positions(self) -> torch.Tensor | None:
         """Return the last commanded joint positions on env device (1D tensor)."""

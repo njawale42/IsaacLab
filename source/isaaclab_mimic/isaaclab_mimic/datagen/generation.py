@@ -32,6 +32,7 @@ async def run_data_generator(
     success_term: TerminationTermCfg,
     pause_subtask: bool = False,
     motion_planner: Any = None,
+    joint_state_control: bool = False,
 ):
     """Run mimic data generation from the given data generator in the specified environment index.
 
@@ -54,6 +55,7 @@ async def run_data_generator(
             env_action_queue=env_action_queue,
             pause_subtask=pause_subtask,
             motion_planner=motion_planner,
+            joint_state_control=joint_state_control,
         )
         if bool(results["success"]):
             num_success += 1
@@ -199,6 +201,7 @@ def setup_async_generation(
     success_term: Any,
     pause_subtask: bool = False,
     motion_planners: Any = None,
+    joint_state_control: bool = False,
 ) -> dict[str, Any]:
     """Setup async data generation tasks.
 
@@ -236,6 +239,7 @@ def setup_async_generation(
                 success_term,
                 pause_subtask=pause_subtask,
                 motion_planner=env_motion_planner,
+                joint_state_control=joint_state_control,
             )
         )
         data_generator_asyncio_tasks.append(task)

@@ -133,15 +133,18 @@ class FrankaCubeStackEnvCfg(StackEnvCfg):
                 semantic_tags=[("class", "cube_3")],
             ),
         )
+        wall_props = cube_properties
+        # wall_props.kinematic_enabled = True
+        wall_props.disable_gravity = True
         self.scene.wall_obstacle = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/WallObstacle",
             spawn=UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/red_block.usd",
                 scale=(0.5, 4.5, 7.0),  # Width x Depth x Height - tall wall
-                rigid_props=cube_properties,
+                rigid_props=wall_props,
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(0.55, 0.0, 0.80),  # x: middle of cube spawn range, y: centered, z: tall obstacle
+                pos=(0.55, 0.0, 0.70),  # x: middle of cube spawn range, y: centered, z: tall obstacle
                 rot=(1.0, 0.0, 0.0, 0.0)  # No rotation (w, x, y, z quaternion)
             ),
         )

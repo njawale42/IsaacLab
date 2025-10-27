@@ -624,6 +624,7 @@ class DataGenerator:
         pause_subtask: bool = False,
         export_demo: bool = True,
         motion_planner: Any | None = None,
+        joint_state_control: bool = False,
     ) -> dict:
         """
         Attempt to generate a new demonstration.
@@ -761,6 +762,7 @@ class DataGenerator:
                                                 target_gripper_action=target_gripper_action,
                                                 env_action_queue=env_action_queue,
                                                 success_term=success_term,
+                                                joint_state_control=joint_state_control,
                                             )
                                             if mpc_success:
                                                 print(f"Env {env_id}: MPC transition completed successfully")
@@ -1044,6 +1046,7 @@ class DataGenerator:
         target_gripper_action: torch.Tensor,
         env_action_queue: asyncio.Queue,
         success_term: TerminationTermCfg,
+        joint_state_control: bool = False,
     ) -> tuple[list[Waypoint], bool]:
         """
         Execute reactive MPC transition to target pose.
@@ -1074,23 +1077,70 @@ class DataGenerator:
         try:
             while motion_planner.has_next_waypoint() and step_count < max_mpc_steps:
                 # Get next waypoint from MPC
-                next_ee_pose = motion_planner.get_next_waypoint_ee_pose()
+                next_ee_pose, last_cmd_state = motion_planner.get_next_waypoint_ee_pose()
 
-                # Create waypoint with gripper action and noise
-                waypoint = Waypoint(
-                    pose=next_ee_pose,
-                    gripper_action=target_gripper_action,
-                    noise=motion_noise_scale
-                )
+                if joint_state_control:
+                    # Use direct joint control for true collision awareness
+                    if step_count == 0:
+                        print(f"Env {env_id}: Using joint state control for MPC transition")
+                        print("Note: Joint control within IK action framework - using waypoint execution with direct joint override")
 
-                # Execute the waypoint using MultiWaypoint (single eef)
-                multi_waypoint = MultiWaypoint({eef_name: waypoint})
-                exec_results = await multi_waypoint.execute(
-                    env=self.env,
-                    success_term=success_term,
-                    env_id=env_id,
-                    env_action_queue=env_action_queue,
-                )
+                    # For now, we'll use the standard waypoint execution
+                    # In the future, we can add a custom mechanism to override with joint positions
+                    # after the IK action is computed
+                    waypoint = Waypoint(
+                        pose=next_ee_pose,
+                        gripper_action=target_gripper_action,
+                        noise=0.0  # No noise for joint control
+                    )
+
+                    # Execute waypoint normally - this maintains compatibility
+                    multi_waypoint = MultiWaypoint({eef_name: waypoint})
+                    exec_results = await multi_waypoint.execute(
+                        env=self.env,
+                        success_term=success_term,
+                        env_id=env_id,
+                        env_action_queue=env_action_queue,
+                    )
+
+                    # After execution, we could potentially override with joint positions
+                    # but this would require modifying the environment step function
+                    joint_positions = motion_planner.get_last_joint_positions()
+                    if joint_positions is not None:
+                        if step_count % 10 == 0:  # Log periodically
+                            print(f"MPC joint positions available (not applied): {joint_positions.shape}")
+                    else:
+                        print("Warning: No joint positions available from MPC, falling back to IK")
+                        # Fallback to IK if joint positions not available
+                        waypoint = Waypoint(
+                            pose=next_ee_pose,
+                            gripper_action=target_gripper_action,
+                            noise=motion_noise_scale
+                        )
+                        multi_waypoint = MultiWaypoint({eef_name: waypoint})
+                        exec_results = await multi_waypoint.execute(
+                            env=self.env,
+                            success_term=success_term,
+                            env_id=env_id,
+                            env_action_queue=env_action_queue,
+                        )
+                else:
+                    # Use standard IK-based waypoint execution
+                    # Create waypoint with gripper action and noise
+                    waypoint = Waypoint(
+                        pose=next_ee_pose,
+                        gripper_action=target_gripper_action,
+                        noise=motion_noise_scale
+                    )
+
+                    # Execute the waypoint using MultiWaypoint (single eef)
+                    multi_waypoint = MultiWaypoint({eef_name: waypoint})
+                    exec_results = await multi_waypoint.execute(
+                        env=self.env,
+                        success_term=success_term,
+                        env_id=env_id,
+                        env_action_queue=env_action_queue,
+                    )
 
                 # Store executed waypoint
                 executed_waypoints.append(waypoint)

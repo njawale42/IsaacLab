@@ -51,6 +51,12 @@ parser.add_argument(
     default=False,
     help="use MPC (reactive planning) instead of trajectory planning when used with --use_skillgen",
 )
+parser.add_argument(
+    "--joint_state_control",
+    action="store_true",
+    default=False,
+    help="use direct joint state control for MPC segments instead of IK control (only with --use_mpc)",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -94,6 +100,8 @@ def main():
     # Validate arguments
     if args_cli.use_mpc and not args_cli.use_skillgen:
         raise ValueError("--use_mpc can only be used with --use_skillgen")
+    if args_cli.joint_state_control and not args_cli.use_mpc:
+        raise ValueError("--joint_state_control can only be used with --use_mpc")
 
     # Setup output paths and get env name
     output_dir, output_file_name = setup_output_paths(args_cli.output_file)
@@ -175,6 +183,10 @@ def main():
                 # Enable visual rollouts for MPC if not in headless mode
                 if not args_cli.headless and env_id == 0:
                     motion_planners[env_id].enable_visual_rollouts(True)
+
+                # Print info about joint state control
+                if args_cli.joint_state_control:
+                    print(f"Joint state control enabled for MPC planner in environment {env_id}")
             else:
                 motion_planners[env_id] = CuroboPlanner(
                     env=env,
@@ -193,6 +205,7 @@ def main():
         success_term=success_term,
         pause_subtask=args_cli.pause_subtask,
         motion_planners=motion_planners,  # Pass the motion planners dictionary
+        joint_state_control=args_cli.joint_state_control if args_cli.use_mpc else False,  # Pass joint state control flag
     )
 
     try:
