@@ -40,6 +40,7 @@ class FrankaCubeStackIKRelMimicEnv(ManagerBasedRLMimicEnv):
         target_eef_pose_dict: dict,
         gripper_action_dict: dict,
         action_noise_dict: dict | None = None,
+        joint_positions_dict: dict | None = None,
         env_id: int = 0,
     ) -> torch.Tensor:
         """
@@ -51,6 +52,7 @@ class FrankaCubeStackIKRelMimicEnv(ManagerBasedRLMimicEnv):
             target_eef_pose_dict: Dictionary of 4x4 target eef pose for each end-effector.
             gripper_action_dict: Dictionary of gripper actions for each end-effector.
             noise: Noise to add to the action. If None, no noise is added.
+            joint_positions_dict: Joint positions to use for the action (per eef). If None, no joint positions are used.
             env_id: Environment index to get the action for.
 
         Returns:
@@ -83,6 +85,46 @@ class FrankaCubeStackIKRelMimicEnv(ManagerBasedRLMimicEnv):
             noise = action_noise_dict[eef_name] * torch.randn_like(pose_action)
             pose_action += noise
             pose_action = torch.clamp(pose_action, -1.0, 1.0)
+
+        if (
+            joint_positions_dict is not None
+            and eef_name in joint_positions_dict
+            and joint_positions_dict[eef_name] is not None
+        ):
+            joint_positions = joint_positions_dict[eef_name]
+            if joint_positions.dim() > 1:
+                joint_positions = joint_positions.squeeze(0)
+
+            # Resolve arm joints once and size override accordingly
+            arm_joint_ids, _ = self.scene["robot"].find_joints(["panda_joint.*"])
+            num_arm_joints = len(arm_joint_ids)
+            num_robot_joints = int(self.scene["robot"].data.joint_pos.shape[1])
+
+            # If the provided vector includes gripper joints (full length), slice to arm indices
+            if joint_positions.shape[0] == num_robot_joints:
+                joint_positions = joint_positions[arm_joint_ids]
+            elif joint_positions.shape[0] != num_arm_joints:
+                # Mismatched length; bail out of override for safety
+                joint_positions = None
+
+            if joint_positions is not None:
+                if not hasattr(self, "_mpc_joint_override"):
+                    self._mpc_joint_override = torch.full(
+                        (self.scene.num_envs, num_arm_joints),
+                        float("nan"),
+                        device=self.device,
+                        dtype=self.scene["robot"].data.joint_pos.dtype,
+                    )
+                # Stash/overwrite override for this env step
+                self._mpc_joint_override[env_id, : num_arm_joints] = joint_positions
+                # Debug print (concise)
+                try:
+                    sample = joint_positions[:3].detach().cpu().numpy()
+                    print(
+                        f"MimicEnv: stashed MPC joint override for env {env_id} (arm={num_arm_joints}); sample[0:3]={sample}"
+                    )
+                except Exception:
+                    pass
 
         return torch.cat([pose_action, gripper_action], dim=0)
 

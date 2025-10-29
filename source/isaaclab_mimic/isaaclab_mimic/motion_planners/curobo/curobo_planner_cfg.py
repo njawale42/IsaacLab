@@ -429,8 +429,8 @@ class CuroboPlannerCfg:
         config.static_objects = ["table"]
         config.visualize_plan = False
         config.debug_planner = True
-        config.motion_noise_scale = 0.02
-        config.collision_activation_distance = 0.01
+        config.motion_noise_scale = 0.0
+        config.collision_activation_distance = 0.03
         config.approach_distance = 0.05
         config.retreat_distance = 0.05
         config.surface_sphere_radius = 0.01

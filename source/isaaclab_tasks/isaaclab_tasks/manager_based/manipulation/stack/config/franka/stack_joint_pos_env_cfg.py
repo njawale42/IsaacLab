@@ -10,6 +10,8 @@ from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+import isaaclab.sim as sim_utils
+
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
@@ -136,15 +138,18 @@ class FrankaCubeStackEnvCfg(StackEnvCfg):
         wall_props = cube_properties
         # wall_props.kinematic_enabled = True
         wall_props.disable_gravity = True
+        # wall_props.kinematic_enabled = True
         self.scene.wall_obstacle = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/WallObstacle",
             spawn=UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/red_block.usd",
-                scale=(0.5, 4.5, 7.0),  # Width x Depth x Height - tall wall
+                scale=(0.5, 3.0, 3.0),  # Width x Depth x Height
                 rigid_props=wall_props,
+                mass_props=sim_utils.MassPropertiesCfg(mass=1e10),  # TODO: (Neel) remove the hard coding here for mass
+
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(0.55, 0.0, 0.70),  # x: middle of cube spawn range, y: centered, z: tall obstacle
+                pos=(0.55, 0.0, 0.50),  # x: middle of cube spawn range, y: centered, z: tall obstacle
                 rot=(1.0, 0.0, 0.0, 0.0)  # No rotation (w, x, y, z quaternion)
             ),
         )

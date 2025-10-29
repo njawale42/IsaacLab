@@ -207,6 +207,30 @@ class DifferentialInverseKinematicsAction(ActionTerm):
             joint_pos_des = self._ik_controller.compute(ee_pos_curr, ee_quat_curr, jacobian, joint_pos)
         else:
             joint_pos_des = joint_pos.clone()
+        # Keep a copy to report if overridden
+        joint_pos_des_ik = joint_pos_des.clone()
+
+        override = getattr(self._env, "_mpc_joint_override", None)
+        if override is not None and override.shape[1] == joint_pos_des.shape[1]:
+            use_override_mask = torch.isfinite(override).all(dim=1)
+            if use_override_mask.any():
+                joint_pos_des[use_override_mask] = override[use_override_mask]
+                # Debug: confirm override application
+                try:
+                    env_indices = torch.nonzero(use_override_mask, as_tuple=False).squeeze(-1).tolist()
+                    if isinstance(env_indices, int):
+                        env_indices = [env_indices]
+                    # Show a concise sample for the first env overridden
+                    sample_env = int(env_indices[0])
+                    ik_sample = joint_pos_des_ik[sample_env, :3].detach().cpu().numpy()
+                    ov_sample = override[sample_env, :3].detach().cpu().numpy()
+                    print(
+                        f"IKAction: applied MPC joint override for envs {env_indices}; "
+                        f"env {sample_env} arm[0:3] IK->{ik_sample} OV->{ov_sample}"
+                    )
+                except Exception:
+                    pass
+                override[use_override_mask] = torch.nan
         # set the joint position command
         self._asset.set_joint_position_target(joint_pos_des, self._joint_ids)
 

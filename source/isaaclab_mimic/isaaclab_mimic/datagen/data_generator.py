@@ -1085,14 +1085,30 @@ class DataGenerator:
                         print(f"Env {env_id}: Using joint state control for MPC transition")
                         print("Note: Joint control within IK action framework - using waypoint execution with direct joint override")
 
-                    # For now, we'll use the standard waypoint execution
-                    # In the future, we can add a custom mechanism to override with joint positions
-                    # after the IK action is computed
-                    waypoint = Waypoint(
-                        pose=next_ee_pose,
-                        gripper_action=target_gripper_action,
-                        noise=0.0  # No noise for joint control
-                    )
+                    joint_positions = motion_planner.get_last_joint_positions()
+                    if joint_positions is not None:
+                        if joint_positions.dim() > 1:
+                            joint_positions = joint_positions.squeeze(0)
+                        waypoint = Waypoint(
+                            pose=next_ee_pose,
+                            gripper_action=target_gripper_action,
+                            noise=motion_noise_scale,
+                            joint_positions=joint_positions
+                        )
+                        try:
+                            print(
+                                f"MPC transition: using joint override of length {joint_positions.shape[0]} for env {env_id}"
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        print("Warning: No joint positions available from MPC, falling back to IK")
+                        waypoint = Waypoint(
+                            pose=next_ee_pose,
+                            gripper_action=target_gripper_action,
+                            noise=motion_noise_scale,
+                            joint_positions=None
+                        )
 
                     # Execute waypoint normally - this maintains compatibility
                     multi_waypoint = MultiWaypoint({eef_name: waypoint})
@@ -1108,7 +1124,7 @@ class DataGenerator:
                     joint_positions = motion_planner.get_last_joint_positions()
                     if joint_positions is not None:
                         if step_count % 10 == 0:  # Log periodically
-                            print(f"MPC joint positions available (not applied): {joint_positions.shape}")
+                            print(f"MPC joint positions available: {joint_positions.shape}")
                     else:
                         print("Warning: No joint positions available from MPC, falling back to IK")
                         # Fallback to IK if joint positions not available

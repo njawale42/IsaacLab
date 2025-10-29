@@ -21,7 +21,7 @@ class Waypoint:
     Represents a single desired 6-DoF waypoint, along with corresponding gripper actuation for this point.
     """
 
-    def __init__(self, pose, gripper_action, noise=None):
+    def __init__(self, pose, gripper_action, noise=None, joint_positions=None):
         """
         Args:
             pose (torch.Tensor): 4x4 pose target for robot controller
@@ -32,10 +32,11 @@ class Waypoint:
         self.pose = pose
         self.gripper_action = gripper_action
         self.noise = noise
+        self.joint_positions = joint_positions
 
     def __str__(self):
         """String representation of the waypoint."""
-        return f"Waypoint:\n  Pose:\n{self.pose}\n"
+        return f"Waypoint:\n  Pose:\n{self.pose}\n  Gripper Action:\n{self.gripper_action}\n  Noise:\n{self.noise}\n  Joint Positions:\n{self.joint_positions}\n"
 
 
 class WaypointSequence:
@@ -386,12 +387,29 @@ class MultiWaypoint:
         # construct action from target poses and gripper actions
         target_eef_pose_dict = {eef_name: waypoint.pose for eef_name, waypoint in self.waypoints.items()}
         gripper_action_dict = {eef_name: waypoint.gripper_action for eef_name, waypoint in self.waypoints.items()}
+
+        # construct joint positions from waypoints
+        joint_positions_dict = {}
+        for eef_name, waypoint in self.waypoints.items():
+            if waypoint.joint_positions is not None:
+                joint_positions_dict[eef_name] = waypoint.joint_positions
+            else:
+                joint_positions_dict[eef_name] = None
+
         if "action_noise_dict" in inspect.signature(env.target_eef_pose_to_action).parameters:
             action_noise_dict = {eef_name: waypoint.noise for eef_name, waypoint in self.waypoints.items()}
+            # Debug: report if any joint overrides are present
+            try:
+                non_none_overrides = [k for k, v in joint_positions_dict.items() if v is not None]
+                if len(non_none_overrides) > 0:
+                    print(f"MultiWaypoint: passing joint overrides for EEFs {non_none_overrides} to env {env_id}")
+            except Exception:
+                pass
             play_action = env.target_eef_pose_to_action(
                 target_eef_pose_dict=target_eef_pose_dict,
                 gripper_action_dict=gripper_action_dict,
                 action_noise_dict=action_noise_dict,
+                joint_positions_dict=joint_positions_dict,
                 env_id=env_id,
             )
         else:
