@@ -114,6 +114,9 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": stack_ik_rel_env_cfg_skillgen.FrankaCubeStackSkillgenEnvCfg,
         "robomimic_bc_cfg_entry_point": os.path.join(agents.__path__[0], "robomimic/bc_rnn_low_dim.json"),
+        "robomimic_diffusion_policy_cfg_entry_point": os.path.join(
+            agents.__path__[0], "robomimic/diffusion_policy_low_dim.json"
+        ),
     },
     disable_env_checker=True,
 )

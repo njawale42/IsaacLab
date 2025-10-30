@@ -68,6 +68,7 @@ import time
 import torch
 import traceback
 from collections import OrderedDict
+from typing import Any, cast
 from torch.utils.data import DataLoader
 
 import psutil
@@ -106,7 +107,9 @@ def normalize_hdf5_actions(config: Config, log_dir: str) -> str:
 
     # Open the new dataset and normalize the actions
     with h5py.File(normalized_path, "r+") as f:
-        dataset_paths = [f"/data/demo_{str(i)}/actions" for i in range(len(f["data"].keys()))]
+        data_group = cast(Any, f["data"])
+        num_demos = len(list(data_group))
+        dataset_paths = [f"/data/demo_{i}/actions" for i in range(num_demos)]
 
         # Compute the min and max of the dataset
         dataset = np.array(f[dataset_paths[0]]).flatten()
@@ -131,6 +134,83 @@ def normalize_hdf5_actions(config: Config, log_dir: str) -> str:
             f.write(f"max: {max}\n")
 
     return normalized_path
+
+
+def ensure_dataset_and_shape_meta(config: Config):
+    # Normalize dataset spec to new API style
+    if isinstance(config.train.data, str) or config.train.data is None:
+        with config.values_unlocked():
+            config.train.data = ([{"path": config.train.data}] if config.train.data is not None else [])
+    if len(config.train.data) == 0:
+        raise FileNotFoundError("No dataset path provided in config.train.data")
+    first_ds_cfg = config.train.data[0]
+    dataset_path = os.path.expanduser(first_ds_cfg["path"])
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset at provided path {dataset_path} not found!")
+
+    # Ensure required keys for newer API
+    with config.values_unlocked():
+        if "action_keys" not in config.train:
+            config.train.action_keys = ["actions"]
+        if "action_config" not in config.train:
+            config.train.action_config = {}
+        if "normalize_weights_by_ds_size" not in config.train:
+            config.train.normalize_weights_by_ds_size = False
+
+    shape_meta = FileUtils.get_shape_metadata_from_dataset(
+        dataset_config=first_ds_cfg,
+        action_keys=config.train.action_keys,
+        all_obs_keys=config.all_obs_keys,
+        verbose=True,
+    )
+
+    if config.experiment.rollout.enabled:
+        try:
+            print("\n============= Loaded Environment Metadata =============")
+            env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=first_ds_cfg["path"])
+            if "env_kwargs" not in env_meta:
+                env_meta["env_kwargs"] = {}
+        except Exception:
+            env_meta = {"env_name": config.experiment.env or "UnknownEnv", "type": "Gym", "env_kwargs": {}}
+    else:
+        env_meta = {"env_name": config.experiment.env or "UnknownEnv", "type": "Gym", "env_kwargs": {}}
+
+    return first_ds_cfg, shape_meta, env_meta
+
+
+def build_data_loaders(config: Config, shape_meta):
+    trainset, validset = TrainUtils.load_data_for_training(config, obs_keys=shape_meta["all_obs_keys"])
+    train_sampler = trainset.get_dataset_sampler()
+    train_loader = DataLoader(
+        dataset=trainset,
+        sampler=train_sampler,
+        batch_size=config.train.batch_size,
+        shuffle=(train_sampler is None),
+        num_workers=config.train.num_data_workers,
+        drop_last=True,
+    )
+    if config.experiment.validate:
+        num_workers = min(config.train.num_data_workers, 1)
+        valid_sampler = validset.get_dataset_sampler()
+        valid_loader = DataLoader(
+            dataset=validset,
+            sampler=valid_sampler,
+            batch_size=config.train.batch_size,
+            shuffle=(valid_sampler is None),
+            num_workers=num_workers,
+            drop_last=True,
+        )
+    else:
+        valid_loader = None
+    return trainset, validset, train_loader, valid_loader, train_sampler
+
+
+def inject_optim_schedule(config: Config, trainset, train_num_steps: int | None):
+    with config.values_unlocked():
+        if "optim_params" in config.algo:
+            for k in config.algo.optim_params:
+                config.algo.optim_params[k]["num_train_batches"] = len(trainset) if train_num_steps is None else train_num_steps
+                config.algo.optim_params[k]["num_epochs"] = config.train.num_epochs
 
 
 def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: str):
@@ -164,17 +244,8 @@ def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: s
     # read config to set up metadata for observation modalities (e.g. detecting rgb observations)
     ObsUtils.initialize_obs_utils_with_config(config)
 
-    # make sure the dataset exists
-    dataset_path = os.path.expanduser(config.train.data)
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Dataset at provided path {dataset_path} not found!")
-
-    # load basic metadata from training file
-    print("\n============= Loaded Environment Metadata =============")
-    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=config.train.data)
-    shape_meta = FileUtils.get_shape_metadata_from_dataset(
-        dataset_path=config.train.data, all_obs_keys=config.all_obs_keys, verbose=True
-    )
+    # Prepare dataset config and read shape/env metadata using updated API
+    first_ds_cfg, shape_meta, env_meta = ensure_dataset_and_shape_meta(config)
 
     if config.experiment.env is not None:
         env_meta["env_name"] = config.experiment.env
@@ -203,8 +274,25 @@ def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: s
 
     print("")
 
-    # setup for a new training run
+    # setup for a new training run (logger first)
     data_logger = DataLogger(log_dir, config=config, log_tb=config.experiment.logging.log_tb)
+
+    # load training data
+    trainset, validset, train_loader, valid_loader, train_sampler = build_data_loaders(config, shape_meta)
+    print("\n============= Training Dataset =============")
+    print(trainset)
+    print("")
+
+    # maybe retrieve statistics for normalizing observations
+    obs_normalization_stats = None
+    if config.train.hdf5_normalize_obs:
+        obs_normalization_stats = trainset.get_obs_normalization_stats()
+
+    # determine steps per epoch, then update optimizer scheduling info in config BEFORE model creation
+    train_num_steps = config.experiment.epoch_every_n_steps
+    inject_optim_schedule(config, trainset, train_num_steps)
+
+    # now that optim params are populated, create the model
     model = algo_factory(
         algo_name=config.algo_name,
         config=config,
@@ -221,49 +309,9 @@ def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: s
     print(model)  # print model summary
     print("")
 
-    # load training data
-    trainset, validset = TrainUtils.load_data_for_training(config, obs_keys=shape_meta["all_obs_keys"])
-    train_sampler = trainset.get_dataset_sampler()
-    print("\n============= Training Dataset =============")
-    print(trainset)
-    print("")
-
-    # maybe retrieve statistics for normalizing observations
-    obs_normalization_stats = None
-    if config.train.hdf5_normalize_obs:
-        obs_normalization_stats = trainset.get_obs_normalization_stats()
-
-    # initialize data loaders
-    train_loader = DataLoader(
-        dataset=trainset,
-        sampler=train_sampler,
-        batch_size=config.train.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=config.train.num_data_workers,
-        drop_last=True,
-    )
-
-    if config.experiment.validate:
-        # cap num workers for validation dataset at 1
-        num_workers = min(config.train.num_data_workers, 1)
-        valid_sampler = validset.get_dataset_sampler()
-        valid_loader = DataLoader(
-            dataset=validset,
-            sampler=valid_sampler,
-            batch_size=config.train.batch_size,
-            shuffle=(valid_sampler is None),
-            num_workers=num_workers,
-            drop_last=True,
-        )
-    else:
-        valid_loader = None
-
     # main training loop
     best_valid_loss = None
     last_ckpt_time = time.time()
-
-    # number of learning steps per epoch (defaults to a full dataset pass)
-    train_num_steps = config.experiment.epoch_every_n_steps
     valid_num_steps = config.experiment.validation_epoch_every_n_steps
 
     for epoch in range(1, config.train.num_epochs + 1):  # epoch numbers start at 1
@@ -358,8 +406,6 @@ def main(args: argparse.Namespace):
         task_name = args.task.split(":")[-1]
 
         print(f"Loading configuration for task: {task_name}")
-        print(gym.envs.registry.keys())
-        print(" ")
         cfg_entry_point_file = gym.spec(task_name).kwargs.pop(cfg_entry_point_key)
         # check if entry point exists
         if cfg_entry_point_file is None:
@@ -379,7 +425,8 @@ def main(args: argparse.Namespace):
         raise ValueError("Please provide a task name through CLI arguments.")
 
     if args.dataset is not None:
-        config.train.data = args.dataset
+        with config.values_unlocked():
+            config.train.data = [{"path": args.dataset}]
 
     if args.name is not None:
         config.experiment.name = args.name
@@ -390,7 +437,8 @@ def main(args: argparse.Namespace):
     # change location of experiment directory
     config.train.output_dir = os.path.abspath(os.path.join("./logs", args.log_dir, args.task))
 
-    log_dir, ckpt_dir, video_dir = TrainUtils.get_exp_dir(config)
+    # Support both older and newer robomimic versions that may return extra values
+    log_dir, ckpt_dir, video_dir, *_ = TrainUtils.get_exp_dir(config)
 
     if args.normalize_training_actions:
         config.train.data = normalize_hdf5_actions(config, log_dir)

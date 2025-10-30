@@ -41,6 +41,17 @@ parser.add_argument(
     "--norm_factor_max", type=float, default=None, help="Optional: maximum value of the normalization factor."
 )
 parser.add_argument("--enable_pinocchio", default=False, action="store_true", help="Enable Pinocchio.")
+parser.add_argument(
+    "--dp_infer_steps",
+    type=int,
+    default=None,
+    help="Optional: override diffusion num_inference_timesteps at replay (smaller is faster).",
+)
+parser.add_argument(
+    "--dp_use_ddim",
+    action="store_true",
+    help="Optional: use DDIM scheduler for faster inference during replay.",
+)
 
 
 # append AppLauncher cli args
@@ -91,11 +102,48 @@ def rollout(policy, env, success_term, horizon, device):
     obs_dict, _ = env.reset()
     traj = dict(actions=[], obs=[], next_obs=[])
 
+    # Detect diffusion policy and set up temporal buffers
+    is_diffusion = getattr(policy.policy, "global_config", None) is not None and \
+        getattr(policy.policy.global_config, "algo_name", "") == "diffusion_policy"
+    obs_horizon = None
+    obs_keys_for_policy = None
+    if is_diffusion:
+        obs_horizon = int(policy.policy.global_config.algo.horizon.observation_horizon)
+        obs_keys_for_policy = list(policy.policy.global_config.all_obs_keys)
+        from collections import deque
+        obs_buffers = {k: deque(maxlen=obs_horizon) for k in obs_keys_for_policy if k in obs_dict["policy"]}
+        # prime buffers with initial obs repeated
+        initial_obs = obs_dict["policy"]
+        for k in obs_buffers:
+            val = initial_obs[k]
+            obs_buffers[k].extend([val for _ in range(obs_horizon)])
+        # action buffering to avoid re-sampling every step (expensive)
+        action_buffer = []
+        action_horizon = int(policy.policy.global_config.algo.horizon.action_horizon)
+        # background prefetch of next trajectory while consuming current buffer
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=1)
+        inflight = None
+        prefetch_threshold = max(1, action_horizon // 2)
+
     for i in range(horizon):
-        # Prepare observations
-        obs = copy.deepcopy(obs_dict["policy"])
-        for ob in obs:
-            obs[ob] = torch.squeeze(obs[ob])
+        # Prepare observations (temporal window for diffusion)
+        if is_diffusion:
+            # push current obs into buffers
+            for k in list(obs_buffers.keys()):
+                if k in obs_dict["policy"]:
+                    obs_buffers[k].append(obs_dict["policy"][k])
+            # build [B=1, T, D] inputs per key
+            obs = {}
+            for k in obs_buffers:
+                # each element may be tensor with extra dims; squeeze batch/time-like dims
+                frames = [torch.as_tensor(f).squeeze(0) for f in list(obs_buffers[k])]
+                stacked = torch.stack(frames, dim=0)  # [T, D]
+                obs[k] = stacked.unsqueeze(0)  # [1, T, D]
+        else:
+            obs = copy.deepcopy(obs_dict["policy"])
+            for ob in obs:
+                obs[ob] = torch.squeeze(obs[ob])
 
         # Check if environment image observations
         if hasattr(env.cfg, "image_obs_list"):
@@ -112,7 +160,51 @@ def rollout(policy, env, success_term, horizon, device):
         traj["obs"].append(obs)
 
         # Compute actions
-        actions = policy(obs)
+        if is_diffusion:
+            # Ensure buffer has at least one action:
+            # - If a prefetch job exists, block until it completes and fill the buffer
+            # - Otherwise, run a synchronous inference
+            while len(action_buffer) == 0:
+                if inflight is not None:
+                    try:
+                        seq_np_block = inflight.result()
+                        action_buffer.extend([seq_np_block[i] for i in range(seq_np_block.shape[0])])
+                    except Exception:
+                        # fall back to synchronous inference on failure
+                        prep_obs = policy._prepare_observation(obs, batched_ob=True)
+                        with torch.no_grad():
+                            action_seq = policy.policy._get_action_trajectory(obs_dict=prep_obs)
+                        seq_np = action_seq[0, :action_horizon].detach().cpu().numpy()
+                        action_buffer = [seq_np[i] for i in range(seq_np.shape[0])]
+                    finally:
+                        inflight = None
+                else:
+                    prep_obs = policy._prepare_observation(obs, batched_ob=True)
+                    with torch.no_grad():
+                        action_seq = policy.policy._get_action_trajectory(obs_dict=prep_obs)
+                    seq_np = action_seq[0, :action_horizon].detach().cpu().numpy()
+                    action_buffer = [seq_np[i] for i in range(seq_np.shape[0])]
+
+            # Background prefetch when buffer gets low
+            if len(action_buffer) <= prefetch_threshold and inflight is None:
+                snap_obs = {k: v.clone() for k, v in obs.items()}
+
+                def _infer_sequence(o):
+                    po = policy._prepare_observation(o, batched_ob=True)
+                    with torch.no_grad():
+                        aseq = policy.policy._get_action_trajectory(obs_dict=po)
+                    return aseq[0, :action_horizon].detach().cpu().numpy()
+                inflight = executor.submit(_infer_sequence, snap_obs)
+            # If a prefetch finished, extend buffer
+            if inflight is not None and inflight.done():
+                try:
+                    seq_np2 = inflight.result()
+                    action_buffer.extend([seq_np2[i] for i in range(seq_np2.shape[0])])
+                finally:
+                    inflight = None
+            actions = action_buffer.pop(0)
+        else:
+            actions = policy(obs)
 
         # Unnormalize actions
         if args_cli.norm_factor_min is not None and args_cli.norm_factor_max is not None:
@@ -174,6 +266,20 @@ def main():
     for trial in range(args_cli.num_rollouts):
         print(f"[INFO] Starting trial {trial}")
         policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.checkpoint, device=device)
+        # Optional: speed up diffusion policy inference
+        try:
+            if getattr(policy.policy, "global_config", None) is not None and \
+               getattr(policy.policy.global_config, "algo_name", "") == "diffusion_policy":
+                if args_cli.dp_use_ddim:
+                    policy.policy.algo_config.ddpm.enabled = False
+                    policy.policy.algo_config.ddim.enabled = True
+                if args_cli.dp_infer_steps is not None:
+                    if policy.policy.algo_config.ddpm.enabled:
+                        policy.policy.algo_config.ddpm.num_inference_timesteps = args_cli.dp_infer_steps
+                    if policy.policy.algo_config.ddim.enabled:
+                        policy.policy.algo_config.ddim.num_inference_timesteps = args_cli.dp_infer_steps
+        except Exception:
+            pass
         terminated, traj = rollout(policy, env, success_term, args_cli.horizon, device)
         results.append(terminated)
         print(f"[INFO] Trial {trial}: {terminated}\n")
