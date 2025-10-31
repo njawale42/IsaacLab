@@ -202,6 +202,7 @@ def setup_async_generation(
     pause_subtask: bool = False,
     motion_planners: Any = None,
     joint_state_control: bool = False,
+    z_offset: float = 0.0,
 ) -> dict[str, Any]:
     """Setup async data generation tasks.
 
@@ -225,7 +226,7 @@ def setup_async_generation(
     print(f"Loaded {shared_datagen_info_pool.num_datagen_infos} to datagen info pool")
 
     # Create and schedule data generator tasks
-    data_generator = DataGenerator(env=env, src_demo_datagen_info_pool=shared_datagen_info_pool)
+    data_generator = DataGenerator(env=env, src_demo_datagen_info_pool=shared_datagen_info_pool, z_offset=z_offset)
     data_generator_asyncio_tasks = []
     for i in range(num_envs):
         env_motion_planner = motion_planners[i] if motion_planners else None

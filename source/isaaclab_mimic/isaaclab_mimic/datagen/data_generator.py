@@ -146,6 +146,7 @@ class DataGenerator:
         src_demo_datagen_info_pool: DataGenInfoPool | None = None,
         dataset_path: str | None = None,
         demo_keys: list[str] | None = None,
+        z_offset: float = 0.0,
     ):
         """
         Args:
@@ -159,6 +160,7 @@ class DataGenerator:
         self.env_cfg = env.cfg
         assert isinstance(self.env_cfg, MimicEnvCfg)
         self.dataset_path = dataset_path
+        self.z_offset = float(z_offset)
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -724,6 +726,10 @@ class DataGenerator:
                             if self.env_cfg.datagen_config.use_skillgen:
                                 # Define the goal for the motion planner: the start of the next subtask.
                                 target_eef_pose = eef_subtask_trajectory[0].pose
+                                # Apply world-frame Z offset (for MPC only) if requested
+                                if self.z_offset != 0.0:
+                                    target_eef_pose = target_eef_pose.clone()
+                                    target_eef_pose[2, 3] = target_eef_pose[2, 3] + self.z_offset
                                 target_gripper_action = eef_subtask_trajectory[0].gripper_action
 
                                 # Determine expected object attachment using environment-specific logic (optional)

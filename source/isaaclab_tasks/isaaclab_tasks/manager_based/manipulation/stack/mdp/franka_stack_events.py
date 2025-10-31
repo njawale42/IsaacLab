@@ -288,8 +288,11 @@ def randomize_visual_texture_material(
             " by setting 'replicate_physics' to False in 'InteractiveSceneCfg'."
         )
 
-    # convert from radians to degrees
-    texture_rotation = tuple(math.degrees(angle) for angle in texture_rotation)
+    # convert from radians to degrees (preserve 2-tuple type)
+    texture_rotation = (
+        math.degrees(texture_rotation[0]),
+        math.degrees(texture_rotation[1]),
+    )
 
     # obtain the asset entity
     asset = env.scene[asset_cfg.name]
@@ -312,3 +315,44 @@ def randomize_visual_texture_material(
         rep.randomizer.texture(
             textures=textures, project_uvw=True, texture_rotate=rep.distribution.uniform(*texture_rotation)
         )
+
+
+def move_wall_obstacle(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    amplitude: float = 0.10,
+    t_lat: float = 8.0,
+    t_long: float = 8.0,
+):
+    """Move a kinematic wall slowly: first along +/−Y (lateral), then along +/−X (longitudinal), repeating."""
+    if env_ids is None or len(env_ids) == 0:
+        return
+
+    wall = env.scene[asset_cfg.name]
+
+    # Cache base pose once per episode so motion is relative and repeatable
+    if not hasattr(env, "_wall_motion_initialized") or env.common_step_counter == 0:
+        env._wall_motion_initialized = True
+        env._wall_base_pos = wall.data.root_pos_w.clone()
+        env._wall_base_quat = wall.data.root_quat_w.clone()
+
+    # Elapsed time at env-step granularity
+    t = env.common_step_counter * env.step_dt
+    period = t_lat + t_long
+    phase = t % period
+
+    # Build target pose
+    pos = env._wall_base_pos[env_ids].clone()
+    if phase < t_lat:
+        # lateral motion (Y)
+        offset = amplitude * math.sin(2.0 * math.pi * (phase / t_lat))
+        pos[:, 1] = pos[:, 1] + offset
+    else:
+        # longitudinal motion (X)
+        phase2 = phase - t_lat
+        offset = amplitude * math.sin(2.0 * math.pi * (phase2 / t_long))
+        pos[:, 0] = pos[:, 0] + offset
+
+    quat = env._wall_base_quat[env_ids]
+    wall.write_root_pose_to_sim(torch.cat((pos, quat), dim=-1), env_ids=env_ids)

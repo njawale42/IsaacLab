@@ -10,7 +10,6 @@ from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
-import isaaclab.sim as sim_utils
 
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -55,6 +54,20 @@ class EventCfg:
             "pose_range": {"x": (0.4, 0.6), "y": (-0.10, 0.10), "z": (0.0203, 0.0203), "yaw": (-1.0, 1, 0)},
             "min_separation": 0.1,
             "asset_cfgs": [SceneEntityCfg("cube_1"), SceneEntityCfg("cube_2"), SceneEntityCfg("cube_3")],
+        },
+    )
+
+    # Event for wall moving
+    move_wall_obstacle = EventTerm(
+        func=franka_stack_events.move_wall_obstacle,
+        mode="interval",
+        # is_global_time=True,
+        interval_range_s=(0.0, 0.0),  # time_s = num_steps * (decimation * dt)
+        params={
+            "asset_cfg": SceneEntityCfg("wall_obstacle"),
+            "amplitude": 0.06,
+            "t_lat" : 4.0,
+            "t_long" : 4.0,
         },
     )
 
@@ -135,21 +148,21 @@ class FrankaCubeStackEnvCfg(StackEnvCfg):
                 semantic_tags=[("class", "cube_3")],
             ),
         )
-        wall_props = cube_properties
+        # wall_props = cube_properties
+        # wall_props.disable_gravity = True
         # wall_props.kinematic_enabled = True
-        wall_props.disable_gravity = True
-        # wall_props.kinematic_enabled = True
+        wall_props = RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True)
         self.scene.wall_obstacle = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/WallObstacle",
             spawn=UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/red_block.usd",
                 scale=(0.5, 3.0, 3.0),  # Width x Depth x Height
                 rigid_props=wall_props,
-                mass_props=sim_utils.MassPropertiesCfg(mass=1e10),  # TODO: (Neel) remove the hard coding here for mass
+                # mass_props=sim_utils.MassPropertiesCfg(mass=1e10),  # TODO: (Neel) remove the hard coding here for mass
 
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(0.55, 0.0, 0.50),  # x: middle of cube spawn range, y: centered, z: tall obstacle
+                pos=(0.55, 0.0, 0.45),  # x: middle of cube spawn range, y: centered, z: tall obstacle
                 rot=(1.0, 0.0, 0.0, 0.0)  # No rotation (w, x, y, z quaternion)
             ),
         )
@@ -167,7 +180,7 @@ class FrankaCubeStackEnvCfg(StackEnvCfg):
                     prim_path="{ENV_REGEX_NS}/Robot/panda_hand",
                     name="end_effector",
                     offset=OffsetCfg(
-                        pos=[0.0, 0.0, 0.1034],
+                        pos=[0.0, 0.0, 0.0],
                     ),
                 ),
                 FrameTransformerCfg.FrameCfg(

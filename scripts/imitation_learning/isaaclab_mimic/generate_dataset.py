@@ -52,6 +52,12 @@ parser.add_argument(
     help="use MPC (reactive planning) instead of trajectory planning when used with --use_skillgen",
 )
 parser.add_argument(
+    "--z_offset",
+    type=float,
+    default=0.0,
+    help="World-frame Z offset to add to MPC goal pose (only with --use_mpc)",
+)
+parser.add_argument(
     "--joint_state_control",
     action="store_true",
     default=False,
@@ -206,6 +212,7 @@ def main():
         pause_subtask=args_cli.pause_subtask,
         motion_planners=motion_planners,  # Pass the motion planners dictionary
         joint_state_control=args_cli.joint_state_control if args_cli.use_mpc else False,  # Pass joint state control flag
+        z_offset=args_cli.z_offset if args_cli.use_mpc else 0.0,
     )
 
     try:
