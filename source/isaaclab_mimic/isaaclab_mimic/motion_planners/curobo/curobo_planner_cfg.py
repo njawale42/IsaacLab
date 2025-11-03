@@ -167,6 +167,29 @@ class CuroboPlannerCfg:
     cuda_device: int | None = 0
     """Preferred CUDA device index; None uses torch.cuda.current_device() (respects CUDA_VISIBLE_DEVICES)."""
 
+    # MPC optimizer selection and IMPPI tuning
+    mpc_use_imppi: bool = False
+    """Use IMPPI optimizer instead of MPPI in MPC."""
+
+    imppi_target_kl: float = 0.03
+    """Target KL threshold per iteration for distribution update."""
+
+    imppi_reuse_prev_iter: bool = False
+    """Reuse previous iteration samples via importance mixing."""
+
+    imppi_max_backtracks: int = 5
+    """Maximum backtracking steps to satisfy KL constraint."""
+
+    imppi_backtrack_coeff: float = 0.5
+    """Backtracking multiplicative coefficient (0,1)."""
+
+    # Output filtering
+    ema_alpha: float = 0.8
+    """EMA coefficient for joint command smoothing (0..1, higher is smoother)."""
+
+    rate_limit: float = 0.015
+    """Per-step joint position delta limit (radians)."""
+
     def get_world_config(self) -> WorldConfig:
         """Load and prepare the world configuration.
 

@@ -99,7 +99,12 @@ class CuroboMPCPlanner(MotionPlannerBase):
             collision_cache=self.config.collision_cache_size,
             collision_activation_distance=self.config.collision_activation_distance,
             step_dt=self.config.interpolation_dt,
-            use_mppi=True,
+            use_mppi=not bool(self.config.mpc_use_imppi),
+            use_imppi=bool(self.config.mpc_use_imppi),
+            imppi_target_kl=float(self.config.imppi_target_kl),
+            imppi_reuse_prev_iter=bool(self.config.imppi_reuse_prev_iter),
+            imppi_max_backtracks=int(self.config.imppi_max_backtracks),
+            imppi_backtrack_coeff=float(self.config.imppi_backtrack_coeff),
         )
         self.mpc: MpcSolver = MpcSolver(mpc_config)
 
@@ -127,6 +132,8 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # Cached object mappings for world sync
         self._cached_object_mappings: dict[str, str] | None = None
         self._expected_objects: set[str] | None = None
+        # Track currently attached objects (by Isaac Lab short name)
+        self._attached_objects: set[str] = set()
 
         # Debug draw state for visualizing MPPI rollouts
         self._draw_rollouts_enabled: bool = False
@@ -171,7 +178,7 @@ class CuroboMPCPlanner(MotionPlannerBase):
         if self._expected_objects is None:
             self._expected_objects = set(self._get_world_object_names())
         else:
-            current_objects = set(self._get_world_object_names())
+            current_objects = set[str](self._get_world_object_names())
             if current_objects != self._expected_objects:
                 self._cached_object_mappings = None
                 added = current_objects - self._expected_objects
@@ -309,6 +316,67 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # Sync world first
         self.update_world()
 
+        # Handle attachment state: attach object geometry to robot when grasped, re-enable otherwise
+        try:
+            gripper_pos = self.robot.data.joint_pos[env_id, -2:]
+
+            def _check_object_grasped() -> bool:
+                try:
+                    open_val = float(self.config.grasp_gripper_open_val)
+                except Exception:
+                    open_val = 0.02
+                return bool(gripper_pos[0].item() < open_val)
+
+            # Re-enable any previously attached objects if none expected now
+            if expected_attached_object is None and self._attached_objects:
+                # Detach spheres from robot and re-enable obstacles in MPC world
+                self.mpc.detach_object_from_robot(link_name=self.config.attached_object_link_name)
+                # Re-enable hand link collisions (if previously disabled)
+                self._toggle_hand_link_collisions(enable=True)
+                self._detach_objects()
+            elif expected_attached_object is not None:
+                # If grasped and not already attached, attach spheres to robot and disable obstacle in world model
+                if _check_object_grasped() and expected_attached_object not in self._attached_objects:
+                    # Build current joint state for cuRobo
+                    cu_js_for_attach = self._get_current_joint_state_for_curobo()
+                    # Attach object geometry to robot link in MPC (and disable obstacle in world)
+                    attached_ok = self.mpc.attach_objects_to_robot(
+                        joint_state=cu_js_for_attach,
+                        object_names=[expected_attached_object],
+                        surface_sphere_radius=getattr(self.config, "surface_sphere_radius", 0.001),
+                        link_name=getattr(self.config, "attached_object_link_name", "attached_object"),
+                        world_objects_pose_offset=None,
+                        remove_obstacles_from_world_config=False,
+                    )
+                    if attached_ok:
+                        # track and log
+                        self._attached_objects.add(expected_attached_object)
+                        self.logger.info(
+                            f"MPC: attached '{expected_attached_object}' with spheres on link "
+                            f"{getattr(self.config, 'attached_object_link_name', 'attached_object')}"
+                        )
+                        # Allow in-contact motion: disable hand link collisions during grasp
+                        self._toggle_hand_link_collisions(enable=False)
+                    else:
+                        self.logger.warning(
+                            f"MPC: failed to attach '{expected_attached_object}' (no spheres/obstacle missing)"
+                        )
+                    # Also disable obstacle in MPC world mapping for safety
+                    self._attach_object(expected_attached_object, env_id)
+                # If not grasped but currently marked attached, re-enable obstacle
+                elif not _check_object_grasped() and expected_attached_object in self._attached_objects:
+                    # Detach from robot link
+                    self.mpc.detach_object_from_robot(link_name=self.config.attached_object_link_name)
+                    # Re-enable hand link collisions
+                    self._toggle_hand_link_collisions(enable=True)
+                    # Re-enable in MPC world
+                    self._detach_objects(names={expected_attached_object})
+        except Exception:
+            # Attachment handling is best-effort; continue even if it fails
+            import traceback
+            traceback.print_exc()
+            pass
+
         # Ensure target_pose is a 4x4 matrix on the env device first
         if not isinstance(target_pose, torch.Tensor):
             target_pose = torch.as_tensor(target_pose, device=self.env.device, dtype=torch.float32)
@@ -358,6 +426,41 @@ class CuroboMPCPlanner(MotionPlannerBase):
         self._step_count = 0
         # step_dt currently informs internal MPC horizon. Env cadence remains external.
         return True
+
+    # =============================
+    # Attachment helpers
+    # =============================
+    def _attach_object(self, object_name: str, env_id: int) -> None:
+        mappings = self._get_object_mappings()
+        object_path = mappings.get(object_name)
+        if object_path and self.mpc.world_coll_checker is not None:
+            # try:
+            # Disable obstacle in collision checker while attached
+            self.mpc.world_coll_checker.enable_obstacle(object_path, enable=False)  # type: ignore
+            if object_name not in self._attached_objects:
+                self._attached_objects.add(object_name)
+                # Visibility: info-level so it shows up in console
+                self.logger.info(f"Attached object '{object_name}' (disabled in MPC world): {object_path}")
+                print(f"MPC: attached '{object_name}' -> disabled obstacle {object_path}")
+            # except Exception:
+            #     pass
+
+    def _detach_objects(self, names: set[str] | None = None) -> None:
+        if not self._attached_objects:
+            return
+        mappings = self._get_object_mappings()
+        to_detach = self._attached_objects if names is None else (self._attached_objects & names)
+        for name in list(to_detach):
+            object_path = mappings.get(name)
+            if object_path and self.mpc.world_coll_checker is not None:
+                # try:
+                self.mpc.world_coll_checker.enable_obstacle(object_path, enable=True)  # type: ignore
+                # except Exception:
+                #     pass
+            if name in self._attached_objects:
+                self._attached_objects.discard(name)
+                self.logger.info(f"Detached object '{name}' (re-enabled in MPC world): {object_path}")
+                print(f"MPC: detached '{name}' -> re-enabled obstacle {object_path}")
 
     # -------------------------------------------------------------------------------------
     # DEBUG / VISUALIZATION HELPERS
@@ -562,7 +665,7 @@ class CuroboMPCPlanner(MotionPlannerBase):
             return False
         return True
 
-    def get_next_waypoint_ee_pose(self) -> torch.Tensor:
+    def get_next_waypoint_ee_pose(self) -> tuple[torch.Tensor, Any]:
         if not self.has_next_waypoint():
             raise IndexError("No more MPC waypoints; target reached or limit hit.")
 
@@ -584,6 +687,42 @@ class CuroboMPCPlanner(MotionPlannerBase):
         except AttributeError:
             # Fallback to action if js_action is unavailable
             cmd_state_full = cast(JointState, result.action)  # type: ignore
+
+        # Output filtering: EMA + rate limit on joint positions
+        try:
+            alpha = float(self.config.ema_alpha)
+        except Exception:
+            alpha = 0.8
+        try:
+            rate_limit = float(self.config.rate_limit)
+        except Exception:
+            rate_limit = 0.015
+
+        prev_pos = None
+        last_pos_attr = getattr(self._last_cmd_state, "position", None) if self._last_cmd_state is not None else None
+        if isinstance(last_pos_attr, torch.Tensor):
+            prev_pos = last_pos_attr
+        curr_pos_attr = getattr(cmd_state_full, "position", None)
+        if isinstance(prev_pos, torch.Tensor) and isinstance(curr_pos_attr, torch.Tensor):
+            # match shapes (B, D) or (D)
+            if curr_pos_attr.dim() == 2 and curr_pos_attr.shape[0] == 1:
+                cpos = curr_pos_attr[0]
+            else:
+                cpos = curr_pos_attr
+            if prev_pos.dim() == 2 and prev_pos.shape[0] == 1:
+                ppos = prev_pos[0]
+            else:
+                ppos = prev_pos
+            if ppos.shape == cpos.shape:
+                # EMA smoothing
+                smoothed = alpha * ppos + (1.0 - alpha) * cpos
+                # Rate limit
+                delta = torch.clamp(smoothed - ppos, min=-rate_limit, max=rate_limit)
+                new_pos = ppos + delta
+                if curr_pos_attr.dim() == 2 and curr_pos_attr.shape[0] == 1:
+                    cmd_state_full.position = torch.stack([new_pos], dim=0)
+                else:
+                    cmd_state_full.position = new_pos
 
         # Save last commanded joint state for consumers that want joint control
         self._last_cmd_state = cmd_state_full
