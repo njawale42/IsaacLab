@@ -9,6 +9,7 @@ import gymnasium as gym
 
 from .exhaustpipe_gr1t2_mimic_env_cfg import ExhaustPipeGR1T2MimicEnvCfg
 from .nutpour_gr1t2_mimic_env_cfg import NutPourGR1T2MimicEnvCfg
+from .nutpour_gr1t2_mimic_env_skillgen_cfg import NutPourGR1T2MimicEnvSkillGenCfg
 from .pickplace_gr1t2_mimic_env import PickPlaceGR1T2MimicEnv
 from .pickplace_gr1t2_mimic_env_cfg import PickPlaceGR1T2MimicEnvCfg
 from .pickplace_gr1t2_waist_enabled_mimic_env_cfg import PickPlaceGR1T2WaistEnabledMimicEnvCfg
@@ -42,5 +43,20 @@ gym.register(
     id="Isaac-ExhaustPipe-GR1T2-Pink-IK-Abs-Mimic-v0",
     entry_point="isaaclab_mimic.envs.pinocchio_envs:PickPlaceGR1T2MimicEnv",
     kwargs={"env_cfg_entry_point": exhaustpipe_gr1t2_mimic_env_cfg.ExhaustPipeGR1T2MimicEnvCfg},
+    disable_env_checker=True,
+)
+
+# # SkillGen alias for humanoid nut-pour Mimic env (same runtime class, SkillGen behavior via env cfg)
+# gym.register(
+#     id="Isaac-NutPour-GR1T2-Pink-IK-Abs-SkillGen-Mimic-v0",
+#     entry_point="isaaclab_mimic.envs.pinocchio_envs:PickPlaceGR1T2MimicEnv",
+#     kwargs={"env_cfg_entry_point": nutpour_gr1t2_mimic_env_skillgen_cfg.NutPourGR1T2MimicEnvSkillGenCfg},
+#     disable_env_checker=True,
+# )
+
+gym.register(
+    id="Isaac-NutPour-GR1T2-Pink-IK-Abs-SkillGen-Mimic-v0",
+    entry_point="isaaclab_mimic.envs.pinocchio_envs:PickPlaceGR1T2MimicEnv",
+    kwargs={"env_cfg_entry_point": nutpour_gr1t2_mimic_env_skillgen_cfg.NutPourGR1T2MimicEnvSkillGenCfg},
     disable_env_checker=True,
 )

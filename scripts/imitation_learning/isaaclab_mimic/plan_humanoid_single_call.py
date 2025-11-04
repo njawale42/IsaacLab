@@ -224,9 +224,13 @@ def _build_env_and_planner_bimanual_single(args_cli):
     # inactive_joint_names.extend(left_arm_joints)
 
     if args_cli.ignore_arm_collisions:
-        inactive_joint_names.extend([j for j in env_cfg.actions.pink_ik_cfg.pink_controlled_joint_names if "left_" in j])
+        inactive_joint_names.extend(
+            [j for j in env_cfg.actions.pink_ik_cfg.pink_controlled_joint_names if "left_" in j]
+        )
 
-    robot_yaml_both = _build_temp_robot_yaml_both_arms(usd_path, inactive_joints=inactive_joint_names, ignore_collision_arms=args_cli.ignore_arm_collisions)
+    robot_yaml_both = _build_temp_robot_yaml_both_arms(
+        usd_path, inactive_joints=inactive_joint_names, ignore_collision_arms=args_cli.ignore_arm_collisions
+    )
 
     env = gym.make(env_name, cfg=env_cfg).unwrapped
     env.reset()
@@ -838,7 +842,9 @@ def main():
     >> Convert targets to required frames and run planning with diagnostics
     >> Emit post-plan diagnostics, then execute the plan
     """
-    import pdb; pdb.set_trace()
+    import pdb
+
+    pdb.set_trace()
     np.random.seed(42)
     torch.manual_seed(42)
 

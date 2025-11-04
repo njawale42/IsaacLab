@@ -45,6 +45,13 @@ parser.add_argument(
     default=False,
     help="use skillgen to generate motion trajectories",
 )
+parser.add_argument(
+    "--skillgen_type",
+    type=str,
+    choices=["single_arm", "bimanual"],
+    default="single_arm",
+    help="SkillGen mode: single_arm (default, Franka-style) or bimanual (humanoid).",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -76,6 +83,7 @@ import isaaclab_mimic.envs  # noqa: F401
 
 if args_cli.enable_pinocchio:
     import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
+
 from isaaclab_mimic.datagen.generation import env_loop, setup_async_generation, setup_env_config
 from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
 
@@ -102,7 +110,56 @@ def main():
         generation_num_trials=args_cli.generation_num_trials,
     )
 
-    # Create environment
+    # Ensure env cfg reflects CLI skillgen toggle so DataGenerator takes the skillgen path
+    try:
+        env_cfg.datagen_config.use_skillgen = bool(args_cli.use_skillgen)
+    except Exception:
+        pass
+
+    # Precompute humanoid planner configs BEFORE creating the env (ordering matters)
+    prebuilt_humanoid_cfgs = None
+    if args_cli.use_skillgen and args_cli.skillgen_type == "bimanual" and "nutpour-gr1t2" in env_name.lower():
+        from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
+        from isaaclab_mimic.motion_planners.curobo.humanoid_robot_yaml import build_humanoid_yaml_from_usd
+
+        # USD path and inactive joints from env_cfg
+        usd_path = env_cfg.scene.robot.spawn.usd_path
+        try:
+            inactive_joint_names = list(env_cfg.actions.gr1_action.ik_urdf_fixed_joint_names)
+        except Exception:
+            inactive_joint_names = []
+
+        # Build per-arm YAML once
+        yaml_right = build_humanoid_yaml_from_usd(usd_path, arm="right", inactive_joints=inactive_joint_names)
+        yaml_left = build_humanoid_yaml_from_usd(usd_path, arm="left", inactive_joints=inactive_joint_names)
+
+        def _mk_cfg(yaml_path: str) -> CuroboPlannerCfg:
+            return CuroboPlannerCfg(
+                robot_config_file=yaml_path,
+                robot_name="gr1",
+                hand_link_names=[
+                    "GR1T2_fourier_hand_6dof_right_hand_pitch_link",
+                    "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
+                ],
+                static_objects=["table", "scale", "bin"],
+                # Ignore entire USD /World for obstacle extraction; rely on YAML world only
+                world_ignore_substrings=["/World/"],
+                approach_distance=0.0,
+                retreat_distance=0.0,
+                time_dilation_factor=0.5,
+                enable_finetune_trajopt=True,
+                collision_activation_distance=0.01,
+                motion_step_size=None,
+                visualize_spheres=False,
+                visualize_plan=True,
+                debug_planner=True,
+            )
+
+        cfg_right = _mk_cfg(yaml_right)
+        cfg_left = _mk_cfg(yaml_left)
+        prebuilt_humanoid_cfgs = (cfg_left, cfg_right)
+
+    # Create environment AFTER prebuilding robot YAML/configs
     env = gym.make(env_name, cfg=env_cfg).unwrapped
 
     if not isinstance(env, ManagerBasedRLMimicEnv):
@@ -120,36 +177,42 @@ def main():
     np.random.seed(env.cfg.datagen_config.seed)
     torch.manual_seed(env.cfg.datagen_config.seed)
 
-    # Reset before starting
+    # Reset before starting (ensures scene is instantiated before planner queries)
     env.reset()
 
     motion_planners = None
     if args_cli.use_skillgen:
+        from isaaclab_mimic.motion_planners.curobo.bimanual_humanoid_planner import BimanualHumanoidPlanner
         from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
         from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
 
-        # Create one motion planner per environment
         motion_planners = {}
         for env_id in range(num_envs):
             print(f"Initializing motion planner for environment {env_id}")
-            # Create a config instance from the task name
-            planner_config = CuroboPlannerCfg.from_task_name(env_name)
-
-            # Ensure visualization is only enabled for the first environment
-            # If not, sphere and plan visualization will be too slow in isaac lab
-            # It is efficient to visualize the spheres and plan for the first environment in rerun
-            if env_id != 0:
+            if (
+                args_cli.skillgen_type == "bimanual"
+                and "nutpour-gr1t2" in env_name.lower()
+                and prebuilt_humanoid_cfgs is not None
+            ):
+                cfg_left, cfg_right = prebuilt_humanoid_cfgs
+                motion_planners[env_id] = BimanualHumanoidPlanner(
+                    env=env,
+                    robot=env.scene["robot"],
+                    cfg_right=cfg_right,
+                    cfg_left=cfg_left,
+                    env_id=env_id,
+                )
+            else:
+                planner_config = CuroboPlannerCfg.from_task_name(env_name)
+                # No planner visualization during dataset generation
                 planner_config.visualize_spheres = False
                 planner_config.visualize_plan = False
-
-            motion_planners[env_id] = CuroboPlanner(
-                env=env,
-                robot=env.scene["robot"],
-                config=planner_config,  # Pass the config object
-                env_id=env_id,  # Pass environment ID
-            )
-
-        env.cfg.datagen_config.use_skillgen = True
+                motion_planners[env_id] = CuroboPlanner(
+                    env=env,
+                    robot=env.scene["robot"],
+                    config=planner_config,
+                    env_id=env_id,
+                )
 
     # Setup and run async data generation
     async_components = setup_async_generation(
@@ -159,6 +222,7 @@ def main():
         success_term=success_term,
         pause_subtask=args_cli.pause_subtask,
         motion_planners=motion_planners,  # Pass the motion planners dictionary
+        skillgen_type=args_cli.skillgen_type,
     )
 
     try:

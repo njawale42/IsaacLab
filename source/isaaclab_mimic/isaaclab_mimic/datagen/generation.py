@@ -199,6 +199,7 @@ def setup_async_generation(
     success_term: Any,
     pause_subtask: bool = False,
     motion_planners: Any = None,
+    skillgen_type: str = "single_arm",
 ) -> dict[str, Any]:
     """Setup async data generation tasks.
 
@@ -222,7 +223,11 @@ def setup_async_generation(
     print(f"Loaded {shared_datagen_info_pool.num_datagen_infos} to datagen info pool")
 
     # Create and schedule data generator tasks
-    data_generator = DataGenerator(env=env, src_demo_datagen_info_pool=shared_datagen_info_pool)
+    data_generator = DataGenerator(
+        env=env,
+        src_demo_datagen_info_pool=shared_datagen_info_pool,
+        skillgen_type=skillgen_type,
+    )
     data_generator_asyncio_tasks = []
     for i in range(num_envs):
         env_motion_planner = motion_planners[i] if motion_planners else None

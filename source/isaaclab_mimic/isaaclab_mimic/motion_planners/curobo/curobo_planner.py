@@ -1814,6 +1814,7 @@ class CuroboPlanner(MotionPlannerBase):
         step_size: float | None = None,
         enable_retiming: bool | None = None,
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
+        **kwargs: Any,
     ) -> bool:
         """Complete planning pipeline with world updates and object attachment handling.
 

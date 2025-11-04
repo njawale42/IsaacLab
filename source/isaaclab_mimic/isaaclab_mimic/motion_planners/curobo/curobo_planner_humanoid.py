@@ -187,14 +187,51 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         step_size: float | None = None,
         enable_retiming: bool | None = None,
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
+        *,
+        input_is_site_frame: bool = False,
     ) -> bool:
         """Plan motion for single humanoid arm with collision management.
 
         Accepts target_pose as a world-frame tool pose and converts to planner frame.
         """
-        # Convert world tool pose to planner frame if needed
-        if isinstance(target_pose, torch.Tensor) and target_pose.shape == (4, 4):
-            # world->base using current robot base from env
+        # Convert controller-site/world input to tool/world if requested
+        target_pose_world_tool: torch.Tensor
+        if input_is_site_frame:
+            # Compute current tool pose in base via cuRobo FK, then lift to world using robot base pose
+            cu_js = self._get_current_joint_state_for_curobo()
+            ee_pose = self.get_ee_pose(cu_js)  # base->tool
+            pos_bt = self._to_env_device(ee_pose.position).reshape(-1, 3)[0]
+            if hasattr(ee_pose, "quaternion"):
+                quat_bt = self._to_env_device(ee_pose.quaternion).view(1, 4)
+                rot_bt = PoseUtils.matrix_from_quat(quat_bt)[0]
+            else:
+                rot_bt = self._to_env_device(ee_pose.get_rotation())
+                if rot_bt.dim() == 3:
+                    rot_bt = rot_bt[0]
+            T_base_tool_now = PoseUtils.make_pose(pos_bt.unsqueeze(0), rot_bt.unsqueeze(0))[0]
+            # World (env-origin) -> base
+            base_pos_w = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(
+                device=self.env.device, dtype=torch.float32
+            )
+            base_rot_w = PoseUtils.matrix_from_quat(
+                self.robot.data.root_quat_w[self.env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32)
+            )[0]
+            T_world_base = PoseUtils.make_pose(base_pos_w.unsqueeze(0), base_rot_w.unsqueeze(0))[0]
+            T_world_tool_now = (T_world_base @ T_base_tool_now).clone()
+
+            # Controller site pose from env (same EEF name as active arm)
+            arm = self._arm_side() or "right"
+            ctrl_site_env = self.env.get_robot_eef_pose(arm, env_ids=[self.env_id])[0]
+            # Mapping from cuRobo tool to controller site: T_T_S = inv(T_W_T) @ T_W_S
+            T_tool_site = torch.linalg.solve(T_world_tool_now, ctrl_site_env).clone()
+            # Convert input site/world to tool/world: T_W_T = T_W_S @ inv(T_T_S)
+            target_site_world = target_pose.to(device=self.env.device, dtype=torch.float32).clone()
+            target_pose_world_tool = target_site_world @ torch.linalg.inv(T_tool_site)
+        else:
+            target_pose_world_tool = target_pose.to(device=self.env.device, dtype=torch.float32)
+
+        # Convert world tool pose to planner (base) frame
+        if isinstance(target_pose_world_tool, torch.Tensor) and target_pose_world_tool.shape == (4, 4):
             base_pos = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(
                 device=self.env.device, dtype=torch.float32
             )
@@ -203,9 +240,42 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             )[0]
             T_env_base = PoseUtils.make_pose(base_pos.unsqueeze(0), base_rot.unsqueeze(0))[0]
             T_base_env = torch.linalg.inv(T_env_base)
-            target_pose_base_tool = (T_base_env @ target_pose.to(device=self.env.device, dtype=torch.float32)).clone()
+            target_pose_base_tool = (T_base_env @ target_pose_world_tool).clone()
         else:
-            target_pose_base_tool = target_pose
+            target_pose_base_tool = target_pose_world_tool
+
+        # Guard: if target is effectively current, synthesize a trivial plan to avoid optimizer edge cases
+        try:
+            current_js = self._get_current_joint_state_for_curobo()
+            ee_pose_bt = self.get_ee_pose(current_js)  # base->tool
+            cur_pos_bt = self._to_env_device(ee_pose_bt.position).reshape(-1, 3)[0]
+            if hasattr(ee_pose_bt, "quaternion"):
+                cur_quat_bt = self._to_env_device(ee_pose_bt.quaternion).view(1, 4)
+                cur_rot_bt = PoseUtils.matrix_from_quat(cur_quat_bt)[0]
+            else:
+                cur_rot_bt = self._to_env_device(ee_pose_bt.get_rotation())
+                if cur_rot_bt.dim() == 3:
+                    cur_rot_bt = cur_rot_bt[0]
+            T_base_tool_cur = PoseUtils.make_pose(cur_pos_bt.unsqueeze(0), cur_rot_bt.unsqueeze(0))[0]
+            base_pos_w = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(
+                device=self.env.device, dtype=torch.float32
+            )
+            base_rot_w = PoseUtils.matrix_from_quat(
+                self.robot.data.root_quat_w[self.env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32)
+            )[0]
+            T_world_base = PoseUtils.make_pose(base_pos_w.unsqueeze(0), base_rot_w.unsqueeze(0))[0]
+            T_world_tool_cur = (T_world_base @ T_base_tool_cur).clone()
+            # Compare in world frame for clarity
+            d_pos = torch.linalg.vector_norm(T_world_tool_cur[:3, 3] - target_pose_world_tool[:3, 3]).item()
+            d_rot_mat = T_world_tool_cur[:3, :3].T @ target_pose_world_tool[:3, :3]
+            d_rot = torch.acos(torch.clamp((torch.trace(d_rot_mat) - 1.0) / 2.0, -1.0, 1.0)).item()
+            if d_pos < 1e-4 and d_rot < 1e-3:
+                # Build a single-waypoint plan at current state
+                self._current_plan = current_js
+                self._plan_index = 0
+                return True
+        except Exception:
+            pass
 
         inactive_links = self._inactive_collision_links()
         try:

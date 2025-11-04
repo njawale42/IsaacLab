@@ -146,6 +146,8 @@ class DataGenerator:
         src_demo_datagen_info_pool: DataGenInfoPool | None = None,
         dataset_path: str | None = None,
         demo_keys: list[str] | None = None,
+        *,
+        skillgen_type: str = "single_arm",
     ):
         """
         Args:
@@ -159,6 +161,7 @@ class DataGenerator:
         self.env_cfg = env.cfg
         assert isinstance(self.env_cfg, MimicEnvCfg)
         self.dataset_path = dataset_path
+        self.skillgen_type = skillgen_type
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -676,6 +679,8 @@ class DataGenerator:
         current_eef_subtask_indices = {}
         next_eef_subtask_indices_after_motion = {}
         next_eef_subtask_trajectories_after_motion = {}
+        paused_eef_traj: dict[str, list[Waypoint]] = {}
+        paused_eef_step_idx: dict[str, int | None] = {}
         current_eef_subtask_step_indices = {}
         eef_subtasks_done = {}
         for eef_name in self.env_cfg.subtask_configs.keys():
@@ -732,6 +737,59 @@ class DataGenerator:
                                         eef_name, current_eef_subtask_indices[eef_name], self.env.cfg
                                     )
 
+                                # If the target is effectively current, skip planning and execute directly
+                                if motion_planner:
+                                    try:
+                                        cur_site_pose = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])[0]
+                                        dpos = torch.linalg.vector_norm(cur_site_pose[:3, 3] - target_eef_pose[:3, 3])
+                                        drot_mat = cur_site_pose[:3, :3].T @ target_eef_pose[:3, :3]
+                                        drot = torch.acos(torch.clamp((torch.trace(drot_mat) - 1.0) / 2.0, -1.0, 1.0))
+                                    except Exception:
+                                        dpos = torch.tensor(float("inf"), device=self.env.device)
+                                        drot = torch.tensor(float("inf"), device=self.env.device)
+
+                                    # Thresholds: 1 cm and ~5.7 degrees
+                                    if float(dpos.item()) < 0.01 and float(drot.item()) < 0.1:
+                                        # Treat as no-op transition: resume subtask directly with interpolation
+                                        current_eef_subtask_trajectories[eef_name] = self.merge_eef_subtask_trajectory(
+                                            env_id,
+                                            eef_name,
+                                            current_eef_subtask_indices[eef_name],
+                                            current_eef_subtask_trajectories[eef_name],
+                                            eef_subtask_trajectory,
+                                        )
+                                        current_eef_subtask_step_indices[eef_name] = 0
+                                        # While this arm moves, hold the other arm(s) steady (bimanual mode only)
+                                        if self.skillgen_type == "bimanual":
+                                            planned_len = len(current_eef_subtask_trajectories[eef_name])
+                                            for other_eef in self.env_cfg.subtask_configs.keys():
+                                                if other_eef == eef_name:
+                                                    continue
+                                                # Backup current trajectory/state to restore after transition
+                                                paused_eef_traj[other_eef] = current_eef_subtask_trajectories[other_eef]
+                                                paused_eef_step_idx[other_eef] = current_eef_subtask_step_indices[
+                                                    other_eef
+                                                ]
+
+                                                # Build constant hold trajectory for the other arm
+                                                hold_pose = self.env.get_robot_eef_pose(other_eef, env_ids=[env_id])[0]
+                                                ga = None
+                                                try:
+                                                    si = paused_eef_step_idx[other_eef]
+                                                    if si is not None and si < len(paused_eef_traj[other_eef]):
+                                                        ga = paused_eef_traj[other_eef][si].gripper_action
+                                                except Exception:
+                                                    ga = None
+                                                if ga is None:
+                                                    ga = target_gripper_action
+                                                hold_seq = [
+                                                    Waypoint(pose=hold_pose, gripper_action=ga, noise=0.0)
+                                                    for _ in range(planned_len)
+                                                ]
+                                                current_eef_subtask_trajectories[other_eef] = hold_seq
+                                                current_eef_subtask_step_indices[other_eef] = 0
+                                        continue
+
                                 # Plan motion using motion planner with comprehensive world update and attachment handling
                                 if motion_planner:
                                     print(f"\n--- Environment {env_id}: Planning motion to target pose ---")
@@ -739,14 +797,22 @@ class DataGenerator:
                                     print(f"Expected attached object: {expected_attached_object}")
 
                                     # This call updates the planner's world model and computes the trajectory.
-                                    planning_success = motion_planner.update_world_and_plan_motion(
-                                        target_pose=target_eef_pose,
-                                        expected_attached_object=expected_attached_object,
-                                        env_id=env_id,
-                                        step_size=getattr(motion_planner, "step_size", None),
-                                        enable_retiming=hasattr(motion_planner, "step_size")
-                                        and motion_planner.step_size is not None,
-                                    )
+                                    import torch as _torch
+
+                                    with _torch.inference_mode(False):
+                                        _kwargs = dict(
+                                            target_pose=target_eef_pose,
+                                            expected_attached_object=expected_attached_object,
+                                            env_id=env_id,
+                                            step_size=getattr(motion_planner, "step_size", None),
+                                            enable_retiming=(
+                                                hasattr(motion_planner, "step_size")
+                                                and motion_planner.step_size is not None
+                                            ),
+                                        )
+                                        if self.skillgen_type == "bimanual":
+                                            _kwargs["input_is_site_frame"] = True
+                                        planning_success = motion_planner.update_world_and_plan_motion(**_kwargs)
 
                                     # If planning succeeds, execute the planner's trajectory first.
                                     if planning_success:
@@ -766,11 +832,6 @@ class DataGenerator:
                                             )
                                         )
                                         current_eef_subtask_step_indices[eef_name] = 0
-                                        print(
-                                            f"Generated {len(current_eef_subtask_trajectories[eef_name])} waypoints"
-                                            " from motion plan"
-                                        )
-
                                     else:
                                         # If planning fails, abort the data generation trial.
                                         print(f"Env {env_id}: Motion planning failed for {eef_name}")
@@ -880,7 +941,17 @@ class DataGenerator:
                 generated_actions.extend(exec_results["actions"])
                 generated_success = generated_success or exec_results["success"]
 
+            # If a motion-planned transition is active (bimanual), only advance the transitioning arm
+            transition_eef = None
+            if self.skillgen_type == "bimanual":
+                for k, v in current_eef_subtask_indices.items():
+                    if v == -1:
+                        transition_eef = k
+                        break
+
             for eef_name in self.env_cfg.subtask_configs.keys():
+                if transition_eef is not None and eef_name != transition_eef:
+                    continue
                 current_eef_subtask_step_indices[eef_name] += 1
                 subtask_ind = current_eef_subtask_indices[eef_name]
                 if current_eef_subtask_step_indices[eef_name] == len(
@@ -923,6 +994,17 @@ class DataGenerator:
                     else:
                         current_eef_subtask_step_indices[eef_name] = None
                         current_eef_subtask_indices[eef_name] += 1
+
+                    # If we just finished a transition (bimanual), restore paused arms
+                    if self.skillgen_type == "bimanual" and transition_eef == eef_name and paused_eef_traj:
+                        for other_eef, seq in paused_eef_traj.items():
+                            if other_eef == eef_name:
+                                continue
+                            current_eef_subtask_trajectories[other_eef] = seq
+                            if other_eef in paused_eef_step_idx:
+                                current_eef_subtask_step_indices[other_eef] = paused_eef_step_idx[other_eef]
+                        paused_eef_traj.clear()
+                        paused_eef_step_idx.clear()
             # Check if all eef_subtasks_done values are True
             if all(eef_subtasks_done.values()):
                 break
@@ -968,11 +1050,72 @@ class DataGenerator:
         # Get motion noise scale from the planner's configuration
         motion_noise_scale = getattr(motion_planner.config, "motion_noise_scale", 0.0)
 
-        waypoints = []
         planned_poses = motion_planner.get_planned_poses()
 
+        # For single-arm SkillGen (Franka-style), planned poses are already in the env's expected frame
+        if self.skillgen_type != "bimanual":
+            return [Waypoint(pose=p, gripper_action=gripper_action, noise=motion_noise_scale) for p in planned_poses]
+
+        # Bimanual humanoid: convert base->tool to site/world before wrapping as waypoints
+        # Determine which arm this plan corresponds to
+        eef_name = None
+        if hasattr(motion_planner, "_last_arm") and motion_planner._last_arm is not None:
+            eef_name = motion_planner._last_arm
+        elif hasattr(motion_planner, "_arm_side"):
+            try:
+                eef_name = motion_planner._arm_side()
+            except Exception:
+                eef_name = None
+        if eef_name is None:
+            eef_name = "right"
+
+        env_id = getattr(motion_planner, "env_id", 0)
+
+        # Compute world->base transform
+        base_pos_world = (self.env.scene["robot"].data.root_pos_w[env_id] - self.env.scene.env_origins[env_id]).to(
+            device=self.env.device, dtype=torch.float32
+        )
+        base_rot_world = PoseUtils.matrix_from_quat(
+            self.env.scene["robot"]
+            .data.root_quat_w[env_id]
+            .unsqueeze(0)
+            .to(device=self.env.device, dtype=torch.float32)
+        )[0]
+        T_world_base = PoseUtils.make_pose(base_pos_world.unsqueeze(0), base_rot_world.unsqueeze(0))[0]
+
+        # Compute fixed tool->site mapping at current configuration
+        try:
+            cu_js = motion_planner._get_current_joint_state_for_curobo()
+            ee_pose_bt = motion_planner.get_ee_pose(cu_js)  # base->tool
+            pos_bt = (
+                ee_pose_bt.position
+                if isinstance(ee_pose_bt.position, torch.Tensor)
+                else torch.tensor(ee_pose_bt.position)
+            )
+            pos_bt = pos_bt.to(device=self.env.device, dtype=torch.float32).reshape(-1, 3)[0]
+            if hasattr(ee_pose_bt, "quaternion"):
+                quat_bt = ee_pose_bt.quaternion.view(1, 4).to(device=self.env.device, dtype=torch.float32)
+                rot_bt = PoseUtils.matrix_from_quat(quat_bt)[0]
+            else:
+                rot_bt = ee_pose_bt.get_rotation()
+                if isinstance(rot_bt, torch.Tensor) and rot_bt.dim() == 3:
+                    rot_bt = rot_bt[0]
+                rot_bt = rot_bt.to(device=self.env.device, dtype=torch.float32)
+            T_base_tool_now = PoseUtils.make_pose(pos_bt.unsqueeze(0), rot_bt.unsqueeze(0))[0]
+            T_world_tool_now = (T_world_base @ T_base_tool_now).clone()
+            ctrl_site_env = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])[0]
+            T_tool_site = torch.linalg.solve(T_world_tool_now, ctrl_site_env).clone()
+        except Exception:
+            # Fallback: assume identity tool->site (may be okay if controller site == tool)
+            T_tool_site = torch.eye(4, device=self.env.device, dtype=torch.float32)
+
+        waypoints = []
         for planned_pose in planned_poses:
-            waypoint = Waypoint(pose=planned_pose, gripper_action=gripper_action, noise=motion_noise_scale)
+            # planned_pose is base->tool; map to world->tool and then to world->site
+            p_bt = planned_pose.to(device=self.env.device, dtype=torch.float32)
+            T_world_tool = (T_world_base @ p_bt).clone()
+            T_world_site = (T_world_tool @ T_tool_site).clone()
+            waypoint = Waypoint(pose=T_world_site, gripper_action=gripper_action, noise=motion_noise_scale)
             waypoints.append(waypoint)
 
         return waypoints

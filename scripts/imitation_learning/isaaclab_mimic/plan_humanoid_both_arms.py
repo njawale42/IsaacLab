@@ -51,6 +51,59 @@ parser.add_argument(
     "--pair_visualize", action="store_true", help="Visualize sampled colliding and collision-free joint pairs."
 )
 parser.add_argument("--pair_vis_samples", type=int, default=8, help="Number of samples per class to visualize.")
+# Post-execution gripper behavior
+parser.add_argument(
+    "--skip_grip",
+    action="store_true",
+    help="Skip closing/opening grippers after executing planned paths.",
+)
+parser.add_argument(
+    "--grip_close_value",
+    type=float,
+    default=-1.0,
+    help="Command value for closing fingers (applied to all finger joints).",
+)
+parser.add_argument(
+    "--grip_close_left",
+    type=str,
+    default=None,
+    help="Comma-separated 11 floats for LEFT finger joints (overrides --grip_close_value).",
+)
+parser.add_argument(
+    "--grip_close_right",
+    type=str,
+    default=None,
+    help="Comma-separated 11 floats for RIGHT finger joints (overrides --grip_close_value).",
+)
+parser.add_argument(
+    "--grip_open_left",
+    type=str,
+    default=None,
+    help="Optional comma-separated 11 floats for LEFT open finger joints (default: env idle).",
+)
+parser.add_argument(
+    "--grip_open_right",
+    type=str,
+    default=None,
+    help="Optional comma-separated 11 floats for RIGHT open finger joints (default: env idle).",
+)
+parser.add_argument(
+    "--grip_close_steps",
+    type=int,
+    default=30,
+    help="Number of control steps to hold the gripper in the closed state.",
+)
+parser.add_argument(
+    "--grip_close_use_upper_limits",
+    action="store_true",
+    help="Use per-finger joint upper limits for closing (overrides close vectors/values).",
+)
+parser.add_argument(
+    "--grip_open_steps",
+    type=int,
+    default=30,
+    help="Number of control steps to hold the gripper in the reopened state after closing.",
+)
 # Back-and-forth planning: if enabled, plan to goal and then back to home, per arm
 parser.add_argument(
     "--back_forth",
@@ -995,6 +1048,15 @@ def _execute_plan(
             if (idx + 1) % 10 == 0 or idx == 0 or idx == len(planned_poses) - 1:
                 print(f"[PlanHumanoid] Step {idx + 1}/{len(planned_poses)}")
 
+        # Post-execution gripper close/open sequence on active arm
+        arm_active_local = active_arm if active_arm is not None else args_cli.arm
+        _run_gripper_sequence(
+            env,
+            args_cli,
+            close_left=(arm_active_local == "left"),
+            close_right=(arm_active_local == "right"),
+        )
+
     planner.plan_visualizer.close()
     planner.clear()
 
@@ -1295,13 +1357,18 @@ def _execute_plans_together(
         # Final hold at goal to allow settling (retimed branch only)
         if retime_schedules is not None and len(schedule) > 0:
             # Use the true retime horizon (T_end) to compute final targets
-            t_last = max(times_r_list[-1], times_l_list[-1]) if len(times_r_list) > 0 and len(times_l_list) > 0 else schedule[-1]
+            t_last = (
+                max(times_r_list[-1], times_l_list[-1])
+                if len(times_r_list) > 0 and len(times_l_list) > 0
+                else schedule[-1]
+            )
             q_r_T = interp(times_r_list, js_r, t_last)
             q_l_T = interp(times_l_list, js_l, t_last)
             state_r = planner_r.motion_gen.kinematics.get_state(q_r_T.unsqueeze(0))
             state_l = planner_l.motion_gen.kinematics.get_state(q_l_T.unsqueeze(0))
             pose_r_bt = getattr(state_r, "ee_pose", None)
             pose_l_bt = getattr(state_l, "ee_pose", None)
+
             def _pose_to_mat_final(pose_obj, state):
                 if pose_obj is not None and hasattr(pose_obj, "position"):
                     pos = pose_obj.position
@@ -1317,13 +1384,16 @@ def _execute_plans_together(
                 ee_rot = getattr(state, "ee_quaternion").view(1, 4)
                 rot_m = PoseUtils.matrix_from_quat(ee_rot)[0]
                 return PoseUtils.make_pose(ee_pos, rot_m.unsqueeze(0))[0]
+
             pose_r_bt = _pose_to_mat_final(pose_r_bt, state_r).to(device=env.device, dtype=torch.float32)
             pose_l_bt = _pose_to_mat_final(pose_l_bt, state_l).to(device=env.device, dtype=torch.float32)
             base_pos_world_exec = (robot.data.root_pos_w[0] - env_origin).to(device=env.device, dtype=torch.float32)
             base_rot_world_exec = PoseUtils.matrix_from_quat(
                 robot.data.root_quat_w[0].unsqueeze(0).to(device=env.device, dtype=torch.float32)
             )[0]
-            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[0]
+            T_world_base_exec = PoseUtils.make_pose(base_pos_world_exec.unsqueeze(0), base_rot_world_exec.unsqueeze(0))[
+                0
+            ]
             target_world_tool_r = (T_world_base_exec @ pose_r_bt).clone()
             target_world_tool_l = (T_world_base_exec @ pose_l_bt).clone()
             target_site_r = (target_world_tool_r @ site_from_r).clone()
@@ -1342,12 +1412,136 @@ def _execute_plans_together(
             action_final = action_final.to(device=env.device, dtype=torch.float32)
             for _ in range(int(max(0, args_cli.final_hold_steps))):
                 env.step(action_final)
+        # Post-execution gripper close/open sequence on both arms
+        _run_gripper_sequence(env, args_cli, close_left=True, close_right=True)
         print("[PlanHumanoid] Trial complete")
 
     planner_r.plan_visualizer.close()
     planner_l.plan_visualizer.close()
     planner_r.clear()
     planner_l.clear()
+
+
+def _run_gripper_sequence(env, args_cli, close_left: bool, close_right: bool) -> None:
+    if getattr(args_cli, "skip_grip", False):
+        return
+    # Prepare idle-based open vectors and uniform close vectors
+    idle = env.cfg.idle_action
+    if not isinstance(idle, torch.Tensor):
+        idle = torch.tensor(idle, dtype=torch.float32)
+    else:
+        idle = idle.to(dtype=torch.float32)
+    idle = idle.to(device=env.device)
+
+    def _parse_list_arg(s: str | None, expected_len: int) -> torch.Tensor | None:
+        if s is None:
+            return None
+        values = [t for t in s.split(",") if t.strip() != ""]
+        try:
+            arr = [float(v) for v in values]
+        except ValueError:
+            print("[PlanHumanoid] Invalid per-finger vector: could not parse floats; ignoring override.")
+            return None
+        if len(arr) != expected_len:
+            print(f"[PlanHumanoid] Invalid per-finger vector length ({len(arr)} != {expected_len}); ignoring override.")
+            return None
+        return torch.tensor(arr, dtype=torch.float32, device=env.device)
+
+    # Open vectors: overrides or idle
+    open_left = _parse_list_arg(getattr(args_cli, "grip_open_left", None), 11)
+    if open_left is None:
+        open_left = idle[14:25].detach().clone().to(device=env.device, dtype=torch.float32)
+    open_right = _parse_list_arg(getattr(args_cli, "grip_open_right", None), 11)
+    if open_right is None:
+        open_right = idle[25:36].detach().clone().to(device=env.device, dtype=torch.float32)
+
+    # Close vectors: optionally use robot upper limits, else per-finger overrides, else uniform value
+    if getattr(args_cli, "grip_close_use_upper_limits", False):
+        robot = env.scene["robot"]
+        joint_names = list(robot.data.joint_names)
+        name_to_idx = {n: i for i, n in enumerate(joint_names)}
+        lims = robot.data.joint_pos_limits[0]  # [num_joints, 2]
+        hand_names = list(env.cfg.actions.pink_ik_cfg.hand_joint_names)
+        left_order = [n for n in hand_names if n.startswith("L_")]
+        right_order = [n for n in hand_names if n.startswith("R_")]
+        try:
+            left_upper = [float(lims[name_to_idx[n], 1].item()) for n in left_order]
+            right_upper = [float(lims[name_to_idx[n], 1].item()) for n in right_order]
+        except Exception:
+            print("[PlanHumanoid] Failed to read joint upper limits; falling back to uniform close value.")
+            left_upper = right_upper = None
+        if left_upper is not None and right_upper is not None and len(left_upper) == 11 and len(right_upper) == 11:
+            close_left_vec = torch.tensor(left_upper, dtype=torch.float32, device=env.device)
+            close_right_vec = torch.tensor(right_upper, dtype=torch.float32, device=env.device)
+        else:
+            close_val = float(args_cli.grip_close_value)
+            close_left_vec = torch.full((11,), close_val, dtype=torch.float32, device=env.device)
+            close_right_vec = torch.full((11,), close_val, dtype=torch.float32, device=env.device)
+    else:
+        close_left_vec = _parse_list_arg(getattr(args_cli, "grip_close_left", None), 11)
+        close_right_vec = _parse_list_arg(getattr(args_cli, "grip_close_right", None), 11)
+        if close_left_vec is None or close_right_vec is None:
+            close_val = float(args_cli.grip_close_value)
+            if close_left_vec is None:
+                close_left_vec = torch.full((11,), close_val, dtype=torch.float32, device=env.device)
+            if close_right_vec is None:
+                close_right_vec = torch.full((11,), close_val, dtype=torch.float32, device=env.device)
+
+    # Hold current EE poses; keep arms fixed while actuating grippers
+    pose_left = env.get_robot_eef_pose("left")[0].to(device=env.device, dtype=torch.float32)
+    pose_right = env.get_robot_eef_pose("right")[0].to(device=env.device, dtype=torch.float32)
+
+    # Helper to interleave per-hand vectors into the env's hand joint order
+    def _interleave(hand_names: list[str], left_vec: torch.Tensor, right_vec: torch.Tensor) -> torch.Tensor:
+        vals = []
+        li = 0
+        ri = 0
+        for name in hand_names:
+            if name.startswith("L_"):
+                vals.append(left_vec[li])
+                li += 1
+            else:
+                vals.append(right_vec[ri])
+                ri += 1
+        return torch.stack(vals).to(device=env.device, dtype=torch.float32)
+
+    hand_names = list(env.cfg.actions.pink_ik_cfg.hand_joint_names)
+
+    # Close phase
+    n_close = max(0, int(getattr(args_cli, "grip_close_steps", 0)))
+    for _ in range(n_close):
+        ga_left = close_left_vec if close_left else open_left
+        ga_right = close_right_vec if close_right else open_right
+        action = env.target_eef_pose_to_action(
+            target_eef_pose_dict={"left": pose_left, "right": pose_right},
+            gripper_action_dict={"left": ga_left, "right": ga_right},
+            action_noise_dict=None,
+            env_id=0,
+        )
+        if action.ndim == 1:
+            action = action.unsqueeze(0)
+        # Remap last 22 dims to match env.hand_joint_names interleaving
+        inter = _interleave(hand_names, ga_left, ga_right)
+        action = action.to(device=env.device, dtype=torch.float32)
+        action[:, -22:] = inter.unsqueeze(0)
+        env.step(action)
+
+    # Re-open phase
+    n_open = max(0, int(getattr(args_cli, "grip_open_steps", 0)))
+    for _ in range(n_open):
+        action = env.target_eef_pose_to_action(
+            target_eef_pose_dict={"left": pose_left, "right": pose_right},
+            gripper_action_dict={"left": open_left, "right": open_right},
+            action_noise_dict=None,
+            env_id=0,
+        )
+        if action.ndim == 1:
+            action = action.unsqueeze(0)
+        # Remap last 22 dims to match env.hand_joint_names interleaving
+        inter_open = _interleave(hand_names, open_left, open_right)
+        action = action.to(device=env.device, dtype=torch.float32)
+        action[:, -22:] = inter_open.unsqueeze(0)
+        env.step(action)
 
 
 def _build_temp_robot_yaml_both_arms(usd_path: str) -> str:
@@ -1486,163 +1680,172 @@ def _compute_colliding_pairs_joint_singlecall(planner_r, planner_l, full_robot_y
 def main():
     np.random.seed(42)
     torch.manual_seed(42)
+    try:
+        # Build env and planner(s)
+        if args_cli.arm == "both":
+            env, robot, planner_right, planner_left, robot_yaml_both = _build_env_and_planners_both(args_cli)
 
-    # Build env and planner(s)
-    if args_cli.arm == "both":
-        env, robot, planner_right, planner_left, robot_yaml_both = _build_env_and_planners_both(args_cli)
+            # Frames and calibration per arm
+            env_origin_r, ctrl_site_env_r, T_world_base_r, T_world_tool_now_r, site_from_curobo_r = (
+                _compute_world_and_site_frames(env, robot, planner_right, "right")
+            )
+            env_origin_l, ctrl_site_env_l, T_world_base_l, T_world_tool_now_l, site_from_curobo_l = (
+                _compute_world_and_site_frames(env, robot, planner_left, "left")
+            )
 
-        # Frames and calibration per arm
-        env_origin_r, ctrl_site_env_r, T_world_base_r, T_world_tool_now_r, site_from_curobo_r = (
-            _compute_world_and_site_frames(env, robot, planner_right, "right")
+            # Build paired goals for arms
+            env_device = cast(Any, env).device
+            use_independent = any(
+                x is not None
+                for x in (
+                    args_cli.right_dx,
+                    args_cli.right_dy,
+                    args_cli.right_dz,
+                    args_cli.left_dx,
+                    args_cli.left_dy,
+                    args_cli.left_dz,
+                )
+            )
+            if use_independent:
+                target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_independent(
+                    ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
+                )
+            else:
+                target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_bimanual(
+                    ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
+                )
+
+            site_inv_r = torch.linalg.inv(site_from_curobo_r)
+            site_inv_l = torch.linalg.inv(site_from_curobo_l)
+            target_world_tool_r = (target_pose_env_site_r @ site_inv_r).clone()
+            target_world_tool_l = (target_pose_env_site_l @ site_inv_l).clone()
+
+            # Configure retiming (see flag description): deg->rad step size; None disables retiming
+            step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
+
+            # Plan sequentially (both arms active in collisions)
+            print(f"[PlanHumanoid] RIGHT: inactive collision links = {len(planner_right._inactive_collision_links())}")
+            print("[PlanHumanoid] Planning RIGHT arm...")
+            ok_r = _plan_motion(planner_right, target_world_tool_r, step_size)
+            if not ok_r:
+                print("Planning failed for right arm.")
+                return
+            print(f"[PlanHumanoid] RIGHT planned waypoints: {len(planner_right.get_planned_poses())}")
+
+            print(f"[PlanHumanoid] LEFT: inactive collision links = {len(planner_left._inactive_collision_links())}")
+            print("[PlanHumanoid] Planning LEFT arm...")
+            ok_l = _plan_motion(planner_left, target_world_tool_l, step_size)
+            if not ok_l:
+                print("Planning failed for left arm.")
+                return
+            print(f"[PlanHumanoid] LEFT planned waypoints: {len(planner_left.get_planned_poses())}")
+
+            # If requested, append return-to-start for both arms by reversing their plans
+            if args_cli.back_forth:
+                print("[PlanHumanoid] Appending return-to-start segment for both arms (back_forth enabled)")
+                _append_return_to_start(planner_right)
+                _append_return_to_start(planner_left)
+                print(
+                    f"[PlanHumanoid] RIGHT total waypoints (forward+back): {len(planner_right.current_plan.position)}"
+                )
+                print(f"[PlanHumanoid] LEFT total waypoints (forward+back): {len(planner_left.current_plan.position)}")
+
+            # Visualize goals and current EE frames for both arms
+            ee_vis_r, ee_vis_l = _visualize_goals_bimanual(
+                args_cli, target_pose_env_site_r, target_pose_env_site_l, env
+            )
+
+            # Collision-aware retiming (optional)
+            retime_sched = None
+            if args_cli.collision_aware:
+                # Prefer joint-level collision detection across both arms
+                colliding_pairs = _compute_colliding_pairs_joint(
+                    planner_right, planner_left
+                )  # _compute_colliding_pairs_joint_singlecall(planner_right, planner_left, robot_yaml_both)
+                # if not colliding_pairs:
+                #     # Fallback to EE proximity if joint-level yields none
+                #     print("[PlanHumanoid] No colliding joint waypoint pairs detected")
+                #     colliding_pairs = _compute_colliding_pairs_ee(
+                #         planner_right.get_planned_poses(),
+                #         planner_left.get_planned_poses(),
+                #         T_world_base_r,
+                #         threshold=float(args_cli.collision_distance),
+                #         device=env_device,
+                #     )
+                if colliding_pairs:
+                    print(f"[PlanHumanoid] Colliding pairs (joint-level preferred): {len(colliding_pairs)}")
+                    retime_sched = _build_retimed_schedules(
+                        len(planner_right.get_planned_poses()),
+                        len(planner_left.get_planned_poses()),
+                        colliding_pairs,
+                        min_dt=0.05,
+                    )
+                    if retime_sched is None:
+                        print(
+                            "[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware"
+                            " retime."
+                        )
+                else:
+                    print("[PlanHumanoid] No colliding waypoint pairs detected")
+
+            # Execute both together in one trial (with optional retime)
+            _execute_plans_together(
+                env,
+                robot,
+                planner_right,
+                planner_left,
+                env_origin_r,
+                site_from_curobo_r,
+                site_from_curobo_l,
+                args_cli,
+                ee_vis_r=ee_vis_r,
+                ee_vis_l=ee_vis_l,
+                retime_schedules=retime_sched,
+            )
+            return
+
+        # Single-arm path (unchanged)
+        env, robot, planner = _build_env_and_planner(args_cli)
+
+        # Frames and calibration
+        eef_name = args_cli.arm  # "left" or "right"
+        env_origin, ctrl_site_env, T_world_base, T_world_tool_now, site_from_curobo = _compute_world_and_site_frames(
+            env, robot, planner, eef_name
         )
-        env_origin_l, ctrl_site_env_l, T_world_base_l, T_world_tool_now_l, site_from_curobo_l = (
-            _compute_world_and_site_frames(env, robot, planner_left, "left")
-        )
 
-        # Build paired goals for arms
+        # Build goal in site/world and convert to tool/world
         env_device = cast(Any, env).device
-        use_independent = any(
-            x is not None
-            for x in (
-                args_cli.right_dx,
-                args_cli.right_dy,
-                args_cli.right_dz,
-                args_cli.left_dx,
-                args_cli.left_dy,
-                args_cli.left_dz,
-            )
-        )
-        if use_independent:
-            target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_independent(
-                ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
-            )
-        else:
-            target_pose_env_site_r, target_pose_env_site_l = _build_site_goal_bimanual(
-                ctrl_site_env_r, ctrl_site_env_l, args_cli, env_device
-            )
-
-        site_inv_r = torch.linalg.inv(site_from_curobo_r)
-        site_inv_l = torch.linalg.inv(site_from_curobo_l)
-        target_world_tool_r = (target_pose_env_site_r @ site_inv_r).clone()
-        target_world_tool_l = (target_pose_env_site_l @ site_inv_l).clone()
+        target_pose_env_site = _build_site_goal(ctrl_site_env, args_cli, env_device)
+        site_inv = torch.linalg.inv(site_from_curobo)
+        target_world_tool = (target_pose_env_site @ site_inv).clone()
 
         # Configure retiming (see flag description): deg->rad step size; None disables retiming
         step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
 
-        # Plan sequentially (both arms active in collisions)
-        print(f"[PlanHumanoid] RIGHT: inactive collision links = {len(planner_right._inactive_collision_links())}")
-        print("[PlanHumanoid] Planning RIGHT arm...")
-        ok_r = _plan_motion(planner_right, target_world_tool_r, step_size)
-        if not ok_r:
-            print("Planning failed for right arm.")
+        # Plan
+        ok = _plan_motion(planner, target_world_tool, step_size)
+        if not ok:
+            print("Planning failed.")
             return
-        print(f"[PlanHumanoid] RIGHT planned waypoints: {len(planner_right.get_planned_poses())}")
 
-        print(f"[PlanHumanoid] LEFT: inactive collision links = {len(planner_left._inactive_collision_links())}")
-        print("[PlanHumanoid] Planning LEFT arm...")
-        ok_l = _plan_motion(planner_left, target_world_tool_l, step_size)
-        if not ok_l:
-            print("Planning failed for left arm.")
-            return
-        print(f"[PlanHumanoid] LEFT planned waypoints: {len(planner_left.get_planned_poses())}")
-
-        # If requested, append return-to-start for both arms by reversing their plans
         if args_cli.back_forth:
-            print("[PlanHumanoid] Appending return-to-start segment for both arms (back_forth enabled)")
-            _append_return_to_start(planner_right)
-            _append_return_to_start(planner_left)
-            print(f"[PlanHumanoid] RIGHT total waypoints (forward+back): {len(planner_right.current_plan.position)}")
-            print(f"[PlanHumanoid] LEFT total waypoints (forward+back): {len(planner_left.current_plan.position)}")
+            print("[PlanHumanoid] Appending return-to-start segment (back_forth enabled)")
+            _append_return_to_start(planner)
 
-        # Visualize goals and current EE frames for both arms
-        ee_vis_r, ee_vis_l = _visualize_goals_bimanual(args_cli, target_pose_env_site_r, target_pose_env_site_l, env)
+        # Diagnostics only for forward goal when not back-forth
+        if not args_cli.back_forth:
+            _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, env)
 
-        # Collision-aware retiming (optional)
-        retime_sched = None
-        if args_cli.collision_aware:
-            # Prefer joint-level collision detection across both arms
-            colliding_pairs = _compute_colliding_pairs_joint(
-                planner_right, planner_left
-            )  # _compute_colliding_pairs_joint_singlecall(planner_right, planner_left, robot_yaml_both)
-            # if not colliding_pairs:
-            #     # Fallback to EE proximity if joint-level yields none
-            #     print("[PlanHumanoid] No colliding joint waypoint pairs detected")
-            #     colliding_pairs = _compute_colliding_pairs_ee(
-            #         planner_right.get_planned_poses(),
-            #         planner_left.get_planned_poses(),
-            #         T_world_base_r,
-            #         threshold=float(args_cli.collision_distance),
-            #         device=env_device,
-            #     )
-            if colliding_pairs:
-                print(f"[PlanHumanoid] Colliding pairs (joint-level preferred): {len(colliding_pairs)}")
-                retime_sched = _build_retimed_schedules(
-                    len(planner_right.get_planned_poses()),
-                    len(planner_left.get_planned_poses()),
-                    colliding_pairs,
-                    min_dt=0.05,
-                )
-                if retime_sched is None:
-                    print(
-                        "[PlanHumanoid] Retimer infeasible after relaxations; proceeding without collision-aware"
-                        " retime."
-                    )
-            else:
-                print("[PlanHumanoid] No colliding waypoint pairs detected")
+        # Visualize goal and current EE pose
+        ee_pose_visualizer = _visualize_goal(args_cli, target_pose_env_site, env, eef_name)
 
-        # Execute both together in one trial (with optional retime)
-        _execute_plans_together(
-            env,
-            robot,
-            planner_right,
-            planner_left,
-            env_origin_r,
-            site_from_curobo_r,
-            site_from_curobo_l,
-            args_cli,
-            ee_vis_r=ee_vis_r,
-            ee_vis_l=ee_vis_l,
-            retime_schedules=retime_sched,
-        )
-        return
+        # Execute
+        _execute_plan(env, robot, planner, env_origin, site_from_curobo, eef_name, args_cli, ee_pose_visualizer)
 
-    # Single-arm path (unchanged)
-    env, robot, planner = _build_env_and_planner(args_cli)
-
-    # Frames and calibration
-    eef_name = args_cli.arm  # "left" or "right"
-    env_origin, ctrl_site_env, T_world_base, T_world_tool_now, site_from_curobo = _compute_world_and_site_frames(
-        env, robot, planner, eef_name
-    )
-
-    # Build goal in site/world and convert to tool/world
-    env_device = cast(Any, env).device
-    target_pose_env_site = _build_site_goal(ctrl_site_env, args_cli, env_device)
-    site_inv = torch.linalg.inv(site_from_curobo)
-    target_world_tool = (target_pose_env_site @ site_inv).clone()
-
-    # Configure retiming (see flag description): deg->rad step size; None disables retiming
-    step_size = np.deg2rad(args_cli.retime_deg) if args_cli.retime_deg > 0 else None
-
-    # Plan
-    ok = _plan_motion(planner, target_world_tool, step_size)
-    if not ok:
-        print("Planning failed.")
-        return
-
-    if args_cli.back_forth:
-        print("[PlanHumanoid] Appending return-to-start segment (back_forth enabled)")
-        _append_return_to_start(planner)
-
-    # Diagnostics only for forward goal when not back-forth
-    if not args_cli.back_forth:
-        _diagnostics(planner, T_world_base, site_from_curobo, target_pose_env_site, env)
-
-    # Visualize goal and current EE pose
-    ee_pose_visualizer = _visualize_goal(args_cli, target_pose_env_site, env, eef_name)
-
-    # Execute
-    _execute_plan(env, robot, planner, env_origin, site_from_curobo, eef_name, args_cli, ee_pose_visualizer)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[PlanHumanoid] Error: {e}")
+        raise e
 
 
 if __name__ == "__main__":
