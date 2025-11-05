@@ -17,6 +17,9 @@ from __future__ import annotations
 import logging
 import torch
 from typing import Any
+from collections import deque
+import os
+import re
 
 from curobo.rollout.rollout_base import Goal
 from curobo.types.base import TensorDeviceType
@@ -24,7 +27,7 @@ from curobo.types.math import Pose
 from curobo.types.state import JointState
 from curobo.util.logger import setup_curobo_logger
 from curobo.util.usd_helper import UsdHelper
-from curobo.wrap.reacher.mpc import MpcSolver, MpcSolverConfig
+from curobo.wrap.reacher.mpc import MpcSolver, MpcSolverConfig, DiffusionMpcSolver
 
 import isaaclab.utils.math as PoseUtils
 from isaaclab.assets import Articulation
@@ -87,26 +90,64 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # and initialize the solver with that; dynamic objects are updated each step.
         # Build MPC solver once, using world config from planner cfg (will be replaced with USD scene next)
         initial_world_cfg = self.config.get_world_config()
-        mpc_config: MpcSolverConfig = MpcSolverConfig.load_from_robot_config(
-            robot_cfg=self.config.robot_config_file,
-            world_model=initial_world_cfg,
-            tensor_args=self.tensor_args,
-            compute_metrics=True,
-            use_cuda_graph=True,
-            self_collision_check=True,
-            collision_checker_type=self.config.collision_checker_type,
-            store_rollouts=True,
-            collision_cache=self.config.collision_cache_size,
-            collision_activation_distance=self.config.collision_activation_distance,
-            step_dt=self.config.interpolation_dt,
-            use_mppi=not bool(self.config.mpc_use_imppi),
-            use_imppi=bool(self.config.mpc_use_imppi),
-            imppi_target_kl=float(self.config.imppi_target_kl),
-            imppi_reuse_prev_iter=bool(self.config.imppi_reuse_prev_iter),
-            imppi_max_backtracks=int(self.config.imppi_max_backtracks),
-            imppi_backtrack_coeff=float(self.config.imppi_backtrack_coeff),
-        )
-        self.mpc: MpcSolver = MpcSolver(mpc_config)
+        if bool(getattr(self.config, "mpc_use_diffusion", False)):
+            self.logger.info("MPC: Using diffusion-guided MPPI")
+            self.mpc = DiffusionMpcSolver.create_from_robot_config(
+                robot_cfg=self.config.robot_config_file,
+                world_model=initial_world_cfg,
+                tensor_args=self.tensor_args,
+                compute_metrics=True,
+                self_collision_check=True,
+                collision_checker_type=self.config.collision_checker_type,
+                store_rollouts=True,
+                collision_cache=self.config.collision_cache_size,
+                collision_activation_distance=self.config.collision_activation_distance,
+                step_dt=self.config.interpolation_dt,
+                diffusion_ckpt_path=getattr(self.config, "diffusion_ckpt_path", None),
+                diffusion_alpha=float(getattr(self.config, "diffusion_alpha", 1.0)),
+            )
+        else:
+            mpc_config: MpcSolverConfig = MpcSolverConfig.load_from_robot_config(
+                robot_cfg=self.config.robot_config_file,
+                world_model=initial_world_cfg,
+                tensor_args=self.tensor_args,
+                compute_metrics=True,
+                use_cuda_graph=True,
+                self_collision_check=True,
+                collision_checker_type=self.config.collision_checker_type,
+                store_rollouts=True,
+                collision_cache=self.config.collision_cache_size,
+                collision_activation_distance=self.config.collision_activation_distance,
+                step_dt=self.config.interpolation_dt,
+                use_mppi=not bool(self.config.mpc_use_imppi),
+                use_imppi=bool(self.config.mpc_use_imppi),
+                imppi_target_kl=float(self.config.imppi_target_kl),
+                imppi_reuse_prev_iter=bool(self.config.imppi_reuse_prev_iter),
+                imppi_max_backtracks=int(self.config.imppi_max_backtracks),
+                imppi_backtrack_coeff=float(self.config.imppi_backtrack_coeff),
+            )
+            self.mpc = MpcSolver(mpc_config)
+
+        # Initialize diffusion prior (if enabled) before attaching to solver
+        self._diff_prior = None
+        if bool(getattr(self.config, "mpc_use_diffusion", False)):
+            try:
+                self._init_diffusion_prior()
+            except Exception:
+                self.logger.warning("Diffusion prior initialization failed; proceeding without it")
+            # Report optimizer type
+            try:
+                opt_cls = type(self.mpc.solver.optimizers[0]).__name__
+                self.logger.info(f"MPC optimizer: {opt_cls}")
+            except Exception:
+                pass
+
+        # If diffusion MPPI, connect a prior sampler
+        if isinstance(self.mpc, DiffusionMpcSolver) and self._diff_prior is not None:
+            try:
+                self.mpc.set_prior_sampler(self._diff_prior.sample_prior_batched)
+            except Exception:
+                self.logger.warning("Failed to attach diffusion prior sampler; using zero prior")
 
         # Prepare USD helper and initialize static world from the current stage
         self.usd_helper: UsdHelper = UsdHelper()
@@ -140,6 +181,8 @@ class CuroboMPCPlanner(MotionPlannerBase):
         self._debug_draw_iface = None
         self._draw_log_counter: int = 0
 
+        # (moved diffusion prior initialization above)
+
     # =============================
     # Device utilities
     # =============================
@@ -172,6 +215,160 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # Initialize solver world
         # (Note: this loads the collision model the first time; we will incrementally update poses later.)
         _ = self.mpc.update_world(self._static_world_config)
+
+    # =============================
+    # Diffusion prior integration
+    # =============================
+    def _init_diffusion_prior(self) -> None:
+        try:
+            import robomimic.utils.file_utils as _RM_FileUtils
+            import robomimic.utils.tensor_utils as _RM_TensorUtils
+        except Exception as e:
+            self.logger.warning(f"Robomimic not available for diffusion prior: {e}")
+            return
+
+        device = torch.device(self.tensor_args.device)
+        ckpt_path = getattr(self.config, "diffusion_ckpt_path", None)
+        if ckpt_path is None or not os.path.isfile(str(ckpt_path)):
+            # Auto-discover a checkpoint from logs/robomimic
+            base = os.path.join(os.getcwd(), "logs", "robomimic")
+            best_path = None
+            best_epoch = -1
+            for root, _dirs, files in os.walk(base):
+                for f in files:
+                    if f.startswith("model_epoch_") and f.endswith(".pth"):
+                        m = re.search(r"model_epoch_(\\d+)\\.pth", f)
+                        if m:
+                            ep = int(m.group(1))
+                            if ep > best_epoch:
+                                best_epoch = ep
+                                best_path = os.path.join(root, f)
+            ckpt_path = best_path
+        if ckpt_path is None:
+            self.logger.warning("No diffusion checkpoint found; using zero prior")
+            return
+
+        policy, _ = _RM_FileUtils.policy_from_checkpoint(ckpt_path=str(ckpt_path), device=device)
+
+        class _DiffusionPolicyPrior:
+            def __init__(self, policy, device, logger, mppi_h, d_action):
+                self.policy = policy
+                self.device = device
+                self.logger = logger
+                self.mppi_h = int(mppi_h)
+                self.d_action = int(d_action)
+                # horizons
+                try:
+                    self.To = int(policy.policy.global_config.algo.horizon.observation_horizon)
+                    self.Ta = int(policy.policy.global_config.algo.horizon.action_horizon)
+                    self.Tp = int(policy.policy.global_config.algo.horizon.prediction_horizon)
+                except Exception:
+                    self.To = 2
+                    self.Ta = self.mppi_h
+                    self.Tp = max(self.Ta, self.mppi_h)
+                # obs shapes and keys
+                try:
+                    self.obs_shapes = dict(policy.policy.obs_shapes)
+                    self.obs_keys = list(self.obs_shapes.keys())
+                except Exception:
+                    self.obs_shapes = {"eef_pos": (3,), "eef_quat": (4,), "gripper_pos": (1,), "object": (4,)}
+                    self.obs_keys = list(self.obs_shapes.keys())
+                self.buffers = {k: deque(maxlen=self.To) for k in self.obs_keys}
+
+            def prime(self, obs_policy_dict):
+                for k in self.buffers:
+                    if k in obs_policy_dict:
+                        v = torch.as_tensor(obs_policy_dict[k]).detach().to(self.device)
+                    else:
+                        shape = self.obs_shapes.get(k, None)
+                        if shape is None:
+                            continue
+                        v = torch.zeros(shape, device=self.device, dtype=torch.float32)
+                    self.buffers[k].clear()
+                    for _ in range(self.To):
+                        self.buffers[k].append(v)
+
+            def update_from_env_obs(self, obs_policy_dict):
+                for k in self.buffers:
+                    if k in obs_policy_dict:
+                        v = torch.as_tensor(obs_policy_dict[k]).detach().to(self.device)
+                    else:
+                        # If missing, reuse last value if available, otherwise zeros
+                        if len(self.buffers[k]) > 0:
+                            v = self.buffers[k][-1]
+                        else:
+                            shape = self.obs_shapes.get(k, None)
+                            if shape is None:
+                                continue
+                            v = torch.zeros(shape, device=self.device, dtype=torch.float32)
+                    self.buffers[k].append(v)
+
+            def _build_obs_bt(self):
+                obs_bt = {}
+                for k, dq in self.buffers.items():
+                    if len(dq) == 0:
+                        # backfill zeros if empty
+                        shape = self.obs_shapes.get(k, None)
+                        if shape is None:
+                            continue
+                        zeros = torch.zeros(shape, device=self.device, dtype=torch.float32)
+                        for _ in range(self.To):
+                            dq.append(zeros)
+                    frames = [torch.as_tensor(x).detach().to(self.device).squeeze(0) for x in list(dq)]
+                    stacked = torch.stack(frames, dim=0)
+                    obs_bt[k] = stacked.unsqueeze(0)
+                return obs_bt
+
+            def _sample_sequence_once(self):
+                obs_bt = self._build_obs_bt()
+                m = self.policy.policy
+                nets = m.ema.averaged_model if m.ema is not None else m.nets
+                inputs = {"obs": self.policy._prepare_observation(obs_bt, batched_ob=True), "goal": None}
+                for k in m.obs_shapes:
+                    if inputs["obs"][k].ndim - 1 == len(m.obs_shapes[k]):
+                        inputs["obs"][k] = inputs["obs"][k].unsqueeze(1)
+                obs_features = _RM_TensorUtils.time_distributed(inputs, nets["policy"]["obs_encoder"], inputs_as_kwargs=True)
+                obs_cond = obs_features.flatten(start_dim=1)
+                naction = torch.randn((1, self.Tp, m.ac_dim), device=self.device)
+                # Prefer DDIM with 10 steps for speed
+                try:
+                    m.algo_config.ddpm.enabled = False
+                    m.algo_config.ddim.enabled = True
+                    m.algo_config.ddim.num_inference_timesteps = 30
+                except Exception:
+                    pass
+                m.noise_scheduler.set_timesteps(10)
+                for k in m.noise_scheduler.timesteps:
+                    noise_pred = nets["policy"]["noise_pred_net"](sample=naction, timestep=k, global_cond=obs_cond)
+                    naction = m.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
+                start = max(0, self.To - 1)
+                end = start + self.Ta
+                action = naction[:, start:end]
+                return action[0]  # [Ta, ac_dim]
+
+            def sample_prior_batched(self, batch_size: int) -> torch.Tensor:
+                try:
+                    seq = self._sample_sequence_once()  # [Ta, ac_dim]
+                except Exception as e:
+                    self.logger.warning(f"Diffusion prior inference failed: {e}")
+                    seq = torch.zeros((self.Ta, self.d_action), device=self.device, dtype=torch.float32)
+                # Match d_action
+                ac_dim = seq.shape[-1]
+                if ac_dim > self.d_action:
+                    seq = seq[..., : self.d_action]
+                elif ac_dim < self.d_action:
+                    pad = torch.zeros((seq.shape[0], self.d_action - ac_dim), device=self.device, dtype=seq.dtype)
+                    seq = torch.cat([seq, pad], dim=-1)
+                # Match horizon to MPPI
+                if seq.shape[0] > self.mppi_h:
+                    seq = seq[: self.mppi_h, :]
+                elif seq.shape[0] < self.mppi_h:
+                    pad_t = torch.zeros((self.mppi_h - seq.shape[0], seq.shape[1]), device=self.device, dtype=seq.dtype)
+                    seq = torch.cat([seq, pad_t], dim=0)
+                seq = seq.unsqueeze(0).expand(int(batch_size), -1, -1).contiguous()
+                return seq.to(dtype=self.policy.policy.tensor_args.dtype if hasattr(self.policy.policy, "tensor_args") else torch.float32)
+
+        self._diff_prior = _DiffusionPolicyPrior(policy, device, self.logger, self.mpc.rollout_fn.action_horizon, self.mpc.rollout_fn.d_action)
 
     def update_world(self) -> None:
         # Establish validation baseline on first call, validate on subsequent calls
@@ -672,9 +869,33 @@ class CuroboMPCPlanner(MotionPlannerBase):
         # World sync and one MPC step
         self.update_world()
 
+        # Update diffusion prior observation buffers
+        try:
+            if self._diff_prior is not None:
+                env_obs = self.env.get_observations()
+                if isinstance(env_obs, dict) and "policy" in env_obs:
+                    obs_policy = env_obs["policy"]
+                else:
+                    obs_policy = env_obs if isinstance(env_obs, dict) else {}
+                if len(self._diff_prior.buffers) and all(len(v) == 0 for v in self._diff_prior.buffers.values()):
+                    self._diff_prior.prime(obs_policy)
+                else:
+                    self._diff_prior.update_from_env_obs(obs_policy)
+        except Exception:
+            pass
+
         current_js = self._get_current_joint_state_for_curobo()
         self.logger.debug("Running MPC step ...")
         result = self.mpc.step(current_js, max_attempts=2)
+        # Diffusion prior debug: print once per step
+        try:
+            if isinstance(self.mpc, DiffusionMpcSolver):
+                used, shape, norm = self.mpc.get_last_prior_stats()
+                self.logger.debug(
+                    f"Diff prior used={used} shape={shape} norm={norm:.4f}"
+                )
+        except Exception:
+            pass
         self.logger.debug("MPC step complete; attempting rollout draw")
         # Draw MPPI rollouts if enabled
         self._draw_mpc_rollouts()

@@ -52,6 +52,18 @@ parser.add_argument(
     help="use MPC (reactive planning) instead of trajectory planning when used with --use_skillgen",
 )
 parser.add_argument(
+    "--use_mpc_diffusion",
+    action="store_true",
+    default=False,
+    help="use diffusion-guided MPPI instead of vanilla MPPI (only with --use_mpc)",
+)
+parser.add_argument(
+    "--diffusion_ckpt",
+    type=str,
+    default=None,
+    help="Optional path to diffusion policy checkpoint to guide MPPI",
+)
+parser.add_argument(
     "--z_offset",
     type=float,
     default=0.0,
@@ -67,6 +79,9 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+# If diffusion-guided MPC is requested, ensure MPC path is enabled
+if hasattr(args_cli, "use_mpc_diffusion") and args_cli.use_mpc_diffusion:
+    args_cli.use_mpc = True
 
 if args_cli.enable_pinocchio:
     # Import pinocchio before AppLauncher to force the use of the version installed by IsaacLab and not the one installed by Isaac Sim
@@ -106,7 +121,7 @@ def main():
     # Validate arguments
     if args_cli.use_mpc and not args_cli.use_skillgen:
         raise ValueError("--use_mpc can only be used with --use_skillgen")
-    if args_cli.joint_state_control and not args_cli.use_mpc:
+    if args_cli.joint_state_control and not (args_cli.use_mpc or args_cli.use_mpc_diffusion):
         raise ValueError("--joint_state_control can only be used with --use_mpc")
 
     # Setup output paths and get env name
@@ -125,6 +140,13 @@ def main():
         device=args_cli.device,
         generation_num_trials=args_cli.generation_num_trials,
     )
+
+    # For diffusion-guided MPC we need structured obs dict (not concatenated)
+    try:
+        if args_cli.use_mpc_diffusion and hasattr(env_cfg, "observations") and hasattr(env_cfg.observations, "policy"):
+            env_cfg.observations.policy.concatenate_terms = False
+    except Exception:
+        pass
 
     # Create environment
     env = gym.make(env_name, cfg=env_cfg).unwrapped
@@ -179,6 +201,11 @@ def main():
                 planner_config.position_threshold = 0.02  # 20mm instead of 5mm
                 planner_config.rotation_threshold = 0.1   # 0.1 rad instead of 0.05 rad
                 planner_config.max_mpc_steps = 500       # Limit MPC steps for faster execution
+
+                # Diffusion-guided MPPI selection
+                planner_config.mpc_use_diffusion = bool(args_cli.use_mpc_diffusion)
+                if args_cli.diffusion_ckpt is not None:
+                    planner_config.diffusion_ckpt_path = args_cli.diffusion_ckpt
 
                 motion_planners[env_id] = CuroboMPCPlanner(
                     env=env,

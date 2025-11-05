@@ -171,6 +171,27 @@ class CuroboPlannerCfg:
     mpc_use_imppi: bool = False
     """Use IMPPI optimizer instead of MPPI in MPC."""
 
+    # Diffusion-guided MPPI
+    mpc_use_diffusion: bool = False
+    """Use diffusion prior to seed MPPI at each step."""
+
+    diffusion_ckpt_path: str | None = \
+        "/home/njawale/IsaacLab/logs/robomimic/Isaac-Stack-Cube-Franka-IK-Rel-Skillgen-v0/" \
+        "diffusion_policy_low_dim_franka_stack/20251029161520/models/model_epoch_500.pth"
+    """Path to diffusion policy checkpoint (optional). When None, planner may select a default from logs/robomimic."""
+
+    diffusion_alpha: float = 1.0
+    """Blend factor for diffusion prior seed (0..1). Currently the seed is set directly; reserved for future use."""
+
+    # Diffusion-MPPI exposed tuning (optional)
+    mpc_diff_model_horizon: int | None = None
+    mpc_diff_num_particles: int | None = None
+    mpc_diff_init_cov: float | None = None
+    mpc_diff_step_size_mean: float | None = None
+    mpc_diff_step_size_cov: float | None = None
+    mpc_diff_activation_distance: float | None = None
+    mpc_diff_ic_scale: float | None = None
+
     imppi_target_kl: float = 0.03
     """Target KL threshold per iteration for distribution update."""
 
