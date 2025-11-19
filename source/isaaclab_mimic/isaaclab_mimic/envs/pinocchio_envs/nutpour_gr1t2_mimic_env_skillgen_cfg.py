@@ -3,7 +3,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
+from isaaclab.envs.mimic_env_cfg import (
+    MimicEnvCfg,
+    SubTaskConfig,
+    SubTaskConstraintConfig,
+    SubTaskConstraintType,
+)
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_tasks.manager_based.manipulation.pick_place.nutpour_gr1t2_pink_ik_env_cfg import NutPourGR1T2PinkIKEnvCfg
@@ -15,6 +20,10 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
     def __post_init__(self):
         # Calling post init of parents
         super().__post_init__()
+        from isaaclab.envs.common import ViewerCfg
+        self.viewer = ViewerCfg(
+            eye=(0.0, 2.0, 2.0), lookat=(0.0, 0.0, 0.2), origin_type="asset_body", asset_name="robot", body_name="base_link"
+        )
 
         # Enable SkillGen to consume start boundaries and plan transitions
         self.datagen_config.use_skillgen = True
@@ -157,3 +166,13 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
             )
         )
         self.subtask_configs["left"] = subtask_configs
+
+        # with a buffer near the end of the latter's trajectory.
+        # This mirrors TwoArmPouringHumanoid_SG1_Config: temporal_before((left, pour), (right, grasp)).
+        self.task_constraint_configs.append(
+            SubTaskConstraintConfig(
+                eef_subtask_constraint_tuple=[("left", 1), ("right", 1)],
+                constraint_type=SubTaskConstraintType.SEQUENTIAL,
+                sequential_min_time_diff=40,
+            )
+        )

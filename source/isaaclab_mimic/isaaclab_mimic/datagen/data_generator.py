@@ -618,6 +618,60 @@ class DataGenerator:
         # Return the generated trajectory
         return traj_to_execute.get_full_sequence().sequence
 
+    def _get_mp_gripper_actions_from_source_demo(
+        self,
+        eef_name: str,
+        subtask_ind: int,
+        selected_demo_ind: int,
+        num_waypoints: int,
+        randomized_subtask_boundaries: dict[str, np.ndarray],
+    ) -> torch.Tensor:
+        """
+        Compute gripper actions for motion-planned waypoints by replaying the source
+        demo gripper pattern between the previous subtask end and the current subtask
+        start (similar to DexMimicGen's `source_demo` scheme).
+
+        This keeps the motion-planning segment's gripper evolution consistent with the
+        original demonstration and prevents subtask-specific gripper changes (e.g.,
+        grasp / release) from being executed during transit.
+        """
+        # Subtask bounds for this end-effector and demo: use ORIGINAL (non-randomized)
+        # boundaries from the datagen info pool, to mirror DexMimicGen behavior.
+        # Shape [S, 2] after conversion from list[tuple[int, int]].
+        orig_bounds_list = self.src_demo_datagen_info_pool.subtask_boundaries[eef_name][selected_demo_ind]
+        subtask_bounds = np.array(orig_bounds_list, dtype=int)
+        current_start = int(subtask_bounds[subtask_ind, 0])
+        if subtask_ind > 0:
+            prev_end = int(subtask_bounds[subtask_ind - 1, 1])
+        else:
+            prev_end = 0
+
+        src_ep_datagen_info = self.src_demo_datagen_info_pool.datagen_infos[selected_demo_ind]
+        # Gripper actions between previous subtask end and current subtask start (inclusive)
+        src_actions = src_ep_datagen_info.gripper_action[eef_name][prev_end : current_start + 1]
+
+        # Fallback: no in-between segment — hold the skill start value
+        if src_actions.shape[0] == 0:
+            target_val = src_ep_datagen_info.gripper_action[eef_name][current_start]
+            return target_val.unsqueeze(0).repeat(num_waypoints, 1)
+
+        L = src_actions.shape[0]
+        if L == 1:
+            return src_actions.repeat(num_waypoints, 1)
+
+        device = src_actions.device
+        # Normalize source timesteps to [0, 1]
+        source_timesteps = torch.linspace(0.0, 1.0, L, device=device)
+        target_timesteps = torch.linspace(0.0, 1.0, num_waypoints, device=device)
+
+        interpolated = []
+        current_idx = 0
+        for t in target_timesteps:
+            while (current_idx < L - 1) and (source_timesteps[current_idx] < t):
+                current_idx += 1
+            interpolated.append(src_actions[current_idx])
+        return torch.stack(interpolated, dim=0)
+
     async def generate(  # noqa: C901
         self,
         env_id: int,
@@ -652,6 +706,7 @@ class DataGenerator:
                 src_demo_labels (np.array): same as @src_demo_inds, but repeated to have a label for each timestep of the trajectory
         """
         # With skillgen, a motion planner is required to generate collision-free transitions between subtasks.
+        # import pdb; pdb.set_trace()
         if self.env_cfg.datagen_config.use_skillgen and motion_planner is None:
             raise ValueError("motion_planner must be provided if use_skillgen is True")
 
@@ -707,6 +762,26 @@ class DataGenerator:
                 # Generate trajectory for a subtask for the eef that is currently at the beginning of a subtask
                 for eef_name, eef_subtask_step_index in current_eef_subtask_step_indices.items():
                     if eef_subtask_step_index is None:
+                        # next_subtask_ind = current_eef_subtask_indices[eef_name]
+
+                        # # Check if there is a sequential constraint that needs to be fulfilled
+                        # should_wait_for_constraint = False
+                        # if (eef_name, next_subtask_ind) in runtime_subtask_constraints_dict:
+                        #     task_constraint = runtime_subtask_constraints_dict[(eef_name, next_subtask_ind)]
+                        #     if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER:
+                        #         min_time_diff = task_constraint["min_time_diff"]
+                        #         if not task_constraint["fulfilled"]:
+                        #             should_wait_for_constraint = True
+                        
+                        # # If we need to wait for a constraint, we need to add a hold trajectory to the current eef
+                        # if should_wait_for_constraint:
+                        #     # if len(current_eef_subtask_trajectories[eef_name]) > 0:
+                        #     #     current_eef_subtask_trajectories[eef_name].append(
+                        #     #         current_eef_subtask_trajectories[eef_name][-1]
+                        #     #     )
+                        #     #     current_eef_subtask_step_indices[eef_name] = len(current_eef_subtask_trajectories[eef_name]) - 1
+                        #     continue
+
                         # Trajectory stored in current_eef_subtask_trajectories[eef_name] has been executed,
                         # So we need to determine the next trajectory
                         # Note: This condition is the "resume-after-motion-plan" gate for skillgen. When
@@ -728,6 +803,13 @@ class DataGenerator:
                             if self.env_cfg.datagen_config.use_skillgen:
                                 # Define the goal for the motion planner: the start of the next subtask.
                                 target_eef_pose = eef_subtask_trajectory[0].pose
+                                # IMPORTANT:
+                                # For the transit motion, we want to avoid executing any of the upcoming
+                                # skill's gripper pattern (e.g., grasp / release) inside the motion-planning
+                                # segment. To ensure this, we keep the gripper fixed at the value that will
+                                # be used at the *start* of the skill segment itself (i.e., the first
+                                # subtask waypoint's gripper value). The full grasp / release pattern then
+                                # only appears when we execute the skill waypoints, never during transit.
                                 target_gripper_action = eef_subtask_trajectory[0].gripper_action
 
                                 # Determine expected object attachment using environment-specific logic (optional)
@@ -739,59 +821,63 @@ class DataGenerator:
 
                                 # If the target is effectively current, skip planning and execute directly
                                 if motion_planner:
-                                    try:
-                                        cur_site_pose = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])[0]
-                                        dpos = torch.linalg.vector_norm(cur_site_pose[:3, 3] - target_eef_pose[:3, 3])
-                                        drot_mat = cur_site_pose[:3, :3].T @ target_eef_pose[:3, :3]
-                                        drot = torch.acos(torch.clamp((torch.trace(drot_mat) - 1.0) / 2.0, -1.0, 1.0))
-                                    except Exception:
-                                        dpos = torch.tensor(float("inf"), device=self.env.device)
-                                        drot = torch.tensor(float("inf"), device=self.env.device)
+                                    # try:
+                                    #     cur_site_pose = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])[0]
+                                    #     dpos = torch.linalg.vector_norm(cur_site_pose[:3, 3] - target_eef_pose[:3, 3])
+                                    #     drot_mat = cur_site_pose[:3, :3].T @ target_eef_pose[:3, :3]
+                                    #     drot = torch.acos(torch.clamp((torch.trace(drot_mat) - 1.0) / 2.0, -1.0, 1.0))
+                                    # except Exception:
+                                    #     dpos = torch.tensor(float("inf"), device=self.env.device)
+                                    #     drot = torch.tensor(float("inf"), device=self.env.device)
 
-                                    # Thresholds: 1 cm and ~5.7 degrees
-                                    if float(dpos.item()) < 0.01 and float(drot.item()) < 0.1:
-                                        # Treat as no-op transition: resume subtask directly with interpolation
-                                        current_eef_subtask_trajectories[eef_name] = self.merge_eef_subtask_trajectory(
-                                            env_id,
-                                            eef_name,
-                                            current_eef_subtask_indices[eef_name],
-                                            current_eef_subtask_trajectories[eef_name],
-                                            eef_subtask_trajectory,
-                                        )
-                                        current_eef_subtask_step_indices[eef_name] = 0
-                                        # While this arm moves, hold the other arm(s) steady (bimanual mode only)
-                                        if self.skillgen_type == "bimanual":
-                                            planned_len = len(current_eef_subtask_trajectories[eef_name])
-                                            for other_eef in self.env_cfg.subtask_configs.keys():
-                                                if other_eef == eef_name:
-                                                    continue
-                                                # Backup current trajectory/state to restore after transition
-                                                paused_eef_traj[other_eef] = current_eef_subtask_trajectories[other_eef]
-                                                paused_eef_step_idx[other_eef] = current_eef_subtask_step_indices[
-                                                    other_eef
-                                                ]
-
-                                                # Build constant hold trajectory for the other arm
-                                                hold_pose = self.env.get_robot_eef_pose(other_eef, env_ids=[env_id])[0]
-                                                ga = None
-                                                try:
-                                                    si = paused_eef_step_idx[other_eef]
-                                                    if si is not None and si < len(paused_eef_traj[other_eef]):
-                                                        ga = paused_eef_traj[other_eef][si].gripper_action
-                                                except Exception:
-                                                    ga = None
-                                                if ga is None:
-                                                    ga = target_gripper_action
-                                                hold_seq = [
-                                                    Waypoint(pose=hold_pose, gripper_action=ga, noise=0.0)
-                                                    for _ in range(planned_len)
-                                                ]
-                                                current_eef_subtask_trajectories[other_eef] = hold_seq
-                                                current_eef_subtask_step_indices[other_eef] = 0
-                                        continue
+                                    # # Thresholds: 1 cm and ~5.7 degrees
+                                    # if float(dpos.item()) < 0.01 and float(drot.item()) < 0.1:
+                                    #     # Treat as no-op transition: resume subtask directly with interpolation
+                                    #     current_eef_subtask_trajectories[eef_name] = self.merge_eef_subtask_trajectory(
+                                    #         env_id,
+                                    #         eef_name,
+                                    #         current_eef_subtask_indices[eef_name],
+                                    #         current_eef_subtask_trajectories[eef_name],
+                                    #         eef_subtask_trajectory,
+                                    #     )
+                                    #     current_eef_subtask_step_indices[eef_name] = 0
+                                        # NOTE: Previously, we injected a constant "hold" trajectory for the
+                                        # non-transitioning arm(s) during bimanual no-op transitions. This was
+                                        # causing premature freezing and jitter around boundaries. The block
+                                        # below has been intentionally disabled to allow other arms to continue
+                                        # coasting under constraint bounds instead of being forcibly held.
+                                        # if self.skillgen_type == "bimanual":
+                                        #     planned_len = len(current_eef_subtask_trajectories[eef_name])
+                                        #     for other_eef in self.env_cfg.subtask_configs.keys():
+                                        #         if other_eef == eef_name:
+                                        #             continue
+                                        #         # Backup current trajectory/state to restore after transition
+                                        #         paused_eef_traj[other_eef] = current_eef_subtask_trajectories[other_eef]
+                                        #         paused_eef_step_idx[other_eef] = current_eef_subtask_step_indices[
+                                        #             other_eef
+                                        #         ]
+                                        #
+                                        #         # Build constant hold trajectory for the other arm
+                                        #         hold_pose = self.env.get_robot_eef_pose(other_eef, env_ids=[env_id])[0]
+                                        #         ga = None
+                                        #         try:
+                                        #             si = paused_eef_step_idx[other_eef]
+                                        #             if si is not None and si < len(paused_eef_traj[other_eef]):
+                                        #                 ga = paused_eef_traj[other_eef][si].gripper_action
+                                        #         except Exception:
+                                        #             ga = None
+                                        #         if ga is None:
+                                        #             ga = target_gripper_action
+                                        #         hold_seq = [
+                                        #             Waypoint(pose=hold_pose, gripper_action=ga, noise=0.0)
+                                        #             for _ in range(planned_len)
+                                        #         ]
+                                        #         current_eef_subtask_trajectories[other_eef] = hold_seq
+                                        #         current_eef_subtask_step_indices[other_eef] = 0
+                                        # continue
 
                                 # Plan motion using motion planner with comprehensive world update and attachment handling
-                                if motion_planner:
+                                # if motion_planner:
                                     print(f"\n--- Environment {env_id}: Planning motion to target pose ---")
                                     print(f"Target pose: {target_eef_pose}")
                                     print(f"Expected attached object: {expected_attached_object}")
@@ -826,11 +912,28 @@ class DataGenerator:
                                         current_eef_subtask_indices[eef_name] = -1
 
                                         # Convert the planner's output into a sequence of waypoints to be executed.
-                                        current_eef_subtask_trajectories[eef_name] = (
-                                            self._convert_planned_trajectory_to_waypoints(
-                                                motion_planner, target_gripper_action
-                                            )
+                                        # We use a placeholder gripper value here and then override it using the
+                                        # source-demo "between skills" region, mirroring DexMimicGen's source_demo
+                                        # gripper scheme. This prevents any part of the skill's gripper pattern
+                                        # from being executed during the motion-planning segment.
+                                        mp_waypoints = self._convert_planned_trajectory_to_waypoints(
+                                            motion_planner, target_gripper_action
                                         )
+
+                                        selected_demo_ind = current_eef_selected_src_demo_indices[eef_name]
+                                        if selected_demo_ind is not None:
+                                            num_wp = len(mp_waypoints)
+                                            mp_gripper_actions = self._get_mp_gripper_actions_from_source_demo(
+                                                eef_name=eef_name,
+                                                subtask_ind=next_eef_subtask_indices_after_motion[eef_name],
+                                                selected_demo_ind=selected_demo_ind,
+                                                num_waypoints=num_wp,
+                                                randomized_subtask_boundaries=randomized_subtask_boundaries,
+                                            )
+                                            for wp_idx, waypoint in enumerate(mp_waypoints):
+                                                waypoint.gripper_action = mp_gripper_actions[wp_idx]
+
+                                        current_eef_subtask_trajectories[eef_name] = mp_waypoints
                                         current_eef_subtask_step_indices[eef_name] = 0
                                     else:
                                         # If planning fails, abort the data generation trial.
@@ -875,14 +978,27 @@ class DataGenerator:
                     if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER:
                         min_time_diff = task_constraint["min_time_diff"]
                         if not task_constraint["fulfilled"]:
-                            if (
-                                min_time_diff == -1
-                                or step_ind >= len(current_eef_subtask_trajectories[eef_name]) - min_time_diff
-                            ):
-                                if step_ind > 0:
-                                    # Wait at the same step
-                                    step_ind -= 1
-                                    current_eef_subtask_step_indices[eef_name] = step_ind
+                            # For sequential constraints, the "latter" subtask should pause in the last
+                            # @min_time_diff timesteps of its trajectory until the "former" subtask
+                            # has finished. When @min_time_diff is -1, the intended behavior is that
+                            # the latter subtask should not advance at all until the former has
+                            # completed. We approximate this by clamping progression to the first
+                            # waypoint (index 0) until the constraint is fulfilled.
+                            traj_len = len(current_eef_subtask_trajectories[eef_name])
+                            if min_time_diff < 0:
+                                # Hold at the very first waypoint until the precondition is met.
+                                hold_start_idx = 0
+                            else:
+                                # Start holding once we enter the last @min_time_diff steps. If
+                                # @min_time_diff exceeds the trajectory length, clamp to 0 so that
+                                # we effectively hold for the whole subtask.
+                                hold_start_idx = max(0, traj_len - min_time_diff)
+
+                            if step_ind > hold_start_idx:
+                                # Decrement the index (which will be incremented later) to stay at
+                                # this waypoint for another timestep.
+                                step_ind -= 1
+                                current_eef_subtask_step_indices[eef_name] = step_ind
 
                     elif task_constraint["type"] == SubTaskConstraintType.COORDINATION:
                         synchronous_steps = task_constraint["synchronous_steps"]
@@ -941,16 +1057,20 @@ class DataGenerator:
                 generated_actions.extend(exec_results["actions"])
                 generated_success = generated_success or exec_results["success"]
 
-            # If a motion-planned transition is active (bimanual), only advance the transitioning arm
-            transition_eef = None
-            if self.skillgen_type == "bimanual":
-                for k, v in current_eef_subtask_indices.items():
-                    if v == -1:
-                        transition_eef = k
-                        break
+            # NOTE: Previously, when a motion-planned transition was active (bimanual), we only advanced
+            # the transitioning arm and froze the other arm(s). This gating is disabled to allow other
+            # arms to continue advancing up to their constraint-imposed bounds.
+            # transition_eef = None
+            # if self.skillgen_type == "bimanual":
+            #     for k, v in current_eef_subtask_indices.items():
+            #         if v == -1:
+            #             transition_eef = k
+            #             break
 
             for eef_name in self.env_cfg.subtask_configs.keys():
-                if transition_eef is not None and eef_name != transition_eef:
+                # if transition_eef is not None and eef_name != transition_eef:
+                #     continue
+                if current_eef_subtask_step_indices[eef_name] is None:
                     continue
                 current_eef_subtask_step_indices[eef_name] += 1
                 subtask_ind = current_eef_subtask_indices[eef_name]
@@ -995,16 +1115,17 @@ class DataGenerator:
                         current_eef_subtask_step_indices[eef_name] = None
                         current_eef_subtask_indices[eef_name] += 1
 
-                    # If we just finished a transition (bimanual), restore paused arms
-                    if self.skillgen_type == "bimanual" and transition_eef == eef_name and paused_eef_traj:
-                        for other_eef, seq in paused_eef_traj.items():
-                            if other_eef == eef_name:
-                                continue
-                            current_eef_subtask_trajectories[other_eef] = seq
-                            if other_eef in paused_eef_step_idx:
-                                current_eef_subtask_step_indices[other_eef] = paused_eef_step_idx[other_eef]
-                        paused_eef_traj.clear()
-                        paused_eef_step_idx.clear()
+                    # NOTE: Restoration of paused arms after a transition depended on injected hold sequences.
+                    # Since the hold injection is disabled, this restoration is no longer needed.
+                    # if self.skillgen_type == "bimanual" and transition_eef == eef_name and paused_eef_traj:
+                    #     for other_eef, seq in paused_eef_traj.items():
+                    #         if other_eef == eef_name:
+                    #             continue
+                    #         current_eef_subtask_trajectories[other_eef] = seq
+                    #         if other_eef in paused_eef_step_idx:
+                    #             current_eef_subtask_step_indices[other_eef] = paused_eef_step_idx[other_eef]
+                    #     paused_eef_traj.clear()
+                    #     paused_eef_step_idx.clear()
             # Check if all eef_subtasks_done values are True
             if all(eef_subtasks_done.values()):
                 break
@@ -1052,11 +1173,11 @@ class DataGenerator:
 
         planned_poses = motion_planner.get_planned_poses()
 
-        # For single-arm SkillGen (Franka-style), planned poses are already in the env's expected frame
+        # For tabletop tasks, planned poses are already in the env's expected frame
         if self.skillgen_type != "bimanual":
             return [Waypoint(pose=p, gripper_action=gripper_action, noise=motion_noise_scale) for p in planned_poses]
 
-        # Bimanual humanoid: convert base->tool to site/world before wrapping as waypoints
+        # Bimanual/humanoid: convert base->tool to site/world before wrapping as waypoints
         # Determine which arm this plan corresponds to
         eef_name = None
         if hasattr(motion_planner, "_last_arm") and motion_planner._last_arm is not None:
@@ -1107,6 +1228,7 @@ class DataGenerator:
             T_tool_site = torch.linalg.solve(T_world_tool_now, ctrl_site_env).clone()
         except Exception:
             # Fallback: assume identity tool->site (may be okay if controller site == tool)
+            # TODO: Neel We need to figure this all out for humanoid
             T_tool_site = torch.eye(4, device=self.env.device, dtype=torch.float32)
 
         waypoints = []
