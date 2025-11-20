@@ -6,6 +6,7 @@
 """Sub-package with core implementation logic for Isaac Lab Mimic."""
 
 from .data_generator import *
+from .data_generator_refactored import *
 from .datagen_info import *
 from .datagen_info_pool import *
 from .generation import *

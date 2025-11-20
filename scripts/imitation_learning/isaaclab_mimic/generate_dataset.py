@@ -148,7 +148,7 @@ def main():
                 retreat_distance=0.0,
                 time_dilation_factor=0.5,
                 enable_finetune_trajopt=True,
-                collision_activation_distance=0.01,
+                collision_activation_distance=0.0,
                 motion_step_size=None,
                 visualize_spheres=False,
                 visualize_plan=True,
