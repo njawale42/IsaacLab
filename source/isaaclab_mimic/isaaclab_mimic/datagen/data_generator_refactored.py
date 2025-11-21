@@ -171,14 +171,14 @@ class EEFGenerationState:
         current_subtask_index: Index into `env_cfg.subtask_configs[eef_name]` that is
             currently being generated/executed. Set to -1 while a motion plan is active.
         current_trajectory: Waypoints (post interpolation) that are currently executing.
-        subtask_step_index: Pointer into `current_trajectory`. `None` signals “ready to
-            build the next subtask trajectory”.
+        subtask_step_index: Pointer into `current_trajectory`. `None` signals "ready to
+            build the next subtask trajectory".
         next_subtask_index_after_motion: Cached index used to resume the real skill after
             finishing a motion planner transit segment.
         next_subtask_trajectory_after_motion: Stored `WaypointTrajectory` representing the
             actual skill to resume after the motion-planned path completes.
         subtasks_done: Flag raised once the end-effector has finished its final skill; the
-            final waypoint is duplicated to keep the arm stationary during other arms’ work.
+            final waypoint is duplicated to keep the arm stationary during other arms' work.
     """
 
     current_subtask_index: int = 0
@@ -201,7 +201,7 @@ class DataGeneratorRefactored:
     collected source demonstrations.
 
     The data generator works by parsing demonstrations into object-centric subtask segments, stored in DataGenInfoPool.
-    It then adapts these subtask segments to new scenes by transforming each segment according to the new scene’s context,
+    It then adapts these subtask segments to new scenes by transforming each segment according to the new scene's context,
     stitching them into a coherent trajectory for a robotic end-effector to execute.
     """
 
@@ -1037,7 +1037,7 @@ class DataGeneratorRefactored:
         schedule.append_hold(int(getattr(self.env_cfg.datagen_config, "final_hold_steps", 0)))
 
         env_id_tensor = torch.tensor([env_id], dtype=torch.int64, device=self.env.device)
-        self.env.scene.reset_to(first_pass["initial_state"], env_ids=[env_id], is_relative=True)
+        self.env.scene.reset_to(first_pass["initial_state"], env_ids=env_id_tensor, is_relative=True)
         self.env.recorder_manager.reset(env_ids=env_id_tensor)
 
         return await self._replay_discrete_schedule(
@@ -1059,6 +1059,32 @@ class DataGeneratorRefactored:
         planner_right: Any,
     ) -> dict[str, ArmPath]:
         """Convert recorded actions and joint positions into ArmPath objects per arm."""
+        # Ensure inputs are tensors (schedule_all path can pass lists/ndarrays)
+        if not isinstance(actions_tensor, torch.Tensor):
+            # List of tensors / lists / ndarrays -> tensor
+            if isinstance(actions_tensor, list):
+                actions_tensor = torch.stack(
+                    [
+                        a if isinstance(a, torch.Tensor) else torch.as_tensor(a)
+                        for a in actions_tensor
+                    ],
+                    dim=0,
+                )
+            else:
+                actions_tensor = torch.as_tensor(actions_tensor)
+
+        if not isinstance(joint_history, torch.Tensor):
+            if isinstance(joint_history, list):
+                joint_history = torch.stack(
+                    [
+                        j if isinstance(j, torch.Tensor) else torch.as_tensor(j)
+                        for j in joint_history
+                    ],
+                    dim=0,
+                )
+            else:
+                joint_history = torch.as_tensor(joint_history)
+
         if actions_tensor.ndim == 1:
             actions_tensor = actions_tensor.unsqueeze(0)
         device = self.env.device
@@ -1638,7 +1664,7 @@ class DataGeneratorRefactored:
         """
         Append simulator outputs from the latest control tick to the shared buffers.
 
-        The environment’s `MultiWaypoint.execute` call returns a dictionary containing
+        The environment's `MultiWaypoint.execute` call returns a dictionary containing
         per-tick states/observations/actions and a success bit. This method simply
         extends the buffer lists in-place, guarding against empty batches (which can
         occur if no simulator step was required).
