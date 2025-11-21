@@ -52,6 +52,12 @@ parser.add_argument(
     default="single_arm",
     help="SkillGen mode: single_arm (default, Franka-style) or bimanual (humanoid).",
 )
+parser.add_argument(
+    "--schedule_all",
+    action="store_true",
+    default=False,
+    help="Precompute entire per-arm trajectories and run collision-aware scheduling before execution.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -111,10 +117,14 @@ def main():
     )
 
     # Ensure env cfg reflects CLI skillgen toggle so DataGenerator takes the skillgen path
-    try:
-        env_cfg.datagen_config.use_skillgen = bool(args_cli.use_skillgen)
-    except Exception:
-        pass
+    for attr_name, value in [
+        ("use_skillgen", bool(args_cli.use_skillgen)),
+        ("schedule_all", bool(args_cli.schedule_all)),
+    ]:
+        try:
+            setattr(env_cfg.datagen_config, attr_name, value)
+        except Exception:
+            pass
 
     # Precompute humanoid planner configs BEFORE creating the env (ordering matters)
     prebuilt_humanoid_cfgs = None

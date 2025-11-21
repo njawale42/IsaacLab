@@ -169,10 +169,10 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
 
         # with a buffer near the end of the latter's trajectory.
         # This mirrors TwoArmPouringHumanoid_SG1_Config: temporal_before((left, pour), (right, grasp)).
-        self.task_constraint_configs.append(
-            SubTaskConstraintConfig(
-                eef_subtask_constraint_tuple=[("left", 1), ("right", 1)],
-                constraint_type=SubTaskConstraintType.SEQUENTIAL,
-                sequential_min_time_diff=40,
-            )
-        )
+        # self.task_constraint_configs.append(
+        #     SubTaskConstraintConfig(
+        #         eef_subtask_constraint_tuple=[("left", 1), ("right", 1)],
+        #         constraint_type=SubTaskConstraintType.SEQUENTIAL,
+        #         sequential_min_time_diff=40,
+        #     )
+        # )

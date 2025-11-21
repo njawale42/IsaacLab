@@ -76,6 +76,24 @@ class DataGenConfig:
     use_skillgen: bool = False
     """Whether to use skillgen to generate motion trajectories."""
 
+    schedule_all: bool = False
+    """When True, pre-compute entire skill+planner trajectories and run collision-aware scheduling before execution."""
+
+    schedule_densify_factor: int = 4
+    """Linear densification factor when sampling joint paths for collision checks."""
+
+    schedule_pair_batch: int = 4096
+    """Batch size when evaluating cross-arm collisions in joint space."""
+
+    schedule_collision_margin: float = 0.01
+    """Extra buffer (meters) added to sphere radii during collision tests."""
+
+    schedule_min_dt: float | None = None
+    """Optional lower bound on the MILP retiming timestep. Defaults to env.step_dt when None."""
+
+    final_hold_steps: int = 10
+    """Number of ticks to hold the final command to keep the robot stationary."""
+
 
 @configclass
 class SubTaskConfig:

@@ -23,6 +23,7 @@ from isaaclab.envs import (
 from isaaclab.managers import TerminationTermCfg
 
 from isaaclab_mimic.datagen.datagen_info import DatagenInfo
+from isaaclab_mimic.datagen.scheduling import ArmPath, DiscreteSchedule, build_collision_aware_schedule
 from isaaclab_mimic.datagen.selection_strategy import make_selection_strategy
 from isaaclab_mimic.datagen.waypoint import MultiWaypoint, Waypoint, WaypointSequence, WaypointTrajectory
 
@@ -145,12 +146,15 @@ class GenerationBuffers:
         actions: Torch tensors representing the low-level actions issued at each tick.
         success: Aggregate boolean indicating whether any execution window satisfied the
             provided success termination condition.
+        joint_positions: Snapshot of the robot's joint configuration (per tick) which
+            can be post-processed into per-arm joint paths for collision-aware scheduling.
     """
 
     states: list[Any] = field(default_factory=list)
     observations: list[Any] = field(default_factory=list)
     actions: list[torch.Tensor] = field(default_factory=list)
     success: bool = False
+    joint_positions: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -209,6 +213,7 @@ class DataGeneratorRefactored:
         demo_keys: list[str] | None = None,
         *,
         skillgen_type: str = "single_arm",
+        schedule_all: bool = False,
     ):
         """
         Args:
@@ -217,12 +222,21 @@ class DataGeneratorRefactored:
             dataset_path: path to hdf5 dataset to use for generation
             demo_keys: list of demonstration keys to use in file. If not provided, all demonstration keys
                 will be used.
+            schedule_all: When True, constructs an offline schedule of all planner+skill segments prior to
+                execution and replays it with collision-aware retiming (bimanual only).
         """
         self.env = env
         self.env_cfg = env.cfg
         assert isinstance(self.env_cfg, MimicEnvCfg)
+        try:
+            self._robot_articulation = self.env.scene["robot"]
+        except (AttributeError, KeyError) as exc:
+            raise AttributeError(
+                "DataGeneratorRefactored expects the environment scene to expose a 'robot' articulation"
+            ) from exc
         self.dataset_path = dataset_path
         self.skillgen_type = skillgen_type
+        self.schedule_all = schedule_all
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -760,6 +774,62 @@ class DataGeneratorRefactored:
         """
         self._require_motion_planner_if_skillgen(motion_planner)
 
+        if self.schedule_all:
+            try:
+                return await self._generate_with_global_schedule(
+                    env_id=env_id,
+                    success_term=success_term,
+                    env_reset_queue=env_reset_queue,
+                    env_action_queue=env_action_queue,
+                    pause_subtask=pause_subtask,
+                    export_demo=export_demo,
+                    motion_planner=motion_planner,
+                )
+            except Exception as exc:
+                print(f"[DataGenerator] schedule_all execution failed: {exc}")
+                raise
+
+        return await self._run_episode_once(
+            env_id=env_id,
+            success_term=success_term,
+            env_reset_queue=env_reset_queue,
+            env_action_queue=env_action_queue,
+            pause_subtask=pause_subtask,
+            export_demo=export_demo,
+            motion_planner=motion_planner,
+            capture_joint_positions=False,
+        )
+
+    async def _run_episode_once(
+        self,
+        env_id: int,
+        success_term: TerminationTermCfg,
+        env_reset_queue: asyncio.Queue | None,
+        env_action_queue: asyncio.Queue | None,
+        pause_subtask: bool,
+        export_demo: bool,
+        motion_planner: Any | None,
+        *,
+        capture_joint_positions: bool,
+    ) -> dict:
+        """
+        Execute the standard generation loop once and optionally capture joint states per tick.
+
+        Args:
+            env_id: Environment replica to operate on.
+            success_term: Termination callable.
+            env_reset_queue: Sync queue for resets.
+            env_action_queue: Queue used when stepping via a remote simulator task.
+            pause_subtask: Whether to pause between subtasks.
+            export_demo: Whether to export to the recorder manager.
+            motion_planner: Motion planner instance (may be None if SkillGen disabled).
+            capture_joint_positions: If True, append the robot's joint positions after each
+                env step to `GenerationBuffers.joint_positions`.
+
+        Returns:
+            A result dictionary akin to `generate`, with an additional `joint_positions`
+            entry when `capture_joint_positions` is True.
+        """
         env_id_tensor, new_initial_state = await self._reset_environment_for_generation(
             env_id=env_id,
             env_reset_queue=env_reset_queue,
@@ -869,7 +939,12 @@ class DataGeneratorRefactored:
                 env_id=env_id,
                 env_action_queue=env_action_queue,
             )
-            self._update_execution_buffers(exec_results, buffers)
+            self._update_execution_buffers(
+                exec_results,
+                buffers,
+                env_id=env_id,
+                capture_joint_positions=capture_joint_positions,
+            )
 
             self._advance_subtask_progress(
                 eef_states=eef_states,
@@ -886,6 +961,10 @@ class DataGeneratorRefactored:
         else:
             generated_actions = buffers.actions
 
+        joint_positions: torch.Tensor | None = None
+        if capture_joint_positions and buffers.joint_positions:
+            joint_positions = torch.stack(buffers.joint_positions, dim=0)
+
         self.env.recorder_manager.set_success_to_episodes(
             env_id_tensor,
             torch.tensor([[buffers.success]], dtype=torch.bool, device=self.env.device),
@@ -899,8 +978,239 @@ class DataGeneratorRefactored:
             observations=buffers.observations,
             actions=generated_actions,
             success=buffers.success,
+            joint_positions=joint_positions,
         )
         return results
+
+    async def _generate_with_global_schedule(
+        self,
+        env_id: int,
+        success_term: TerminationTermCfg,
+        env_reset_queue: asyncio.Queue | None,
+        env_action_queue: asyncio.Queue | None,
+        pause_subtask: bool,
+        export_demo: bool,
+        motion_planner: Any | None,
+    ) -> dict:
+        """
+        Two-stage pipeline: gather per-arm trajectories then replay them with collision-aware scheduling.
+        """
+        if self.skillgen_type != "bimanual":
+            raise ValueError("--schedule_all is only supported for bimanual SkillGen workflows.")
+        planner_left, planner_right = self._resolve_arm_specific_planners(motion_planner)
+
+        first_pass = await self._run_episode_once(
+            env_id=env_id,
+            success_term=success_term,
+            env_reset_queue=env_reset_queue,
+            env_action_queue=env_action_queue,
+            pause_subtask=pause_subtask,
+            export_demo=False,
+            motion_planner=motion_planner,
+            capture_joint_positions=True,
+        )
+
+        actions_tensor = first_pass["actions"]
+        actions_tensor = self._coerce_action_history(actions_tensor)
+        joint_positions = self._coerce_joint_history(first_pass.get("joint_positions"))
+        if joint_positions is None or joint_positions.numel() == 0:
+            return first_pass
+
+        arm_paths = self._build_arm_paths_for_schedule(
+            actions_tensor=actions_tensor,
+            joint_history=joint_positions,
+            planner_left=planner_left,
+            planner_right=planner_right,
+        )
+
+        schedule = build_collision_aware_schedule(
+            arm_right=arm_paths["right"],
+            arm_left=arm_paths["left"],
+            planner_right=planner_right,
+            planner_left=planner_left,
+            step_dt=self.env.step_dt,
+            densify_factor=int(getattr(self.env_cfg.datagen_config, "schedule_densify_factor", 4)),
+            pair_batch=int(getattr(self.env_cfg.datagen_config, "schedule_pair_batch", 4096)),
+            collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
+            min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
+        )
+        schedule.append_hold(int(getattr(self.env_cfg.datagen_config, "final_hold_steps", 0)))
+
+        env_id_tensor = torch.tensor([env_id], dtype=torch.int64, device=self.env.device)
+        self.env.scene.reset_to(first_pass["initial_state"], env_ids=[env_id], is_relative=True)
+        self.env.recorder_manager.reset(env_ids=env_id_tensor)
+
+        return await self._replay_discrete_schedule(
+            env_id=env_id,
+            env_id_tensor=env_id_tensor,
+            initial_state=first_pass["initial_state"],
+            success_term=success_term,
+            env_action_queue=env_action_queue,
+            arm_paths=arm_paths,
+            schedule=schedule,
+            export_demo=export_demo,
+        )
+
+    def _build_arm_paths_for_schedule(
+        self,
+        actions_tensor: torch.Tensor,
+        joint_history: torch.Tensor,
+        planner_left: Any,
+        planner_right: Any,
+    ) -> dict[str, ArmPath]:
+        """Convert recorded actions and joint positions into ArmPath objects per arm."""
+        if actions_tensor.ndim == 1:
+            actions_tensor = actions_tensor.unsqueeze(0)
+        device = self.env.device
+        actions_tensor = actions_tensor.to(device=device)
+        joint_history = joint_history.to(device=device)
+
+        target_poses = self.env.action_to_target_eef_pose(actions_tensor)
+        gripper_actions = self.env.actions_to_gripper_actions(actions_tensor)
+
+        left_joints = self._project_joint_history_to_planner(joint_history, planner_left)
+        right_joints = self._project_joint_history_to_planner(joint_history, planner_right)
+
+        arm_paths = {
+            "left": ArmPath(
+                name="left",
+                poses=target_poses["left"],
+                gripper_actions=gripper_actions["left"],
+                joint_positions=left_joints,
+            ),
+            "right": ArmPath(
+                name="right",
+                poses=target_poses["right"],
+                gripper_actions=gripper_actions["right"],
+                joint_positions=right_joints,
+            ),
+        }
+        return arm_paths
+
+    def _project_joint_history_to_planner(self, joint_history: torch.Tensor, planner: Any) -> torch.Tensor:
+        """Gather the subset of joints (in planner order) from the full articulation history."""
+        target_device = getattr(planner.tensor_args, "device", joint_history.device)
+        target_dtype = getattr(planner.tensor_args, "dtype", joint_history.dtype)
+        joint_names_env = [
+            name.decode("utf-8") if isinstance(name, bytes) else str(name)
+            for name in self._robot_articulation.data.joint_names
+        ]
+        planner_joint_names = list(planner.motion_gen.kinematics.joint_names)
+        indices: list[int] = []
+        for name in planner_joint_names:
+            if name not in joint_names_env:
+                raise KeyError(f"Joint {name} not found in articulation.")
+            indices.append(joint_names_env.index(name))
+        index_tensor = torch.tensor(indices, dtype=torch.long, device=joint_history.device)
+        sliced = joint_history.index_select(dim=1, index=index_tensor)
+        return sliced.to(device=target_device, dtype=target_dtype, copy=True)
+
+    def _coerce_action_history(self, actions: torch.Tensor | list[Any]) -> torch.Tensor:
+        """Convert recorder action history into a contiguous tensor [T, action_dim]."""
+        if isinstance(actions, torch.Tensor):
+            return actions
+        if not actions:
+            return torch.zeros((0, self.env.action_manager.total_action_dim), device=self.env.device)
+
+        action_tensors: list[torch.Tensor] = []
+        for entry in actions:
+            tensor = entry if isinstance(entry, torch.Tensor) else torch.as_tensor(entry)
+            tensor = tensor.to(device=self.env.device, dtype=torch.float32)
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            action_tensors.append(tensor)
+        return torch.cat(action_tensors, dim=0)
+
+    def _coerce_joint_history(self, joints: torch.Tensor | list[Any] | None) -> torch.Tensor | None:
+        """Ensure joint snapshot history is a tensor [T, num_joints] on env device."""
+        if joints is None:
+            return None
+        if isinstance(joints, torch.Tensor):
+            return joints.to(self.env.device)
+        if not joints:
+            return None
+        joint_tensors: list[torch.Tensor] = []
+        for entry in joints:
+            tensor = entry if isinstance(entry, torch.Tensor) else torch.as_tensor(entry)
+            tensor = tensor.to(device=self.env.device, dtype=torch.float32)
+            joint_tensors.append(tensor)
+        stacked = torch.stack(joint_tensors, dim=0)
+        return stacked
+
+    def _resolve_arm_specific_planners(self, motion_planner: Any | None) -> tuple[Any, Any]:
+        """Expose the underlying HumanoidArmCuroboPlanner instances for left/right arms."""
+        if motion_planner is None:
+            raise ValueError("schedule_all requires a bimanual motion planner instance.")
+        planner_left = getattr(motion_planner, "_planner_left", None)
+        planner_right = getattr(motion_planner, "_planner_right", None)
+        if planner_left is None or planner_right is None:
+            raise ValueError("Bimanual motion planner must expose _planner_left/_planner_right for scheduling.")
+        return planner_left, planner_right
+
+    async def _replay_discrete_schedule(
+        self,
+        env_id: int,
+        env_id_tensor: torch.Tensor,
+        initial_state: dict,
+        success_term: TerminationTermCfg,
+        env_action_queue: asyncio.Queue | None,
+        arm_paths: dict[str, ArmPath],
+        schedule: DiscreteSchedule,
+        export_demo: bool,
+    ) -> dict:
+        """Replay the pre-built schedule and record the resulting buffers."""
+        buffers = GenerationBuffers()
+
+        num_ticks = schedule.left_indices.shape[0]
+        for tick in range(num_ticks):
+            left_idx = int(schedule.left_indices[tick].item()) if schedule.left_indices.numel() > 0 else 0
+            right_idx = int(schedule.right_indices[tick].item()) if schedule.right_indices.numel() > 0 else 0
+
+            def _ensure_tensor(value: torch.Tensor | list | np.ndarray) -> torch.Tensor:
+                tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                return tensor.to(device=self.env.device, dtype=torch.float32)
+
+            waypoint_dict = {
+                "left": Waypoint(
+                    pose=_ensure_tensor(arm_paths["left"].poses[left_idx]),
+                    gripper_action=_ensure_tensor(arm_paths["left"].gripper_actions[left_idx]),
+                    noise=0.0,
+                ),
+                "right": Waypoint(
+                    pose=_ensure_tensor(arm_paths["right"].poses[right_idx]),
+                    gripper_action=_ensure_tensor(arm_paths["right"].gripper_actions[right_idx]),
+                    noise=0.0,
+                ),
+            }
+            multi_waypoint = MultiWaypoint(waypoint_dict)
+            exec_results = await multi_waypoint.execute(
+                env=self.env,
+                success_term=success_term,
+                env_id=env_id,
+                env_action_queue=env_action_queue,
+            )
+            self._update_execution_buffers(exec_results, buffers, env_id=env_id, capture_joint_positions=False)
+
+        generated_actions: list[torch.Tensor] | torch.Tensor
+        if buffers.actions:
+            generated_actions = torch.cat(buffers.actions, dim=0)
+        else:
+            generated_actions = buffers.actions
+
+        self.env.recorder_manager.set_success_to_episodes(
+            env_id_tensor,
+            torch.tensor([[buffers.success]], dtype=torch.bool, device=self.env.device),
+        )
+        if export_demo:
+            self.env.recorder_manager.export_episodes(env_id_tensor)
+
+        return dict(
+            initial_state=initial_state,
+            states=buffers.states,
+            observations=buffers.observations,
+            actions=generated_actions,
+            success=buffers.success,
+        )
 
     def _require_motion_planner_if_skillgen(self, motion_planner: Any | None) -> None:
         """
@@ -1317,7 +1627,14 @@ class DataGeneratorRefactored:
                     step_index -= 1
                     eef_state.subtask_step_index = step_index
 
-    def _update_execution_buffers(self, exec_results: dict, buffers: GenerationBuffers) -> None:
+    def _update_execution_buffers(
+        self,
+        exec_results: dict,
+        buffers: GenerationBuffers,
+        *,
+        env_id: int,
+        capture_joint_positions: bool = False,
+    ) -> None:
         """
         Append simulator outputs from the latest control tick to the shared buffers.
 
@@ -1337,6 +1654,11 @@ class DataGeneratorRefactored:
         buffers.observations.extend(exec_results["observations"])
         buffers.actions.extend(exec_results["actions"])
         buffers.success = buffers.success or exec_results["success"]
+
+        if capture_joint_positions:
+            joint_tensor = self._robot_articulation.data.joint_pos
+            if isinstance(joint_tensor, torch.Tensor):
+                buffers.joint_positions.append(joint_tensor[env_id].clone())
 
     def _advance_subtask_progress(
         self,

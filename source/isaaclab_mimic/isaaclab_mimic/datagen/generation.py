@@ -228,6 +228,7 @@ def setup_async_generation(
         env=env,
         src_demo_datagen_info_pool=shared_datagen_info_pool,
         skillgen_type=skillgen_type,
+        schedule_all=bool(getattr(env.cfg.datagen_config, "schedule_all", False)),
     )
     data_generator_asyncio_tasks = []
     for i in range(num_envs):
