@@ -124,14 +124,18 @@ def main():
 
         # USD path and inactive joints from env_cfg
         usd_path = env_cfg.scene.robot.spawn.usd_path
-        try:
-            inactive_joint_names = list(env_cfg.actions.gr1_action.ik_urdf_fixed_joint_names)
-        except Exception:
-            inactive_joint_names = []
+        inactive_joint_names = list(env_cfg.actions.gr1_action.ik_urdf_fixed_joint_names)
+        
+        # TODO: (Neel) This is not working as expected (spheres are still being generated for hand links)
+        # add hand joints to inactive joints
+        inactive_joint_names_left = inactive_joint_names + [j for j in env_cfg.actions.gr1_action.hand_joint_names if "L_" in j]
+        inactive_joint_names_right = inactive_joint_names + [j for j in env_cfg.actions.gr1_action.hand_joint_names if "R_" in j]
+        print(f"Inactive joints left: {inactive_joint_names_left}")
+        print(f"Inactive joints right: {inactive_joint_names_right}")
 
         # Build per-arm YAML once
-        yaml_right = build_humanoid_yaml_from_usd(usd_path, arm="right", inactive_joints=inactive_joint_names)
-        yaml_left = build_humanoid_yaml_from_usd(usd_path, arm="left", inactive_joints=inactive_joint_names)
+        yaml_right = build_humanoid_yaml_from_usd(usd_path, arm="right", inactive_joints=inactive_joint_names_right)
+        yaml_left = build_humanoid_yaml_from_usd(usd_path, arm="left", inactive_joints=inactive_joint_names_left)
 
         def _mk_cfg(yaml_path: str) -> CuroboPlannerCfg:
             return CuroboPlannerCfg(
