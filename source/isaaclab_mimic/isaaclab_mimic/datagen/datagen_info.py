@@ -34,6 +34,7 @@ class DatagenInfo:
         subtask_start_signals=None,
         target_eef_pose=None,
         gripper_action=None,
+        joint_position=None,
     ):
         """
         Args:
@@ -87,6 +88,10 @@ class DatagenInfo:
         if gripper_action is not None:
             self.gripper_action = gripper_action
 
+        self.joint_position = None
+        if joint_position is not None:
+            self.joint_position = joint_position
+
     def to_dict(self):
         """
         Convert this instance to a dictionary containing the same information.
@@ -104,4 +109,6 @@ class DatagenInfo:
             ret["target_eef_pose"] = self.target_eef_pose
         if self.gripper_action is not None:
             ret["gripper_action"] = self.gripper_action
+        if self.joint_position is not None:
+            ret["joint_position"] = self.joint_position
         return ret

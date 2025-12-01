@@ -58,10 +58,19 @@ parser.add_argument(
     default=False,
     help="Precompute entire per-arm trajectories and run collision-aware scheduling before execution.",
 )
+parser.add_argument(
+    "--schedule_all_offline",
+    action="store_true",
+    default=False,
+    help="With --schedule_all, skip the warmup execution pass and build arm paths offline.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+if args_cli.schedule_all_offline:
+    args_cli.schedule_all = True
 
 if args_cli.enable_pinocchio:
     # Import pinocchio before AppLauncher to force the use of the version installed by IsaacLab and not the one installed by Isaac Sim
@@ -120,6 +129,7 @@ def main():
     for attr_name, value in [
         ("use_skillgen", bool(args_cli.use_skillgen)),
         ("schedule_all", bool(args_cli.schedule_all)),
+        ("schedule_all_offline", bool(args_cli.schedule_all_offline)),
     ]:
         try:
             setattr(env_cfg.datagen_config, attr_name, value)

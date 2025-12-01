@@ -79,6 +79,9 @@ class DataGenConfig:
     schedule_all: bool = False
     """When True, pre-compute entire skill+planner trajectories and run collision-aware scheduling before execution."""
 
+    schedule_all_offline: bool = False
+    """When True alongside schedule_all, skip the warmup execution pass and synthesize arm paths offline."""
+
     schedule_densify_factor: int = 4
     """Linear densification factor when sampling joint paths for collision checks."""
 

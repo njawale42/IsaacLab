@@ -21,7 +21,7 @@ class Waypoint:
     Represents a single desired 6-DoF waypoint, along with corresponding gripper actuation for this point.
     """
 
-    def __init__(self, pose, gripper_action, noise=None):
+    def __init__(self, pose, gripper_action, noise=None, joint_seed=None):
         """
         Args:
             pose (torch.Tensor): 4x4 pose target for robot controller
@@ -32,6 +32,7 @@ class Waypoint:
         self.pose = pose
         self.gripper_action = gripper_action
         self.noise = noise
+        self.joint_seed = None if joint_seed is None else joint_seed.clone()
 
     def __str__(self):
         """String representation of the waypoint."""
@@ -56,7 +57,7 @@ class WaypointSequence:
             self.sequence = deepcopy(sequence)
 
     @classmethod
-    def from_poses(cls, poses, gripper_actions, action_noise):
+    def from_poses(cls, poses, gripper_actions, action_noise, joint_positions=None):
         """
         Instantiate a WaypointSequence object given a sequence of poses,
         gripper actions, and action noise.
@@ -79,14 +80,27 @@ class WaypointSequence:
         action_noise = action_noise.reshape(-1, 1)
 
         # make WaypointSequence instance
-        sequence = [
-            Waypoint(
-                pose=poses[t],
-                gripper_action=gripper_actions[t],
-                noise=action_noise[t, 0],
+        joint_list = None
+        if joint_positions is not None:
+            if isinstance(joint_positions, torch.Tensor):
+                joint_list = [joint_positions[t] for t in range(num_timesteps)]
+            else:
+                joint_list = joint_positions
+            assert len(joint_list) == num_timesteps
+
+        sequence = []
+        for t in range(num_timesteps):
+            joint_seed = None
+            if joint_list is not None:
+                joint_seed = joint_list[t]
+            sequence.append(
+                Waypoint(
+                    pose=poses[t],
+                    gripper_action=gripper_actions[t],
+                    noise=action_noise[t, 0],
+                    joint_seed=joint_seed,
+                )
             )
-            for t in range(num_timesteps)
-        ]
         return cls(sequence=sequence)
 
     def get_poses(self):

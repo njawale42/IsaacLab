@@ -113,6 +113,10 @@ class DataGenInfoPool:
         # Extract gripper actions
         gripper_actions = self.env.actions_to_gripper_actions(ep_grp["actions"])
 
+        joint_positions = None
+        if "robot_joint_pos" in ep_grp["obs"]:
+            joint_positions = ep_grp["obs"]["robot_joint_pos"].to(device=self.device)
+
         ep_datagen_info_obj = DatagenInfo(
             eef_pose=eef_pose,
             object_poses=object_poses_dict,
@@ -120,6 +124,7 @@ class DataGenInfoPool:
             subtask_term_signals=subtask_term_signals_dict,
             target_eef_pose=target_eef_pose,
             gripper_action=gripper_actions,
+            joint_position=joint_positions,
         )
         self._datagen_infos.append(ep_datagen_info_obj)
 
@@ -154,6 +159,9 @@ class DataGenInfoPool:
                     # Last subtask has no termination signal from the datagen_info
                     end_index = ep_grp["actions"].shape[0]
                 else:
+                    assert (
+                        ep_datagen_info_obj.subtask_term_signals is not None
+                    ), "subtask_term_signals missing in datagen info"
                     # Trick to detect index where first 0 -> 1 transition occurs - this will be the end of the subtask
                     subtask_term_indicators = (
                         ep_datagen_info_obj.subtask_term_signals[eef_subtask_signal_name].flatten().int()
