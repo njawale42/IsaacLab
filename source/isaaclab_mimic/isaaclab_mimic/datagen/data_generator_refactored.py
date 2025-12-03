@@ -801,10 +801,25 @@ class DataGeneratorRefactored:
         """
         self._require_motion_planner_if_skillgen(motion_planner)
 
-        if self.schedule_all:
-            try:
-                if self.schedule_all_offline:
-                    return await self._generate_with_global_schedule_offline(
+        # The outer task runners frequently invoke the generator under `torch.inference_mode()`
+        # to save dispatcher overhead. That causes tensors created here to become inference
+        # tensors, which cuRobo later mutates in-place, tripping PyTorch runtime errors after
+        # the first demo. Force the entire generation pass to run in eager mode so planners
+        # never inherit inference-only buffers between episodes.
+        with torch.inference_mode(False):
+            if self.schedule_all:
+                try:
+                    if self.schedule_all_offline:
+                        return await self._generate_with_global_schedule_offline(
+                            env_id=env_id,
+                            success_term=success_term,
+                            env_reset_queue=env_reset_queue,
+                            env_action_queue=env_action_queue,
+                            pause_subtask=pause_subtask,
+                            export_demo=export_demo,
+                            motion_planner=motion_planner,
+                        )
+                    return await self._generate_with_global_schedule(
                         env_id=env_id,
                         success_term=success_term,
                         env_reset_queue=env_reset_queue,
@@ -813,31 +828,22 @@ class DataGeneratorRefactored:
                         export_demo=export_demo,
                         motion_planner=motion_planner,
                     )
-                return await self._generate_with_global_schedule(
-                    env_id=env_id,
-                    success_term=success_term,
-                    env_reset_queue=env_reset_queue,
-                    env_action_queue=env_action_queue,
-                    pause_subtask=pause_subtask,
-                    export_demo=export_demo,
-                    motion_planner=motion_planner,
-                )
-            except Exception as exc:
-                print(f"[DataGenerator] schedule_all execution failed: {exc}")
-                import traceback
-                traceback.print_exc()
-                raise
+                except Exception as exc:
+                    print(f"[DataGenerator] schedule_all execution failed: {exc}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
 
-        return await self._run_episode_once(
-            env_id=env_id,
-            success_term=success_term,
-            env_reset_queue=env_reset_queue,
-            env_action_queue=env_action_queue,
-            pause_subtask=pause_subtask,
-            export_demo=export_demo,
-            motion_planner=motion_planner,
-            capture_joint_positions=False,
-        )
+            return await self._run_episode_once(
+                env_id=env_id,
+                success_term=success_term,
+                env_reset_queue=env_reset_queue,
+                env_action_queue=env_action_queue,
+                pause_subtask=pause_subtask,
+                export_demo=export_demo,
+                motion_planner=motion_planner,
+                capture_joint_positions=False,
+            )
 
     async def _run_episode_once(
         self,
@@ -1280,13 +1286,11 @@ class DataGeneratorRefactored:
             for eef_name, waypoint in eef_waypoints.items():
                 eef_state = eef_states[eef_name]
                 joint_vec = eef_state.last_commanded_joint_position
-                # Store IK-solved joints for ALL segments (skill and motion-planned).
-                # For skill segments, _collect_eef_waypoints now solves IK via
-                # _solve_ik_for_waypoint_offline, so joint_vec contains valid joints
-                # for the current scene. We must store them to ensure consistency -
-                # otherwise _extract_joint_history_from_entries would solve IK again
-                # with potentially different results, causing discontinuities.
-                stored_joint = joint_vec.clone() if joint_vec is not None else None
+                # Only store joints from motion-planned segments (subtask_index == -1).
+                # Skill segment joints come from source demo and are not valid for
+                # the current scene, so we leave them as None to force IK solving later.
+                in_motion_planned_phase = eef_state.current_subtask_index == -1
+                stored_joint = joint_vec.clone() if (joint_vec is not None and in_motion_planned_phase) else None
                 joint_seed = waypoint.joint_seed
                 if joint_seed is not None:
                     joint_seed = joint_seed.to(device=self.env.device)
