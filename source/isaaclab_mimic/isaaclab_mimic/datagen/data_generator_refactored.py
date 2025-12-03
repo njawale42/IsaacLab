@@ -244,7 +244,6 @@ class DataGeneratorRefactored:
         self.schedule_all_offline = getattr(self.env_cfg.datagen_config, "schedule_all_offline", False)
         if self.schedule_all_offline:
             self.schedule_all = True
-        self._gripper_action_templates = self._build_gripper_action_templates()
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -584,14 +583,16 @@ class DataGeneratorRefactored:
             # Source segment consists of just the target poses.
             src_eef_poses = src_subtask_target_poses.clone()
             src_subtask_gripper_actions = src_subtask_gripper_actions.clone()
-        joint_seed_sequence = self._capture_joint_seeds_for_waypoints(
-            env_id=env_id,
-            eef_name=eef_name,
-            poses=src_eef_poses,
-            gripper_actions=src_subtask_gripper_actions,
-            raw_joint_positions=src_subtask_joint_positions,
-            prepend_current=prepend_current_joint,
-        )
+        joint_seed_sequence: list[torch.Tensor | None] | None = None
+        if src_subtask_joint_positions is not None:
+            joint_seed_sequence = [jp.clone() for jp in src_subtask_joint_positions]
+        if prepend_current_joint:
+            current_joint = self._robot_articulation.data.joint_pos[env_id].clone()
+            if joint_seed_sequence is None:
+                joint_seed_sequence = []
+            joint_seed_sequence = [current_joint.clone()] + joint_seed_sequence
+        if joint_seed_sequence is not None and len(joint_seed_sequence) < src_eef_poses.shape[0]:
+            joint_seed_sequence.extend([None] * (src_eef_poses.shape[0] - len(joint_seed_sequence)))
 
         # Transform source demonstration segment using relevant object pose.
         if use_delta_transform is not None:
@@ -823,6 +824,8 @@ class DataGeneratorRefactored:
                 )
             except Exception as exc:
                 print(f"[DataGenerator] schedule_all execution failed: {exc}")
+                import traceback
+                traceback.print_exc()
                 raise
 
         return await self._run_episode_once(
@@ -1086,6 +1089,7 @@ class DataGeneratorRefactored:
             arm_paths=arm_paths,
             schedule=schedule,
             export_demo=export_demo,
+            planner_map={"left": planner_left, "right": planner_right},
         )
 
     async def _generate_with_global_schedule_offline(
@@ -1148,6 +1152,7 @@ class DataGeneratorRefactored:
             arm_paths=arm_paths,
             schedule=schedule,
             export_demo=export_demo,
+            planner_map={"left": planner_left, "right": planner_right},
         )
 
     async def _offline_rollout_waypoints(
@@ -1161,7 +1166,7 @@ class DataGeneratorRefactored:
         """
         Run the generator state machine without stepping the simulator to record ideal waypoint streams.
         """
-        env_id_tensor, initial_state = await self._reset_environment_for_generation(
+        _, initial_state = await self._reset_environment_for_generation(
             env_id=env_id,
             env_reset_queue=env_reset_queue,
         )
@@ -1273,14 +1278,22 @@ class DataGeneratorRefactored:
                 raise RuntimeError("Offline rollout produced no waypoints for active timestep.")
 
             for eef_name, waypoint in eef_waypoints.items():
-                joint_vec = eef_states[eef_name].last_commanded_joint_position
+                eef_state = eef_states[eef_name]
+                joint_vec = eef_state.last_commanded_joint_position
+                # Store IK-solved joints for ALL segments (skill and motion-planned).
+                # For skill segments, _collect_eef_waypoints now solves IK via
+                # _solve_ik_for_waypoint_offline, so joint_vec contains valid joints
+                # for the current scene. We must store them to ensure consistency -
+                # otherwise _extract_joint_history_from_entries would solve IK again
+                # with potentially different results, causing discontinuities.
+                stored_joint = joint_vec.clone() if joint_vec is not None else None
                 joint_seed = waypoint.joint_seed
                 if joint_seed is not None:
                     joint_seed = joint_seed.to(device=self.env.device)
                 waypoint_logs[eef_name].append(
                     {
                         "waypoint": deepcopy(waypoint),
-                        "joint": None if joint_vec is None else joint_vec.clone(),
+                        "joint": stored_joint,
                         "joint_seed": None if joint_seed is None else joint_seed.clone(),
                     }
                 )
@@ -1308,79 +1321,6 @@ class DataGeneratorRefactored:
             pad = tensor[-1:].repeat(expected_len - tensor.shape[0], 1)
             tensor = torch.cat([tensor, pad], dim=0)
         return [tensor[i].clone() for i in range(expected_len)]
-
-    def _capture_joint_seeds_for_waypoints(
-        self,
-        env_id: int,
-        eef_name: str,
-        poses: torch.Tensor,
-        gripper_actions: torch.Tensor,
-        raw_joint_positions: torch.Tensor | None,
-        *,
-        prepend_current: bool,
-    ) -> list[torch.Tensor] | None:
-        """Generate joint seeds by running the controller on each pose without advancing physics."""
-        if not self.schedule_all_offline:
-            return None
-
-        num_waypoints = poses.shape[0]
-        joint_seeds: list[torch.Tensor] = []
-        _ = raw_joint_positions
-        start_index = 0
-        if prepend_current:
-            joint_seeds.append(self._robot_articulation.data.joint_pos[env_id].clone())
-            start_index = 1
-
-        # Save env state so we can restore after the virtual rollout.
-        env_id_tensor = torch.tensor([env_id], dtype=torch.long, device=self.env.device)
-        saved_state = self.env.scene.get_state(is_relative=True)
-
-        action_dim = self.env.action_manager.total_action_dim
-        action_batch = torch.zeros((self.env.num_envs, action_dim), device=self.env.device)
-        all_eef_names = list(self.env_cfg.subtask_configs.keys())
-
-        try:
-            for idx in range(start_index, num_waypoints):
-                pose = poses[idx]
-                grip = gripper_actions[idx]
-                target_pose_dict: dict[str, torch.Tensor] = {}
-                target_grip_dict: dict[str, torch.Tensor] = {}
-                for name in all_eef_names:
-                    current_pose = self.env.get_robot_eef_pose(name, env_ids=[env_id])[0]
-                    template = self._gripper_action_templates.get(name)
-                    if template is None:
-                        template = torch.zeros_like(grip)
-                    target_pose_dict[name] = current_pose.clone()
-                    target_grip_dict[name] = template.clone()
-                target_pose_dict[eef_name] = pose.clone()
-                active_template = target_grip_dict[eef_name]
-                copy_len = min(active_template.shape[0], grip.shape[0])
-                active_template[:copy_len] = grip[:copy_len]
-                target_grip_dict[eef_name] = active_template
-                action = self.env.target_eef_pose_to_action(
-                    target_eef_pose_dict=target_pose_dict,
-                    gripper_action_dict=target_grip_dict,
-                    action_noise_dict=None,
-                    env_id=env_id,
-                )
-                action_batch.zero_()
-                action_batch[env_id] = action
-                self.env.action_manager.process_action(action_batch)
-                self.env.action_manager.apply_action()
-                self.env.scene.write_data_to_sim()
-                self.env.scene.update(0.0)
-                joint_seeds.append(self._robot_articulation.data.joint_pos[env_id].clone())
-        finally:
-            self.env.scene.reset_to(saved_state, env_ids=env_id_tensor, is_relative=True)
-            self.env.action_manager.reset(env_ids=env_id_tensor)
-            self.env.scene.write_data_to_sim()
-            self.env.scene.update(0.0)
-
-        if len(joint_seeds) < num_waypoints:
-            pad_joint = joint_seeds[-1].clone()
-            for _ in range(num_waypoints - len(joint_seeds)):
-                joint_seeds.append(pad_joint.clone())
-        return joint_seeds
 
     def _build_arm_paths_from_waypoints(
         self,
@@ -1422,7 +1362,12 @@ class DataGeneratorRefactored:
         planner: Any,
         env_id: int,
     ) -> torch.Tensor:
-        """Compose a contiguous joint history, re-solving IK only for entries lacking stored data."""
+        """Compose a contiguous joint history, re-solving IK only for entries lacking stored data.
+
+        For skill segments (entries without stored joints), IK is solved to recover joint positions.
+        At skill→motion-plan boundaries, we use the motion plan's start joint as the target for the
+        skill segment's last pose to ensure continuity.
+        """
         if planner is None:
             raise ValueError(f"No planner provided for end effector '{eef_name}'.")
 
@@ -1439,26 +1384,58 @@ class DataGeneratorRefactored:
             planner_device = getattr(tensor_args, "device", None)
         target_device = planner_device or self.env.device
 
-        def _flush_buffer(initial_joint: torch.Tensor | None) -> None:
+        def _flush_buffer(
+            initial_joint: torch.Tensor | None,
+            end_target_joint: torch.Tensor | None = None,
+        ) -> None:
+            """Solve IK for buffered poses, ensuring continuity at MP boundaries.
+
+            When end_target_joint is provided (the motion plan's start joint), we ensure
+            the skill segment's last joint exactly matches it for smooth transitions.
+            We solve IK for all poses except the last, then splice in the MP start joint.
+            """
             nonlocal last_joint
             if not pose_buffer:
                 return
-            poses = torch.stack(pose_buffer, dim=0)
+
             start_joint = initial_joint
             if start_joint is None:
                 for seed in seed_buffer:
                     if seed is not None:
                         start_joint = seed
                         break
-            solved = self._solve_waypoints_to_joint_positions(
-                poses=poses,
-                planner=planner,
-                env_id=env_id,
-                initial_joint=start_joint,
-                seed_sequence=seed_buffer,
-            )
-            for offset, idx in enumerate(index_buffer):
-                joint_list[idx] = solved[offset]
+
+            if end_target_joint is not None and len(pose_buffer) > 1:
+                # Solve IK for all poses except the last
+                poses_except_last = torch.stack(pose_buffer[:-1], dim=0)
+                seeds_except_last = seed_buffer[:-1]
+                solved = self._solve_waypoints_to_joint_positions(
+                    poses=poses_except_last,
+                    planner=planner,
+                    env_id=env_id,
+                    initial_joint=start_joint,
+                    seed_sequence=seeds_except_last,
+                )
+                for offset, idx in enumerate(index_buffer[:-1]):
+                    joint_list[idx] = solved[offset]
+                # For the last pose, use the MP start joint directly for exact continuity
+                joint_list[index_buffer[-1]] = end_target_joint.to(device=target_device)
+            elif end_target_joint is not None and len(pose_buffer) == 1:
+                # Only one pose - use MP start directly
+                joint_list[index_buffer[0]] = end_target_joint.to(device=target_device)
+            else:
+                # No MP boundary - solve IK normally
+                poses = torch.stack(pose_buffer, dim=0)
+                solved = self._solve_waypoints_to_joint_positions(
+                    poses=poses,
+                    planner=planner,
+                    env_id=env_id,
+                    initial_joint=start_joint,
+                    seed_sequence=seed_buffer,
+                )
+                for offset, idx in enumerate(index_buffer):
+                    joint_list[idx] = solved[offset]
+
             last_joint = joint_list[index_buffer[-1]]
             pose_buffer.clear()
             index_buffer.clear()
@@ -1478,12 +1455,13 @@ class DataGeneratorRefactored:
                     seed_tensor = self._project_joint_vector_to_planner(seed_tensor, planner).to(device=target_device)
                 seed_buffer.append(seed_tensor)
             else:
-                _flush_buffer(last_joint)
-                joint_tensor = self._project_joint_vector_to_planner(joint_tensor, planner).to(device=target_device)
-                joint_list[idx] = joint_tensor
-                last_joint = joint_tensor
+                # Use the motion plan's start joint as end target for skill segment
+                mp_start_joint = self._project_joint_vector_to_planner(joint_tensor, planner).to(device=target_device)
+                _flush_buffer(last_joint, end_target_joint=mp_start_joint)
+                joint_list[idx] = mp_start_joint
+                last_joint = mp_start_joint
 
-        _flush_buffer(last_joint)
+        _flush_buffer(last_joint, end_target_joint=None)
         joint_history = torch.stack(joint_list, dim=0)
         planner_dof = self._get_planner_dof(planner)
         if joint_history.shape[1] == planner_dof:
@@ -1497,6 +1475,103 @@ class DataGeneratorRefactored:
         if hasattr(motion_planner, "_planner_left") and hasattr(motion_planner, "_planner_right"):
             return motion_planner._planner_left if eef_name == "left" else motion_planner._planner_right
         return motion_planner
+
+    def _solve_ik_for_start_state(
+        self,
+        eef_name: str,
+        pose: torch.Tensor,
+        planner: Any,
+        env_id: int,
+    ) -> torch.Tensor | None:
+        """Solve IK for the current EEF pose to get a valid start state for motion planning.
+
+        Used when last_joint_position is not available (e.g., first motion plan).
+
+        Args:
+            eef_name: Name of the end-effector.
+            pose: Current EEF pose (4x4 matrix).
+            planner: Arm-specific planner for IK solving.
+            env_id: Environment ID.
+
+        Returns:
+            Joint configuration that achieves the pose, or None if IK fails.
+        """
+        if planner is None or pose is None:
+            return None
+
+        # Use current articulation joints as seed - clone to avoid inference mode issues
+        current_joints = self._robot_articulation.data.joint_pos[env_id].clone().detach()
+        seed_joint = self._project_joint_vector_to_planner(current_joints, planner)
+        if seed_joint is not None:
+            seed_joint = seed_joint.clone().detach()
+
+        # Clone pose to ensure it's not an inference tensor
+        poses = pose.clone().detach().unsqueeze(0)
+        solved = self._solve_waypoints_to_joint_positions(
+            poses=poses,
+            planner=planner,
+            env_id=env_id,
+            initial_joint=seed_joint,
+            seed_sequence=[seed_joint] if seed_joint is not None else None,
+        )
+        if solved is not None and solved.shape[0] > 0:
+            return solved[0]
+        return seed_joint  # Fallback to current projected joints
+
+    def _solve_ik_for_waypoint_offline(
+        self,
+        eef_name: str,
+        waypoint: Waypoint,
+        eef_state: EEFGenerationState,
+        motion_planner: Any | None,
+        env_id: int,
+    ) -> torch.Tensor | None:
+        """Solve IK for a skill segment waypoint during offline rollout.
+
+        This ensures that `last_joint_position` reflects IK-consistent joints rather than
+        source demo joints, allowing motion planners to start from the correct configuration.
+
+        Args:
+            eef_name: Name of the end-effector ("left" or "right").
+            waypoint: The current waypoint containing the target pose.
+            eef_state: EEF generation state with previous joint info for seeding.
+            motion_planner: Motion planner instance (needed for IK solver access).
+            env_id: Environment ID.
+
+        Returns:
+            IK-solved joint vector, or None if IK fails or planner unavailable.
+        """
+        if motion_planner is None:
+            # Fallback to source demo joints if no planner
+            return waypoint.joint_seed
+
+        planner = self._get_arm_specific_planner(motion_planner, eef_name)
+        if planner is None:
+            return waypoint.joint_seed
+
+        # Use previous joint position as seed for continuity
+        seed_joint = eef_state.last_joint_position
+        if seed_joint is None:
+            seed_joint = waypoint.joint_seed
+
+        pose = waypoint.pose
+        if pose is None:
+            return seed_joint
+
+        # Solve IK for this single pose
+        poses = pose.unsqueeze(0)
+        seed_sequence = [seed_joint] if seed_joint is not None else None
+
+        solved = self._solve_waypoints_to_joint_positions(
+            poses=poses,
+            planner=planner,
+            env_id=env_id,
+            initial_joint=seed_joint,
+            seed_sequence=seed_sequence,
+        )
+        if solved is not None and solved.shape[0] > 0:
+            return solved[0]
+        return seed_joint
 
     def _solve_waypoints_to_joint_positions(
         self,
@@ -1518,6 +1593,8 @@ class DataGeneratorRefactored:
         joint_store_device = planner_device if planner_device is not None else self.env.device
         if initial_joint is not None:
             last_valid = initial_joint.to(device=joint_store_device).clone()
+            if self.schedule_all_offline:
+                self._set_robot_joint_state(env_id, initial_joint, planner)
         for idx_pose, pose in enumerate(poses):
             try:
                 device_ctx = (
@@ -1564,7 +1641,10 @@ class DataGeneratorRefactored:
                     .to(device=joint_store_device)
                     .view(-1)
                 )
+                joint_vec = self._project_joint_vector_to_planner(joint_vec, planner)
                 last_valid = joint_vec
+                if self.schedule_all_offline:
+                    self._set_robot_joint_state(env_id, joint_vec, planner)
             except Exception:
                 if last_valid is None:
                     raise
@@ -1647,19 +1727,6 @@ class DataGeneratorRefactored:
         }
         return arm_paths
 
-    def _build_gripper_action_templates(self) -> dict[str, torch.Tensor]:
-        """Create zero-action gripper templates per end effector."""
-        templates: dict[str, torch.Tensor] = {}
-        zero_action = torch.zeros(
-            (1, self.env.action_manager.total_action_dim),
-            device=self.env.device,
-            dtype=torch.float32,
-        )
-        gripper_dict = self.env.actions_to_gripper_actions(zero_action)
-        for name, tensor in gripper_dict.items():
-            templates[name] = tensor[0].clone()
-        return templates
-
     def _project_joint_history_to_planner(self, joint_history: torch.Tensor, planner: Any) -> torch.Tensor:
         """Gather the subset of joints (in planner order) from the full articulation history."""
         target_device = getattr(planner.tensor_args, "device", joint_history.device)
@@ -1707,6 +1774,43 @@ class DataGeneratorRefactored:
             return current_plan.position.shape[-1]
         raise ValueError("Unable to determine planner DOF for joint projection.")
 
+    def _expand_planner_joint_vector(self, joint_vec: torch.Tensor, planner: Any, env_id: int = 0) -> torch.Tensor:
+        """Expand a planner joint vector back into the environment's articulation joint ordering.
+
+        Args:
+            joint_vec: Joint vector in planner ordering (subset of full articulation).
+            planner: Planner instance providing joint name mapping.
+            env_id: Environment ID to use as base for non-planner joints.
+        """
+        full_size = self._robot_articulation.data.joint_pos.shape[1]
+        if joint_vec.shape[0] == full_size:
+            return joint_vec.to(device=self.env.device)
+        env_joint_names = [
+            name.decode("utf-8") if isinstance(name, bytes) else str(name)
+            for name in self._robot_articulation.data.joint_names
+        ]
+        planner_joint_names = list(planner.motion_gen.kinematics.joint_names)
+        full = self._robot_articulation.data.joint_pos[env_id].clone()
+        vec = joint_vec.to(device=full.device)
+        for idx, name in enumerate(planner_joint_names):
+            if name not in env_joint_names:
+                continue
+            env_idx = env_joint_names.index(name)
+            full[env_idx] = vec[idx]
+        return full
+
+    def _set_robot_joint_state(self, env_id: int, joint_values: torch.Tensor, planner: Any | None = None) -> None:
+        """Directly overwrite the articulation joint state for the specified env."""
+        target = joint_values.to(device=self.env.device)
+        if planner is not None and target.shape[0] != self._robot_articulation.data.joint_pos.shape[1]:
+            target = self._expand_planner_joint_vector(target, planner, env_id)
+        self._robot_articulation.data.joint_pos[env_id] = target.clone()
+        self._robot_articulation.data.joint_pos_target[env_id] = target.clone()
+        if hasattr(self._robot_articulation.data, "joint_vel"):
+            self._robot_articulation.data.joint_vel[env_id] = torch.zeros_like(target)
+        self._robot_articulation.write_data_to_sim()
+        self._robot_articulation.update(0.0)
+
     def _coerce_action_history(self, actions: torch.Tensor | list[Any]) -> torch.Tensor:
         """Convert recorder action history into a contiguous tensor [T, action_dim]."""
         if isinstance(actions, torch.Tensor):
@@ -1749,6 +1853,150 @@ class DataGeneratorRefactored:
             raise ValueError("Bimanual motion planner must expose _planner_left/_planner_right for scheduling.")
         return planner_left, planner_right
 
+    def _compute_interpolation_steps(
+        self,
+        arm_paths: dict[str, ArmPath],
+        prev_left_idx: int,
+        prev_right_idx: int,
+        curr_left_idx: int,
+        curr_right_idx: int,
+        max_joint_step: float,
+    ) -> int:
+        """Compute number of interpolation steps needed to smooth large joint jumps.
+
+        Args:
+            arm_paths: Per-arm trajectory data containing joint_positions.
+            prev_left_idx: Previous left arm waypoint index.
+            prev_right_idx: Previous right arm waypoint index.
+            curr_left_idx: Current left arm waypoint index.
+            curr_right_idx: Current right arm waypoint index.
+            max_joint_step: Maximum allowed joint change per step (radians).
+
+        Returns:
+            Number of interpolation steps to insert (0 if no smoothing needed).
+        """
+        if prev_left_idx < 0 or prev_right_idx < 0:
+            return 0
+
+        max_delta = 0.0
+
+        # Check left arm joint delta
+        left_joints = arm_paths["left"].joint_positions
+        if left_joints is not None and left_joints.numel() > 0:
+            if prev_left_idx < left_joints.shape[0] and curr_left_idx < left_joints.shape[0]:
+                delta = (left_joints[curr_left_idx] - left_joints[prev_left_idx]).abs().max().item()
+                max_delta = max(max_delta, delta)
+
+        # Check right arm joint delta
+        right_joints = arm_paths["right"].joint_positions
+        if right_joints is not None and right_joints.numel() > 0:
+            if prev_right_idx < right_joints.shape[0] and curr_right_idx < right_joints.shape[0]:
+                delta = (right_joints[curr_right_idx] - right_joints[prev_right_idx]).abs().max().item()
+                max_delta = max(max_delta, delta)
+
+        if max_delta <= max_joint_step:
+            return 0
+
+        # Compute steps needed to keep joint changes below threshold
+        import math
+        return int(math.ceil(max_delta / max_joint_step)) - 1
+
+    def _interpolate_waypoints(
+        self,
+        arm_paths: dict[str, ArmPath],
+        prev_left_idx: int,
+        prev_right_idx: int,
+        curr_left_idx: int,
+        curr_right_idx: int,
+        alpha: float,
+    ) -> dict[str, Waypoint]:
+        """Create interpolated waypoints between previous and current indices.
+
+        Args:
+            arm_paths: Per-arm trajectory data.
+            prev_left_idx: Previous left arm waypoint index.
+            prev_right_idx: Previous right arm waypoint index.
+            curr_left_idx: Current left arm waypoint index.
+            curr_right_idx: Current right arm waypoint index.
+            alpha: Interpolation factor in [0, 1] where 0 = prev, 1 = curr.
+
+        Returns:
+            Dictionary of interpolated Waypoint objects for each arm.
+        """
+        def _interp_tensor(t0: torch.Tensor, t1: torch.Tensor, a: float) -> torch.Tensor:
+            return t0 * (1.0 - a) + t1 * a
+
+        def _interp_pose(p0: torch.Tensor, p1: torch.Tensor, a: float) -> torch.Tensor:
+            """Interpolate 4x4 pose matrices (linear translation, blended rotation)."""
+            t_interp = p0[:3, 3] * (1.0 - a) + p1[:3, 3] * a
+            R_blend = p0[:3, :3] * (1.0 - a) + p1[:3, :3] * a
+            # Orthogonalize via SVD for valid rotation
+            U, _, Vh = torch.linalg.svd(R_blend)
+            R_interp = U @ Vh
+            result = torch.eye(4, device=p0.device, dtype=p0.dtype)
+            result[:3, :3] = R_interp
+            result[:3, 3] = t_interp
+            return result
+
+        result = {}
+        arm_indices = [
+            ("left", prev_left_idx, curr_left_idx),
+            ("right", prev_right_idx, curr_right_idx),
+        ]
+        for arm_name, prev_idx, curr_idx in arm_indices:
+            arm_path = arm_paths[arm_name]
+            p0 = arm_path.poses[prev_idx].to(device=self.env.device, dtype=torch.float32)
+            p1 = arm_path.poses[curr_idx].to(device=self.env.device, dtype=torch.float32)
+            g0 = arm_path.gripper_actions[prev_idx].to(device=self.env.device, dtype=torch.float32)
+            g1 = arm_path.gripper_actions[curr_idx].to(device=self.env.device, dtype=torch.float32)
+
+            result[arm_name] = Waypoint(
+                pose=_interp_pose(p0, p1, alpha),
+                gripper_action=_interp_tensor(g0, g1, alpha),
+                noise=0.0,
+            )
+        return result
+
+    def _apply_scheduled_joint_state(
+        self,
+        env_id: int,
+        arm_paths: dict[str, ArmPath],
+        left_idx: int,
+        right_idx: int,
+        planner_map: dict[str, Any] | None,
+    ) -> None:
+        """Set the robot articulation to the recorded joint state for the scheduled tick.
+
+        When replaying a collision-aware schedule, the controller receives pose targets but
+        the articulation should already be at the configuration the planner computed. This
+        helper reads the stored joint vectors from arm_paths and applies them so the robot
+        doesn't snap back to its initial configuration before each motion-planned segment.
+
+        Args:
+            env_id: Environment ID for which to set joint state.
+            arm_paths: Per-arm trajectory data containing joint_positions tensors.
+            left_idx: Index into left arm joint_positions for the current tick.
+            right_idx: Index into right arm joint_positions for the current tick.
+            planner_map: Mapping from arm name to planner used for joint expansion.
+        """
+        if planner_map is None:
+            return
+
+        # Apply joint state for each arm sequentially; _expand_planner_joint_vector
+        # preserves other joints when expanding so order matters for overlapping DOFs.
+        for arm_name, idx in [("left", left_idx), ("right", right_idx)]:
+            arm_path = arm_paths.get(arm_name)
+            if arm_path is None:
+                continue
+            joint_positions = arm_path.joint_positions
+            if joint_positions is None or joint_positions.numel() == 0:
+                continue
+            if idx >= joint_positions.shape[0]:
+                continue
+            joint_vec = joint_positions[idx]
+            planner = planner_map.get(arm_name)
+            self._set_robot_joint_state(env_id, joint_vec, planner)
+
     async def _replay_discrete_schedule(
         self,
         env_id: int,
@@ -1759,19 +2007,83 @@ class DataGeneratorRefactored:
         arm_paths: dict[str, ArmPath],
         schedule: DiscreteSchedule,
         export_demo: bool,
+        planner_map: dict[str, Any] | None = None,
     ) -> dict:
-        """Replay the pre-built schedule and record the resulting buffers."""
+        """Replay the pre-built schedule and record the resulting buffers.
+
+        Args:
+            env_id: Environment ID to replay within.
+            env_id_tensor: Tensor version of env_id for recorder calls.
+            initial_state: State snapshot used to reset the environment before replay.
+            success_term: Termination condition to check for success.
+            env_action_queue: Queue for asynchronous action dispatch.
+            arm_paths: Per-arm trajectory data (poses, gripper_actions, joint_positions).
+            schedule: Discrete schedule mapping ticks to waypoint indices.
+            export_demo: Whether to export the resulting demonstration.
+            planner_map: Optional mapping from arm name to planner instance used to
+                expand planner-space joint vectors to full articulation ordering.
+        """
         buffers = GenerationBuffers()
+
+        # Set the initial joint state ONCE at the start of replay to align with first waypoints
+        if planner_map is not None and schedule.left_indices.numel() > 0 and schedule.right_indices.numel() > 0:
+            left_idx_0 = int(schedule.left_indices[0].item())
+            right_idx_0 = int(schedule.right_indices[0].item())
+            self._apply_scheduled_joint_state(
+                env_id=env_id,
+                arm_paths=arm_paths,
+                left_idx=left_idx_0,
+                right_idx=right_idx_0,
+                planner_map=planner_map,
+            )
+
+        # Configurable smoothing parameters
+        max_joint_step_rad = float(getattr(self.env_cfg.datagen_config, "max_joint_step_rad", 0.1))
+
+        def _ensure_tensor(value: torch.Tensor | list | np.ndarray) -> torch.Tensor:
+            tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+            return tensor.to(device=self.env.device, dtype=torch.float32)
+
+        # Track previous indices for detecting large jumps
+        prev_left_idx = -1
+        prev_right_idx = -1
 
         num_ticks = schedule.left_indices.shape[0]
         for tick in range(num_ticks):
             left_idx = int(schedule.left_indices[tick].item()) if schedule.left_indices.numel() > 0 else 0
             right_idx = int(schedule.right_indices[tick].item()) if schedule.right_indices.numel() > 0 else 0
 
-            def _ensure_tensor(value: torch.Tensor | list | np.ndarray) -> torch.Tensor:
-                tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-                return tensor.to(device=self.env.device, dtype=torch.float32)
+            # Check if we need interpolation steps for smooth motion
+            interp_steps = self._compute_interpolation_steps(
+                arm_paths=arm_paths,
+                prev_left_idx=prev_left_idx,
+                prev_right_idx=prev_right_idx,
+                curr_left_idx=left_idx,
+                curr_right_idx=right_idx,
+                max_joint_step=max_joint_step_rad,
+            )
 
+            # Execute interpolation steps if needed
+            for step in range(interp_steps):
+                alpha = float(step + 1) / float(interp_steps + 1)
+                interp_waypoint_dict = self._interpolate_waypoints(
+                    arm_paths=arm_paths,
+                    prev_left_idx=prev_left_idx if prev_left_idx >= 0 else left_idx,
+                    prev_right_idx=prev_right_idx if prev_right_idx >= 0 else right_idx,
+                    curr_left_idx=left_idx,
+                    curr_right_idx=right_idx,
+                    alpha=alpha,
+                )
+                interp_multi_waypoint = MultiWaypoint(interp_waypoint_dict)
+                exec_results = await interp_multi_waypoint.execute(
+                    env=self.env,
+                    success_term=success_term,
+                    env_id=env_id,
+                    env_action_queue=env_action_queue,
+                )
+                self._update_execution_buffers(exec_results, buffers, env_id=env_id, capture_joint_positions=False)
+
+            # Execute the actual scheduled waypoint
             waypoint_dict = {
                 "left": Waypoint(
                     pose=_ensure_tensor(arm_paths["left"].poses[left_idx]),
@@ -1792,6 +2104,9 @@ class DataGeneratorRefactored:
                 env_action_queue=env_action_queue,
             )
             self._update_execution_buffers(exec_results, buffers, env_id=env_id, capture_joint_positions=False)
+
+            prev_left_idx = left_idx
+            prev_right_idx = right_idx
 
         generated_actions: list[torch.Tensor] | torch.Tensor
         if buffers.actions:
@@ -1994,6 +2309,32 @@ class DataGeneratorRefactored:
         if motion_planner is None:
             return False, None
 
+        # Ensure robot articulation state is set correctly before motion planning.
+        # The planner reads its start state from robot.data.joint_pos, so we must
+        # sync the articulation to match where we expect the robot to be.
+        if self.schedule_all_offline:
+            import torch as _torch
+            planner_for_arm = self._get_arm_specific_planner(motion_planner, eef_name)
+            if eef_state.last_joint_position is not None:
+                # Use the tracked joint position from previous segment
+                start_joints = eef_state.last_joint_position.clone()
+            else:
+                # No previous joint position - solve IK for current EEF pose as fallback
+                # Must disable inference mode for cuRobo IK solver
+                with _torch.inference_mode(False):
+                    current_eef_pose = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])[0].clone()
+                    start_joints = self._solve_ik_for_start_state(
+                        eef_name=eef_name,
+                        pose=current_eef_pose,
+                        planner=planner_for_arm,
+                        env_id=env_id,
+                    )
+            if start_joints is not None:
+                self._set_robot_joint_state(env_id, start_joints, planner_for_arm)
+                # Force articulation update to ensure planner sees latest state
+                self._robot_articulation.write_data_to_sim()
+                self._robot_articulation.update(0.0)
+
         target_pose = eef_subtask_trajectory[0].pose
         target_gripper_action = eef_subtask_trajectory[0].gripper_action
 
@@ -2035,9 +2376,19 @@ class DataGeneratorRefactored:
         eef_state.next_subtask_trajectory_after_motion = eef_subtask_trajectory
         eef_state.current_subtask_index = -1
 
+        arm_planner = self._get_arm_specific_planner(motion_planner, eef_name) or motion_planner
         mp_waypoints, mp_joint_positions = self._convert_planned_trajectory_to_waypoints(
-            motion_planner, target_gripper_action
+            arm_planner, target_gripper_action
         )
+
+        if len(mp_waypoints) == 0:
+            # Empty motion plan - likely start equals target or planning issue
+            # Skip the motion plan phase entirely and proceed directly to the skill
+            print(f"Info: Motion plan for {eef_name} produced 0 waypoints, skipping transition")
+            eef_state.next_subtask_index_after_motion = None
+            eef_state.next_subtask_trajectory_after_motion = None
+            eef_state.current_subtask_index = target_subtask_index
+            return False, None
 
         selected_demo_ind = selected_src_demo_inds[eef_name]
         if selected_demo_ind is not None:
@@ -2052,10 +2403,14 @@ class DataGeneratorRefactored:
                 waypoint.gripper_action = mp_gripper_actions[idx]
 
         eef_state.current_trajectory = mp_waypoints
-        eef_state.current_joint_trajectory = cast(
-            list[torch.Tensor | None],
-            self._joint_tensor_to_list(mp_joint_positions, len(mp_waypoints)),
-        )
+        joint_trajectory = self._joint_tensor_to_list(mp_joint_positions, len(mp_waypoints))
+        eef_state.current_joint_trajectory = cast(list[torch.Tensor | None], joint_trajectory)
+        if (
+            self.schedule_all_offline
+            and mp_joint_positions is not None
+            and mp_joint_positions.shape[0] > 0
+        ):
+            self._set_robot_joint_state(env_id, mp_joint_positions[0], arm_planner)
         eef_state.subtask_step_index = 0
         return True, None
 
@@ -2174,6 +2529,32 @@ class DataGeneratorRefactored:
             if eef_state.subtask_step_index is None:
                 continue
 
+            if (
+                self.schedule_all_offline
+                and eef_state.subtask_step_index == 0
+                and eef_state.current_joint_trajectory
+                and eef_state.current_joint_trajectory[0] is not None
+            ):
+                planner_for_arm = self._get_arm_specific_planner(motion_planner, eef_name)
+                self._set_robot_joint_state(
+                    env_id=env_id,
+                    joint_values=eef_state.current_joint_trajectory[0],
+                    planner=planner_for_arm,
+                )
+
+            if (
+                self.schedule_all_offline
+                and eef_state.subtask_step_index == 0
+                and eef_state.current_joint_trajectory
+                and eef_state.current_joint_trajectory[0] is not None
+            ):
+                planner_for_arm = self._get_arm_specific_planner(motion_planner, eef_name)
+                self._set_robot_joint_state(
+                    env_id=env_id,
+                    joint_values=eef_state.current_joint_trajectory[0],
+                    planner=planner_for_arm,
+                )
+
             self._apply_constraint_progression_rules(
                 eef_name=eef_name,
                 eef_state=eef_state,
@@ -2182,11 +2563,25 @@ class DataGeneratorRefactored:
             )
             waypoint = eef_state.current_trajectory[eef_state.subtask_step_index]
 
-            joint_vec = waypoint.joint_seed
-            if joint_vec is None and eef_state.current_joint_trajectory:
-                idx = eef_state.subtask_step_index
-                if idx is not None and idx < len(eef_state.current_joint_trajectory):
-                    joint_vec = eef_state.current_joint_trajectory[idx]
+            # For motion-planned segments (subtask_index == -1), use planner joints directly.
+            # For skill segments, solve IK for the waypoint pose to get consistent joints.
+            in_motion_planned_phase = eef_state.current_subtask_index == -1
+            if in_motion_planned_phase:
+                # Motion plan: use joints from current_joint_trajectory (from planner)
+                joint_vec = waypoint.joint_seed
+                if joint_vec is None and eef_state.current_joint_trajectory:
+                    idx = eef_state.subtask_step_index
+                    if idx is not None and idx < len(eef_state.current_joint_trajectory):
+                        joint_vec = eef_state.current_joint_trajectory[idx]
+            else:
+                # Skill segment: solve IK for waypoint pose to get consistent joints
+                joint_vec = self._solve_ik_for_waypoint_offline(
+                    eef_name=eef_name,
+                    waypoint=waypoint,
+                    eef_state=eef_state,
+                    motion_planner=motion_planner,
+                    env_id=env_id,
+                )
             eef_state.last_joint_position = joint_vec
             eef_state.last_commanded_joint_position = joint_vec
 
@@ -2439,6 +2834,13 @@ class DataGeneratorRefactored:
 
         planned_poses = motion_planner.get_planned_poses()
         planned_joint_positions = self._get_planned_joint_positions(motion_planner)
+        if planned_joint_positions is not None:
+            expanded: list[torch.Tensor] = []
+            for idx in range(planned_joint_positions.shape[0]):
+                expanded.append(
+                    self._expand_planner_joint_vector(planned_joint_positions[idx], motion_planner)
+                )
+            planned_joint_positions = torch.stack(expanded, dim=0)
 
         # For tabletop tasks, planned poses are already in the env's expected frame
         if self.skillgen_type != "bimanual":

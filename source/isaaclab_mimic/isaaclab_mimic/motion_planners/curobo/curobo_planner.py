@@ -928,7 +928,8 @@ class CuroboPlanner(MotionPlannerBase):
             and zero velocity/acceleration.
         """
         # Fetch joint position (shape: [1, num_joints])
-        joint_pos_raw: torch.Tensor = self.robot.data.joint_pos[self.env_id, :].unsqueeze(0)
+        # Clone to avoid inference mode issues
+        joint_pos_raw: torch.Tensor = self.robot.data.joint_pos[self.env_id, :].clone().unsqueeze(0)
         joint_vel_raw: torch.Tensor = torch.zeros_like(joint_pos_raw)
         joint_acc_raw: torch.Tensor = torch.zeros_like(joint_pos_raw)
 
@@ -1317,6 +1318,8 @@ class CuroboPlanner(MotionPlannerBase):
                 self.logger.debug(f"Contact planning failed: {result.status}")
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.logger.debug(f"Error during planning: {e}")
 
         # Always restore sphere state after planning, regardless of success
