@@ -1109,29 +1109,47 @@ class DataGeneratorRefactored:
         motion_planner: Any | None,
     ) -> dict:
         """
-        Offline variant of schedule_all that synthesizes per-arm paths without executing the warmup pass.
+        Offline variant of schedule_all using a clean two-phase approach.
+
+        Phase 1: Build complete Cartesian (EE) paths for each arm
+            - Collect all poses: skill_0 → MP → skill_1 → MP → ...
+            - Each segment uses previous segment's end as start for continuity
+
+        Phase 2: Solve IK sequentially through complete paths
+            - Solve IK for each arm's complete pose sequence
+            - Each pose seeded with previous IK solution for smooth joints
+            - Results in continuous joint trajectories
+
+        Phase 3: Collision checking and scheduling
+            - Use joint paths to find collision pairs
+            - Retime paths to avoid collisions
+            - Build discrete schedule for execution
         """
         if self.skillgen_type != "bimanual":
             raise ValueError("--schedule_all_offline is only supported for bimanual SkillGen workflows.")
+
         planner_left, planner_right = self._resolve_arm_specific_planners(motion_planner)
+        planner_map = {"left": planner_left, "right": planner_right}
 
-        rollout_result = await self._offline_rollout_waypoints(
+        # Reset environment and capture initial state
+        env_id_tensor, initial_state = await self._reset_environment_for_generation(
             env_id=env_id,
-            success_term=success_term,
             env_reset_queue=env_reset_queue,
-            pause_subtask=pause_subtask,
-            motion_planner=motion_planner,
-        )
-        if isinstance(rollout_result, dict):
-            return rollout_result
-
-        initial_state, waypoint_logs = rollout_result
-        arm_paths = self._build_arm_paths_from_waypoints(
-            waypoint_logs=waypoint_logs,
-            planner_map={"left": planner_left, "right": planner_right},
-            env_id=env_id,
         )
 
+        # Phase 1 & 2: Build complete Cartesian paths then solve IK
+        import torch as _torch
+        with _torch.inference_mode(False):
+            arm_paths = self._build_complete_arm_paths_offline(
+                env_id=env_id,
+                motion_planner=motion_planner,
+                planner_map=planner_map,
+            )
+
+        if arm_paths is None:
+            return {"success": False}
+
+        # Phase 3: Collision-aware scheduling
         schedule = build_collision_aware_schedule(
             arm_right=arm_paths["right"],
             arm_left=arm_paths["left"],
@@ -1145,7 +1163,7 @@ class DataGeneratorRefactored:
         )
         schedule.append_hold(int(getattr(self.env_cfg.datagen_config, "final_hold_steps", 0)))
 
-        env_id_tensor = torch.tensor([env_id], dtype=torch.int64, device=self.env.device)
+        # Reset to initial state before replay
         self.env.scene.reset_to(initial_state, env_ids=env_id_tensor, is_relative=True)
         self.env.recorder_manager.reset(env_ids=env_id_tensor)
 
@@ -1158,8 +1176,439 @@ class DataGeneratorRefactored:
             arm_paths=arm_paths,
             schedule=schedule,
             export_demo=export_demo,
-            planner_map={"left": planner_left, "right": planner_right},
+            planner_map=planner_map,
         )
+
+    def _build_complete_arm_paths_offline(
+        self,
+        env_id: int,
+        motion_planner: Any,
+        planner_map: dict[str, Any],
+    ) -> dict[str, ArmPath] | None:
+        """Build complete arm paths with continuous Cartesian and joint trajectories.
+
+        Phase 1: For each arm, builds complete Cartesian path:
+            skill_0 poses → MP poses → skill_1 poses → MP poses → ...
+
+        Phase 2: Solves IK through complete path in one pass per arm.
+
+        Returns:
+            Dictionary mapping arm name to ArmPath, or None if any arm fails.
+        """
+        randomized_boundaries = self.randomize_subtask_boundaries()
+        arm_paths: dict[str, ArmPath] = {}
+
+        for eef_name in ["left", "right"]:
+            planner = planner_map.get(eef_name)
+            if planner is None:
+                print(f"[OfflineSchedule] No planner for {eef_name}")
+                return None
+
+            result = self._build_single_arm_path_offline(
+                env_id=env_id,
+                eef_name=eef_name,
+                planner=planner,
+                motion_planner=motion_planner,
+                randomized_boundaries=randomized_boundaries,
+            )
+            if result is None:
+                print(f"[OfflineSchedule] Failed to build path for {eef_name}")
+                return None
+            arm_paths[eef_name] = result
+
+        return arm_paths
+
+    def _build_single_arm_path_offline(
+        self,
+        env_id: int,
+        eef_name: str,
+        planner: Any,
+        motion_planner: Any,
+        randomized_boundaries: dict[str, np.ndarray],
+    ) -> ArmPath | None:
+        """Build complete path for a single arm.
+
+        Collects all poses (skill + motion plan) into one continuous Cartesian path,
+        then solves IK through the entire path for smooth joint trajectories.
+
+        Returns:
+            ArmPath with poses, gripper_actions, and joint_positions, or None on failure.
+        """
+        all_poses: list[torch.Tensor] = []
+        all_gripper_actions: list[torch.Tensor] = []
+
+        subtask_configs = self.env_cfg.subtask_configs[eef_name]
+        num_subtasks = len(subtask_configs)
+
+        # Get initial joint state for first IK solve and motion planning
+        initial_joints = self._robot_articulation.data.joint_pos[env_id].clone().detach()
+        initial_arm_joints = self._project_joint_vector_to_planner(initial_joints, planner)
+        
+        # Track current joint state as we build the path
+        current_joint_state = initial_arm_joints.clone() if initial_arm_joints is not None else None
+
+        for subtask_idx in range(num_subtasks):
+            # Generate skill segment poses (transformed from source demo)
+            skill_result = self._generate_skill_segment_poses_offline(
+                env_id=env_id,
+                eef_name=eef_name,
+                subtask_idx=subtask_idx,
+                randomized_boundaries=randomized_boundaries,
+            )
+            if skill_result is None:
+                print(f"[OfflineSchedule] Failed to generate skill for {eef_name} subtask {subtask_idx}")
+                return None
+
+            skill_poses = skill_result["poses"]
+            skill_grippers = skill_result["gripper_actions"]
+
+            if len(skill_poses) == 0:
+                continue
+
+            # Motion plan from previous segment end to this skill's start
+            if len(all_poses) > 0:
+                target_gripper = skill_grippers[0] if len(skill_grippers) > 0 else all_gripper_actions[-1]
+                
+                # Solve IK for the end of previous segment to get accurate start joint state
+                prev_end_pose = all_poses[-1].clone().detach().unsqueeze(0).to(self.env.device)
+                prev_end_joints = self._solve_ik_for_complete_path(
+                    poses=prev_end_pose,
+                    planner=planner,
+                    env_id=env_id,
+                    initial_joint=current_joint_state,
+                )
+                if prev_end_joints is not None and prev_end_joints.shape[0] > 0:
+                    current_joint_state = prev_end_joints[0].clone().detach()
+                
+                mp_result = self._plan_motion_between_poses_offline(
+                    env_id=env_id,
+                    eef_name=eef_name,
+                    start_pose=all_poses[-1],
+                    target_pose=skill_poses[0],
+                    target_gripper=target_gripper,
+                    start_joint_state=current_joint_state,
+                    planner=planner,
+                    motion_planner=motion_planner,
+                )
+                if mp_result is not None and len(mp_result["poses"]) > 0:
+                    mp_poses = mp_result["poses"]
+                    mp_grippers = mp_result["gripper_actions"]
+                    all_poses.extend(mp_poses)
+                    all_gripper_actions.extend(mp_grippers)
+                    # Update joint state: solve IK for end of motion plan
+                    if len(mp_poses) > 0:
+                        mp_end_pose = mp_poses[-1].clone().detach().unsqueeze(0).to(self.env.device)
+                        mp_end_joints = self._solve_ik_for_complete_path(
+                            poses=mp_end_pose,
+                            planner=planner,
+                            env_id=env_id,
+                            initial_joint=current_joint_state,
+                        )
+                        if mp_end_joints is not None and mp_end_joints.shape[0] > 0:
+                            current_joint_state = mp_end_joints[0].clone().detach()
+                elif mp_result is None:
+                    print(f"[OfflineSchedule] Motion planning failed for {eef_name} subtask {subtask_idx}, skipping")
+                    # Continue without motion plan - direct transition
+
+            # Add skill poses
+            all_poses.extend(skill_poses)
+            all_gripper_actions.extend(skill_grippers)
+            
+            # Update joint state after skill segment
+            if len(skill_poses) > 0:
+                skill_end_pose = skill_poses[-1].clone().detach().unsqueeze(0).to(self.env.device)
+                skill_end_joints = self._solve_ik_for_complete_path(
+                    poses=skill_end_pose,
+                    planner=planner,
+                    env_id=env_id,
+                    initial_joint=current_joint_state,
+                )
+                if skill_end_joints is not None and skill_end_joints.shape[0] > 0:
+                    current_joint_state = skill_end_joints[0].clone().detach()
+
+        if not all_poses:
+            print(f"[OfflineSchedule] No poses collected for {eef_name}")
+            return None
+
+        # Phase 2: Solve IK through complete path sequentially
+        poses_tensor = torch.stack([p.to(self.env.device) for p in all_poses], dim=0)
+        grippers_tensor = torch.stack([g.to(self.env.device) for g in all_gripper_actions], dim=0)
+
+        print(f"[OfflineSchedule] Solving IK for {eef_name}: {poses_tensor.shape[0]} poses")
+        joints_tensor = self._solve_ik_for_complete_path(
+            poses=poses_tensor,
+            planner=planner,
+            env_id=env_id,
+            initial_joint=initial_arm_joints,
+        )
+
+        if joints_tensor is None or joints_tensor.shape[0] != poses_tensor.shape[0]:
+            actual = joints_tensor.shape[0] if joints_tensor is not None else 0
+            print(f"[OfflineSchedule] IK failed for {eef_name}: got {actual} vs {poses_tensor.shape[0]} poses")
+            return None
+
+        print(f"[OfflineSchedule] {eef_name} path complete: {poses_tensor.shape[0]} waypoints")
+        return ArmPath(
+            name=eef_name,
+            poses=poses_tensor,
+            gripper_actions=grippers_tensor,
+            joint_positions=joints_tensor,
+        )
+
+    def _generate_skill_segment_poses_offline(
+        self,
+        env_id: int,
+        eef_name: str,
+        subtask_idx: int,
+        randomized_boundaries: dict[str, np.ndarray],
+    ) -> dict[str, list[torch.Tensor]] | None:
+        """Generate transformed skill segment poses for a subtask.
+
+        Returns:
+            Dictionary with 'poses' and 'gripper_actions' lists, or None on failure.
+        """
+        num_demos = len(self.src_demo_datagen_info_pool.datagen_infos)
+        if num_demos == 0:
+            return None
+
+        import random
+        selected_demo_ind = random.randint(0, num_demos - 1)
+        src_datagen_info = self.src_demo_datagen_info_pool.datagen_infos[selected_demo_ind]
+        subtask_bounds = randomized_boundaries[eef_name][selected_demo_ind]
+        start_idx = int(subtask_bounds[subtask_idx, 0])
+        end_idx = int(subtask_bounds[subtask_idx, 1])
+
+        src_poses = src_datagen_info.target_eef_pose[eef_name][start_idx:end_idx].clone()
+        src_grippers = src_datagen_info.gripper_action[eef_name][start_idx:end_idx].clone()
+
+        if src_poses.shape[0] == 0:
+            return {"poses": [], "gripper_actions": []}
+
+        # Transform poses based on object delta
+        subtask_config = self.env_cfg.subtask_configs[eef_name][subtask_idx]
+        object_ref = subtask_config.object_ref
+
+        if object_ref is not None:
+            src_obj_pose = src_datagen_info.object_poses[object_ref][start_idx]
+            cur_obj_poses = self.env.get_object_poses(env_ids=[env_id])
+            cur_obj_pose = cur_obj_poses[object_ref][0]
+            transformed_poses = transform_source_data_segment_using_object_pose(
+                cur_obj_pose, src_poses, src_obj_pose
+            )
+        else:
+            transformed_poses = src_poses
+
+        return {
+            "poses": [transformed_poses[i].clone() for i in range(transformed_poses.shape[0])],
+            "gripper_actions": [src_grippers[i].clone() for i in range(src_grippers.shape[0])],
+        }
+
+    def _plan_motion_between_poses_offline(
+        self,
+        env_id: int,
+        eef_name: str,
+        start_pose: torch.Tensor,
+        target_pose: torch.Tensor,
+        target_gripper: torch.Tensor,
+        start_joint_state: torch.Tensor | None,
+        planner: Any,
+        motion_planner: Any,
+    ) -> dict[str, list[torch.Tensor]] | None:
+        """Plan motion from start_pose to target_pose and return intermediate poses.
+
+        Uses the provided start_joint_state to set robot state before planning, ensuring
+        the planner starts from the correct configuration (end of previous segment).
+
+        Args:
+            env_id: Environment ID.
+            eef_name: End-effector name ("left" or "right").
+            start_pose: Starting pose (4x4 matrix).
+            target_pose: Target pose (4x4 matrix).
+            target_gripper: Gripper action to use for motion plan waypoints.
+            start_joint_state: Joint state from end of previous segment (in planner ordering).
+            planner: Arm-specific planner for IK.
+            motion_planner: Full motion planner instance.
+
+        Returns:
+            Dictionary with 'poses' and 'gripper_actions' lists, or None on failure.
+        """
+        # Use provided start joint state, or solve IK for start pose as fallback
+        if start_joint_state is not None:
+            start_joints = start_joint_state.clone().detach()
+        else:
+            # Fallback: solve IK for start pose
+            start_pose_tensor = start_pose.clone().detach().unsqueeze(0).to(self.env.device)
+            current_joints = self._robot_articulation.data.joint_pos[env_id].clone().detach()
+            seed_joints = self._project_joint_vector_to_planner(current_joints, planner)
+            solved = self._solve_ik_for_complete_path(
+                poses=start_pose_tensor,
+                planner=planner,
+                env_id=env_id,
+                initial_joint=seed_joints,
+            )
+            if solved is None or solved.shape[0] == 0:
+                print(f"[OfflineSchedule] Failed to solve IK for start pose of {eef_name}")
+                return None
+            start_joints = solved[0]
+
+        # Set robot to start configuration before motion planning
+        # This ensures the planner reads the correct start state
+        # Note: _set_robot_joint_state preserves other arm's joints via _expand_planner_joint_vector
+        self._set_robot_joint_state(env_id, start_joints, planner)
+        self._robot_articulation.write_data_to_sim()
+        self._robot_articulation.update(0.0)
+
+        # Plan motion using motion planner
+        target_pose_tensor = target_pose.clone().detach().to(self.env.device)
+        planner_kwargs = {
+            "target_pose": target_pose_tensor,
+            "expected_attached_object": None,
+            "env_id": env_id,
+            "step_size": None,
+            "enable_retiming": False,
+        }
+        if self.skillgen_type == "bimanual":
+            planner_kwargs["input_is_site_frame"] = True
+
+        # Get arm-specific planner for bimanual case
+        arm_planner = self._get_arm_specific_planner(motion_planner, eef_name) or motion_planner
+        success = arm_planner.update_world_and_plan_motion(**planner_kwargs)
+        if not success:
+            print(f"[OfflineSchedule] Motion planning failed for {eef_name}")
+            return None
+
+        planned_poses = arm_planner.get_planned_poses()
+        if not planned_poses:
+            return None
+
+        # Use target gripper action for all motion plan waypoints
+        gripper_tensor = target_gripper.clone().detach().to(self.env.device)
+        gripper_actions = [gripper_tensor.clone() for _ in planned_poses]
+
+        # Convert to device tensors
+        poses_list = [p.clone().detach().to(self.env.device) for p in planned_poses]
+        return {"poses": poses_list, "gripper_actions": gripper_actions}
+
+    def _solve_ik_for_complete_path(
+        self,
+        poses: torch.Tensor,
+        planner: Any,
+        env_id: int,
+        initial_joint: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Solve IK for a sequence of poses with sequential seeding.
+
+        Each pose is solved using the previous solution as seed for continuity.
+        This ensures smooth joint trajectories matching the Cartesian path.
+
+        Args:
+            poses: Tensor of shape (N, 4, 4) containing pose matrices.
+            planner: Arm-specific planner for IK solving.
+            env_id: Environment ID.
+            initial_joint: Initial joint configuration to seed first pose.
+
+        Returns:
+            Tensor of shape (N, num_joints) with joint configurations, or None on failure.
+        """
+        if poses.shape[0] == 0:
+            return None
+
+        # Get planner device
+        tensor_args = getattr(planner, "tensor_args", None)
+        if tensor_args is None and hasattr(planner, "motion_gen"):
+            tensor_args = getattr(planner.motion_gen, "tensor_args", None)
+        planner_device = getattr(tensor_args, "device", self.env.device) if tensor_args else self.env.device
+
+        joints_list: list[torch.Tensor] = []
+        last_valid: torch.Tensor | None = None
+
+        if initial_joint is not None:
+            last_valid = initial_joint.clone().detach().to(planner_device)
+
+        for idx in range(poses.shape[0]):
+            pose = poses[idx].clone().detach()
+            joint_vec = self._solve_single_pose_ik(
+                pose=pose,
+                planner=planner,
+                env_id=env_id,
+                seed_joint=last_valid,
+                planner_device=planner_device,
+            )
+
+            if joint_vec is not None:
+                last_valid = joint_vec.clone().detach()
+                joints_list.append(joint_vec)
+            elif last_valid is not None:
+                # Fallback to last valid if IK fails
+                joints_list.append(last_valid.clone().detach())
+            else:
+                print(f"[OfflineSchedule] IK failed at pose {idx} with no fallback")
+                return None
+
+        return torch.stack(joints_list, dim=0)
+
+    def _solve_single_pose_ik(
+        self,
+        pose: torch.Tensor,
+        planner: Any,
+        env_id: int,
+        seed_joint: torch.Tensor | None,
+        planner_device: torch.device,
+    ) -> torch.Tensor | None:
+        """Solve IK for a single pose.
+
+        Args:
+            pose: 4x4 pose matrix.
+            planner: Arm-specific planner.
+            env_id: Environment ID.
+            seed_joint: Seed joint configuration for IK solver.
+            planner_device: Device for planner tensors.
+
+        Returns:
+            Joint configuration tensor in planner ordering, or None on failure.
+        """
+        from contextlib import nullcontext
+
+        device_ctx = (
+            torch.cuda.device(planner_device)
+            if planner_device is not None and str(planner_device).startswith("cuda")
+            else nullcontext()
+        )
+
+        with device_ctx:
+            # Convert pose to planner frame
+            pose_bt = self._convert_world_pose_to_planner_frame(pose, env_id=env_id)
+            pos_bt, rot_bt = PoseUtils.unmake_pose(pose_bt.unsqueeze(0))
+            quat_bt = PoseUtils.quat_from_matrix(rot_bt)[0]
+            pose_obj = planner._make_pose(position=pos_bt[0], quaternion=quat_bt)
+
+            # Prepare seed config
+            seed_config = None
+            retract_config = None
+            if seed_joint is not None:
+                seed_vec = seed_joint.to(planner_device)
+                retract_config = seed_vec.reshape(1, -1)
+                seed_config = seed_vec.reshape(1, 1, -1)
+
+            # Solve IK
+            ik_result = planner.motion_gen.ik_solver.solve_single(
+                pose_obj,
+                retract_config=retract_config,
+                seed_config=seed_config,
+            )
+
+            # Extract solution
+            js_solution = getattr(ik_result, "js_solution", None)
+            if js_solution is not None:
+                joint_vec = js_solution.position
+            else:
+                joint_vec = ik_result.solution
+
+            if isinstance(joint_vec, torch.Tensor) and joint_vec.ndim > 1:
+                joint_vec = joint_vec[0]
+
+            joint_vec = torch.as_tensor(joint_vec, dtype=torch.float32).to(planner_device).view(-1)
+            return self._project_joint_vector_to_planner(joint_vec, planner)
 
     async def _offline_rollout_waypoints(
         self,
@@ -2042,7 +2491,7 @@ class DataGeneratorRefactored:
             )
 
         # Configurable smoothing parameters
-        max_joint_step_rad = float(getattr(self.env_cfg.datagen_config, "max_joint_step_rad", 0.1))
+        max_joint_step_rad = float(getattr(self.env_cfg.datagen_config, "max_joint_step_rad", 0.08))
 
         def _ensure_tensor(value: torch.Tensor | list | np.ndarray) -> torch.Tensor:
             tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
