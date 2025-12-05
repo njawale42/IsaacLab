@@ -13,7 +13,10 @@ from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManager
 from isaaclab.managers import DatasetExportMode, TerminationTermCfg
 
 from isaaclab_mimic.datagen.data_generator import DataGenerator
-from isaaclab_mimic.datagen.data_generator_refactored import DataGeneratorRefactored
+from isaaclab_mimic.datagen.data_generator_refactored import (
+    DataGeneratorRefactored,
+    drain_goal_visualizations,
+)
 from isaaclab_mimic.datagen.datagen_info_pool import DataGenInfoPool
 
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -104,6 +107,9 @@ def env_loop(
 
             # perform action on environment
             env.step(actions)
+
+            # Flush any queued goal visualizations on the main thread.
+            drain_goal_visualizations(env)
 
             # mark done so the data generators can continue with the step results
             for i in range(env.num_envs):

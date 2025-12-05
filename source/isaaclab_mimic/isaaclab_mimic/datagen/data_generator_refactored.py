@@ -8,12 +8,14 @@ Base class for data generator.
 """
 import asyncio
 from copy import deepcopy
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, replace as dc_replace
 import numpy as np
 import torch
 from typing import Any
 
 import isaaclab.utils.math as PoseUtils
+from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
 from isaaclab.envs import (
     ManagerBasedRLMimicEnv,
     MimicEnvCfg,
@@ -28,6 +30,42 @@ from isaaclab_mimic.datagen.waypoint import MultiWaypoint, Waypoint, WaypointSeq
 
 from .datagen_info_pool import DataGenInfoPool
 
+# Shared queue for goal visualization requests to be flushed on the main thread (env loop).
+_goal_viz_queue: deque[tuple[int, str, torch.Tensor]] = deque()
+_goal_viz_visualizers: dict[tuple[int, str], VisualizationMarkers] = {}
+_goal_viz_warning_emitted: bool = False
+
+
+def enqueue_goal_visualization(env_id: int, eef_name: str, target_pose: torch.Tensor) -> None:
+    """Queue a goal pose for visualization; drained in the main env loop."""
+    _goal_viz_queue.append((env_id, eef_name, target_pose.detach().clone()))
+
+
+def drain_goal_visualizations(env: ManagerBasedRLMimicEnv) -> None:
+    """Flush queued goal visualizations on the main thread to avoid asyncio re-entrancy."""
+    global _goal_viz_warning_emitted
+    while _goal_viz_queue:
+        env_id, eef_name, target_pose = _goal_viz_queue.popleft()
+        key = (env_id, eef_name)
+        if key not in _goal_viz_visualizers:
+            prim_path = f"/Visuals/MotionPlanGoals/env_{env_id}_{eef_name}"
+            marker_cfg = dc_replace(FRAME_MARKER_CFG, prim_path=prim_path)
+            marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+            _goal_viz_visualizers[key] = VisualizationMarkers(marker_cfg)
+        goal_visualizer = _goal_viz_visualizers[key]
+        try:
+            goal_pos = target_pose[:3, 3].to(dtype=torch.float32, device=env.device)
+            # Offset by env origin for multi-env layouts so markers sit in each env tile.
+            if hasattr(env.scene, "env_origins"):
+                goal_pos = goal_pos + env.scene.env_origins[env_id, :3].to(device=env.device, dtype=goal_pos.dtype)
+            goal_quat = PoseUtils.quat_from_matrix(target_pose[:3, :3].unsqueeze(0))[0].to(
+                dtype=torch.float32, device=env.device
+            )
+            goal_visualizer.visualize(translations=goal_pos.unsqueeze(0), orientations=goal_quat.unsqueeze(0))
+        except Exception as exc:
+            if not _goal_viz_warning_emitted:
+                print(f"Goal visualization failed; continuing without markers. Reason: {exc}")
+                _goal_viz_warning_emitted = True
 
 def transform_source_data_segment_using_delta_object_pose(
     src_eef_poses: torch.Tensor,
@@ -223,6 +261,8 @@ class DataGeneratorRefactored:
         assert isinstance(self.env_cfg, MimicEnvCfg)
         self.dataset_path = dataset_path
         self.skillgen_type = skillgen_type
+        self._goal_visualizers: dict[tuple[int, str], VisualizationMarkers] = {}
+        self._goal_viz_warning_emitted: bool = False
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -1058,9 +1098,15 @@ class DataGeneratorRefactored:
         """
         if motion_planner is None:
             return False, None
-
+        # import pdb; pdb.set_trace()
         target_pose = eef_subtask_trajectory[0].pose
-        target_gripper_action = eef_subtask_trajectory[0].gripper_action
+        # Use the gripper action last commanded from the previous skill segment if available.
+        # Fall back to the upcoming skill segment's first gripper action otherwise.
+        base_gripper_action = (
+            eef_state.last_commanded_gripper_action
+            if eef_state.last_commanded_gripper_action is not None
+            else eef_subtask_trajectory[0].gripper_action
+        )
 
         expected_attached_object = None
         if hasattr(self.env, "get_expected_attached_object"):
@@ -1095,24 +1141,20 @@ class DataGeneratorRefactored:
             return False, {"success": False}
 
         print(f"Env {env_id}: Motion planning succeeded")
+        # Enqueue goal visualization to be flushed on the main env loop thread.
+        enqueue_goal_visualization(env_id=env_id, eef_name=eef_name, target_pose=target_pose)
+
         target_subtask_index = eef_state.current_subtask_index
         eef_state.next_subtask_index_after_motion = target_subtask_index
         eef_state.next_subtask_trajectory_after_motion = eef_subtask_trajectory
         eef_state.current_subtask_index = -1
 
-        mp_waypoints = self._convert_planned_trajectory_to_waypoints(motion_planner, target_gripper_action)
-
-        selected_demo_ind = selected_src_demo_inds[eef_name]
-        if selected_demo_ind is not None:
-            mp_gripper_actions = self._get_mp_gripper_actions_from_source_demo(
-                eef_name=eef_name,
-                subtask_ind=target_subtask_index,
-                selected_demo_ind=selected_demo_ind,
-                num_waypoints=len(mp_waypoints),
-                randomized_subtask_boundaries=randomized_subtask_boundaries,
-            )
-            for idx, waypoint in enumerate(mp_waypoints):
-                waypoint.gripper_action = mp_gripper_actions[idx]
+        # Convert the planned Cartesian trajectory into waypoints, holding the gripper fixed
+        # at the last skill segment action for the entire motion-planned transit.
+        mp_waypoints = self._convert_planned_trajectory_to_waypoints(
+            motion_planner,
+            base_gripper_action,
+        )
 
         eef_state.current_trajectory = mp_waypoints
         eef_state.subtask_step_index = 0
@@ -1541,3 +1583,15 @@ class DataGeneratorRefactored:
             waypoints.append(waypoint)
 
         return waypoints
+
+    def _get_goal_visualizer(self, env_id: int, eef_name: str) -> VisualizationMarkers:
+        """
+        Lazily create or fetch the goal marker visualizer for a given environment/end-effector.
+        """
+        key = (env_id, eef_name)
+        if key not in self._goal_visualizers:
+            prim_path = f"/Visuals/MotionPlanGoals/env_{env_id}_{eef_name}"
+            marker_cfg = dc_replace(FRAME_MARKER_CFG, prim_path=prim_path)
+            marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+            self._goal_visualizers[key] = VisualizationMarkers(marker_cfg)
+        return self._goal_visualizers[key]

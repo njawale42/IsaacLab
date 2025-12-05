@@ -74,7 +74,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9861], rot=[1, 0, 0, 0]),
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_beaker_red.usd",
-            scale=(0.45, 0.45, 1.3),
+            scale=(0.5, 0.5, 1.5), # changed this for testing
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         ),
     )
