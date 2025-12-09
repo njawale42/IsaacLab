@@ -20,10 +20,10 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
     def __post_init__(self):
         # Calling post init of parents
         super().__post_init__()
-        from isaaclab.envs.common import ViewerCfg
-        self.viewer = ViewerCfg(
-            eye=(0.0, 2.0, 2.0), lookat=(0.0, 0.0, 0.2), origin_type="asset_body", asset_name="robot", body_name="base_link"
-        )
+        # from isaaclab.envs.common import ViewerCfg
+        # self.viewer = ViewerCfg(
+        #     eye=(0.0, 2.0, 2.0), lookat=(0.0, 0.0, 0.2), origin_type="asset_body", asset_name="robot", body_name="base_link"
+        # )
 
         # Enable SkillGen to consume start boundaries and plan transitions
         self.datagen_config.use_skillgen = True

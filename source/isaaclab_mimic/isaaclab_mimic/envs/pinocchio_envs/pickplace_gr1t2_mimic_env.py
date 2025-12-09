@@ -127,3 +127,39 @@ class PickPlaceGR1T2MimicEnv(ManagerBasedRLMimicEnv):
             A dictionary of torch.Tensor gripper actions. Key to each dict is an eef_name.
         """
         return {"left": actions[:, 14:25], "right": actions[:, 25:]}
+
+    def get_expected_attached_object(self, eef_name: str, subtask_index: int, env_cfg) -> str | None:
+        """
+        (SkillGen) Return the expected attached object for the given EEF/subtask.
+
+        For GR1T2 bimanual tasks, determines which object should be attached based on
+        the current subtask and whether a grasp has occurred in the preceding subtask.
+
+        Args:
+            eef_name: Name of the end-effector ("left" or "right")
+            subtask_index: Current subtask index
+            env_cfg: Environment configuration containing subtask_configs
+
+        Returns:
+            Object name to attach, or None if no attachment expected
+        """
+        if eef_name not in env_cfg.subtask_configs:
+            return None
+
+        subtask_configs = env_cfg.subtask_configs[eef_name]
+        if not (0 <= subtask_index < len(subtask_configs)):
+            return None
+
+        # Check if we're past a grasp subtask - if so, we should have the object attached
+        if subtask_index > 0:
+            prev_cfg = subtask_configs[subtask_index - 1]
+            prev_signal = str(prev_cfg.subtask_term_signal).lower()
+
+            # If the previous subtask was a grasp, we should have the object attached
+            if "grasp" in prev_signal:
+                attached_object = prev_cfg.object_ref
+                print(f"[GR1T2 Attachment] EEF '{eef_name}' subtask {subtask_index}: "
+                      f"expecting '{attached_object}' attached (grasped in subtask {subtask_index - 1})")
+                return attached_object
+
+        return None

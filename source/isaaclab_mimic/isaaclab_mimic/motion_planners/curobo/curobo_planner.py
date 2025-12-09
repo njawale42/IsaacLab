@@ -283,6 +283,10 @@ class CuroboPlanner(MotionPlannerBase):
         self.spheres: list[tuple[str, float]] | None = None
         self.sphere_update_freq: int = self.config.sphere_update_freq
 
+        # Sync joint limits from Isaac Lab to cuRobo BEFORE warmup
+        # This ensures cuRobo plans within the same limits the controller uses
+        self._sync_joint_limits_from_isaac_lab()
+
         # Warm up planner
         self.logger.info("Warming up motion planner...")
         self.motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
@@ -337,6 +341,61 @@ class CuroboPlanner(MotionPlannerBase):
     # INITIALIZATION AND CONFIGURATION
     # =====================================================================================
 
+    def _sync_joint_limits_from_isaac_lab(self) -> None:
+        """Synchronize joint limits from Isaac Lab articulation to cuRobo kinematics.
+
+        This ensures cuRobo plans within the same joint limits that the IK controller
+        and physics simulation use. Without this sync, cuRobo might plan trajectories
+        that exceed the controller's limits, causing execution failures.
+
+        The method maps Isaac Lab joint names to cuRobo joint names and updates
+        cuRobo's position limits to match Isaac Lab's articulation limits.
+        """
+        # Get cuRobo's joint limits and names
+        curobo_limits = self.motion_gen.kinematics.get_joint_limits()
+        curobo_joint_names = list(curobo_limits.joint_names)
+
+        # Get Isaac Lab's joint limits (shape: [num_instances, num_joints, 2])
+        isaac_limits = self.robot.data.joint_pos_limits[self.env_id]  # [num_joints, 2]
+        isaac_joint_names = self.robot.data.joint_names
+
+        # Build mapping from Isaac Lab joint name to index
+        isaac_name_to_idx = {name: idx for idx, name in enumerate(isaac_joint_names)}
+
+        # Track updates for logging
+        updated_joints = []
+        mismatches = []
+
+        for curobo_idx, joint_name in enumerate(curobo_joint_names):
+            if joint_name in isaac_name_to_idx:
+                isaac_idx = isaac_name_to_idx[joint_name]
+                isaac_lower = isaac_limits[isaac_idx, 0].item()
+                isaac_upper = isaac_limits[isaac_idx, 1].item()
+
+                curobo_lower = curobo_limits.position[0, curobo_idx].item()
+                curobo_upper = curobo_limits.position[1, curobo_idx].item()
+
+                # Check for significant mismatch (more than 0.01 rad difference)
+                if abs(isaac_lower - curobo_lower) > 0.01 or abs(isaac_upper - curobo_upper) > 0.01:
+                    mismatches.append(
+                        f"{joint_name}: cuRobo=[{curobo_lower:.3f}, {curobo_upper:.3f}] "
+                        f"-> Isaac=[{isaac_lower:.3f}, {isaac_upper:.3f}]"
+                    )
+
+                # Update cuRobo limits to match Isaac Lab
+                curobo_limits.position[0, curobo_idx] = isaac_lower
+                curobo_limits.position[1, curobo_idx] = isaac_upper
+                updated_joints.append(joint_name)
+
+        if mismatches:
+            self.logger.info(f"Synced {len(updated_joints)} joint limits from Isaac Lab to cuRobo")
+            for mismatch in mismatches[:5]:  # Log first 5 mismatches
+                self.logger.debug(f"  Joint limit updated: {mismatch}")
+            if len(mismatches) > 5:
+                self.logger.debug(f"  ... and {len(mismatches) - 5} more")
+        else:
+            self.logger.debug(f"Joint limits already in sync ({len(updated_joints)} joints checked)")
+
     def _initialize_static_world(self) -> None:
         """Initialize static world geometry from USD stage.
 
@@ -344,26 +403,101 @@ class CuroboPlanner(MotionPlannerBase):
         the base collision world. This includes walls, tables, bins, and other fixed obstacles
         that don't change during the simulation. Dynamic objects are synchronized separately
         in update_world() to maintain performance.
+
+        Obstacles are extracted in WORLD FRAME, then manually transformed to robot base frame
+        using the physics root pose (robot.data.root_pos_w/root_quat_w). This ensures consistency
+        with dynamic object transforms which also use physics pose.
+
+        Note: We don't use robot_prim_path as reference because the USD prim and physics root
+        can have different transforms (e.g., internal offset in USD asset). Using physics pose
+        for both static and dynamic objects ensures they align correctly.
         """
+        from isaaclab.utils.math import quat_inv
+
         env_prim_path = f"/World/envs/env_{self.env_id}"
         robot_prim_path = self.config.robot_prim_path or f"{env_prim_path}/Robot"
-
         ignore_list = self.config.world_ignore_substrings or [
-            f"{env_prim_path}/Robot",
+            robot_prim_path,
             f"{env_prim_path}/target",
             "/World/defaultGroundPlane",
             "/curobo",
         ]
 
+        # Extract obstacles in WORLD FRAME (no reference prim).
         self._static_world_config = self.usd_helper.get_obstacles_from_stage(
             only_paths=[env_prim_path],
-            reference_prim_path=robot_prim_path,
+            reference_prim_path=None,
             ignore_substring=ignore_list,
         )
+
+        # Transform obstacles from world frame to robot base frame using PHYSICS pose.
+        # This ensures consistency with dynamic object transforms in _sync_object_poses_with_isaaclab.
+        robot_pos_w = self.robot.data.root_pos_w[self.env_id]
+        robot_quat_w = self.robot.data.root_quat_w[self.env_id]  # (w, x, y, z)
+        robot_quat_inv = quat_inv(robot_quat_w)
+
+        self._transform_world_config_to_robot_frame(
+            self._static_world_config, robot_pos_w, robot_quat_inv
+        )
+
         self._static_world_config = self._static_world_config.get_collision_check_world()
 
         # Initialize cuRobo world with static geometry
         self.motion_gen.update_world(self._static_world_config)
+
+    def _transform_world_config_to_robot_frame(
+        self, world_cfg, robot_pos_w: torch.Tensor, robot_quat_inv: torch.Tensor
+    ) -> None:
+        """Transform world config obstacles from world frame to robot base frame.
+
+        Args:
+            world_cfg: WorldConfig with obstacles in world frame
+            robot_pos_w: Robot position in world frame
+            robot_quat_inv: Inverse of robot quaternion (for rotation)
+        """
+        from isaaclab.utils.math import quat_apply, quat_mul
+
+        def _transform_obstacle(obj):
+            if obj is None or not hasattr(obj, "pose") or obj.pose is None:
+                return
+            # obj.pose is [x, y, z, qw, qx, qy, qz]
+            pos = torch.tensor(obj.pose[:3], device=robot_pos_w.device, dtype=torch.float32)
+            quat = torch.tensor(obj.pose[3:], device=robot_pos_w.device, dtype=torch.float32)
+
+            # Transform position: p_robot = R_robot^-1 * (p_obj - p_robot)
+            rel_pos = pos - robot_pos_w
+            new_pos = quat_apply(robot_quat_inv, rel_pos)
+
+            # Transform orientation: q_robot = q_robot^-1 * q_obj
+            new_quat = quat_mul(robot_quat_inv, quat)
+
+            # Update pose
+            obj.pose = [
+                float(new_pos[0].item()),
+                float(new_pos[1].item()),
+                float(new_pos[2].item()),
+                float(new_quat[0].item()),
+                float(new_quat[1].item()),
+                float(new_quat[2].item()),
+                float(new_quat[3].item()),
+            ]
+
+        def _transform_list(obj_list):
+            if not obj_list:
+                return
+            for obj in obj_list:
+                _transform_obstacle(obj)
+
+        # Handle both single config and list of configs
+        cfgs = world_cfg if isinstance(world_cfg, list) else [world_cfg]
+        for cfg in cfgs:
+            if cfg is None:
+                continue
+            _transform_list(getattr(cfg, "cuboid", None))
+            _transform_list(getattr(cfg, "mesh", None))
+            _transform_list(getattr(cfg, "cylinder", None))
+            _transform_list(getattr(cfg, "capsule", None))
+            _transform_list(getattr(cfg, "sphere", None))
 
     # =====================================================================================
     # PROPERTIES AND BASIC GETTERS
@@ -601,13 +735,24 @@ class CuroboPlanner(MotionPlannerBase):
         steps or manual object movements. Static objects (bins, tables, walls) are skipped
         for performance as they shouldn't move during simulation.
 
+        Objects are transformed to ROBOT BASE FRAME to match static obstacles extracted
+        with robot prim as reference. This ensures correct collision checking for robots
+        with non-identity orientation (like GR1T2 which is rotated 90 degrees).
+
         The method updates both the world model and the collision checker to ensure
         consistency across all cuRobo components.
         """
+        from isaaclab.utils.math import quat_inv, quat_apply, quat_mul
+
         # Get cached object mappings and world model
         object_mappings = self._get_object_mappings()
         world_model = self.motion_gen.world_coll_checker.world_model
         rigid_objects = self.env.scene.rigid_objects
+
+        # Get robot world pose for transforming objects to robot base frame
+        robot_pos_w = self.robot.data.root_pos_w[self.env_id]
+        robot_quat_w = self.robot.data.root_quat_w[self.env_id]  # (w, x, y, z)
+        robot_quat_inv = quat_inv(robot_quat_w)
 
         updated_count = 0
 
@@ -621,11 +766,17 @@ class CuroboPlanner(MotionPlannerBase):
                 self.logger.debug(f"SYNC: Skipping static object {object_name}")
                 continue
 
-            # Get current pose from Lab (may be on CPU or CUDA depending on --device flag)
+            # Get current pose from Lab in world frame
             obj = rigid_objects[object_name]
-            env_origin = self.env.scene.env_origins[self.env_id]
-            current_pos_raw = obj.data.root_pos_w[self.env_id] - env_origin
-            current_quat_raw = obj.data.root_quat_w[self.env_id]  # (w, x, y, z)
+            obj_pos_w = obj.data.root_pos_w[self.env_id]
+            obj_quat_w = obj.data.root_quat_w[self.env_id]  # (w, x, y, z)
+
+            # Transform to robot base frame: p_robot = R_robot^-1 * (p_obj - p_robot)
+            rel_pos = obj_pos_w - robot_pos_w
+            current_pos_raw = quat_apply(robot_quat_inv, rel_pos)
+
+            # Transform orientation: q_robot = q_robot^-1 * q_obj
+            current_quat_raw = quat_mul(robot_quat_inv, obj_quat_w)
 
             # Convert to cuRobo device and extract float values for pose list
             current_pos = self._to_curobo_device(current_pos_raw)
@@ -661,11 +812,15 @@ class CuroboPlanner(MotionPlannerBase):
                 if any(static_name in object_name.lower() for static_name in static_objects):
                     continue
 
-                # Get current pose and update in collision checker
+                # Get current pose and transform to robot base frame
                 obj = rigid_objects[object_name]
-                env_origin = self.env.scene.env_origins[self.env_id]
-                current_pos_raw = obj.data.root_pos_w[self.env_id] - env_origin
-                current_quat_raw = obj.data.root_quat_w[self.env_id]
+                obj_pos_w = obj.data.root_pos_w[self.env_id]
+                obj_quat_w = obj.data.root_quat_w[self.env_id]
+
+                # Transform to robot base frame
+                rel_pos = obj_pos_w - robot_pos_w
+                current_pos_raw = quat_apply(robot_quat_inv, rel_pos)
+                current_quat_raw = quat_mul(robot_quat_inv, obj_quat_w)
 
                 current_pos = self._to_curobo_device(current_pos_raw)
                 current_quat = self._to_curobo_device(current_quat_raw)
@@ -881,10 +1036,17 @@ class CuroboPlanner(MotionPlannerBase):
             self._set_active_links(list(detached_links), active=True)
             self.logger.debug(f"Re-enabled collision for attachment links: {detached_links}")
 
-        # Call cuRobo's detach for each link
+        # Call cuRobo's detach for tracked links
         for link_name in link_names:
             self.motion_gen.detach_object_from_robot(link_name=link_name)
             self.logger.debug(f"Called cuRobo detach for link {link_name}")
+
+        # ALWAYS detach from configured attachment link to clean up any orphaned spheres
+        # This handles cases where cuRobo has spheres attached but our tracking doesn't know
+        configured_link = self.config.attached_object_link_name
+        if configured_link and configured_link not in link_names:
+            self.motion_gen.detach_object_from_robot(link_name=configured_link)
+            self.logger.debug(f"Called cuRobo detach for configured attachment link: {configured_link}")
 
         return True
 
@@ -908,6 +1070,16 @@ class CuroboPlanner(MotionPlannerBase):
             True if one or more objects are attached, False if no attachments exist
         """
         return len(self.attached_objects) != 0
+
+    def detach_all_objects(self) -> bool:
+        """Detach all objects from the robot.
+
+        Public wrapper for _detach_objects that detaches from all attachment links.
+
+        Returns:
+            True if detachment succeeded
+        """
+        return self._detach_objects()
 
     # =====================================================================================
     # JOINT STATE AND KINEMATICS
@@ -1155,11 +1327,17 @@ class CuroboPlanner(MotionPlannerBase):
             robot_link_count = 0
 
             # Count robot link spheres
-            robot_links = [
-                link
-                for link in self.robot_cfg["kinematics"]["collision_link_names"]
-                if link != self.config.attached_object_link_name
-            ]
+            collision_link_names = self.robot_cfg["kinematics"]["collision_link_names"]
+            attached_link = self.config.attached_object_link_name
+            is_dedicated_attachment_link = attached_link and (
+                attached_link.startswith("attached_object") or attached_link not in collision_link_names
+            )
+
+            if is_dedicated_attachment_link:
+                robot_links = [link for link in collision_link_names if link != attached_link]
+            else:
+                robot_links = list(collision_link_names)
+
             for link_name in robot_links:
                 link_spheres = self.motion_gen.kinematics.kinematics_config.get_link_spheres(link_name)
                 if link_spheres is not None:
@@ -1685,21 +1863,31 @@ class CuroboPlanner(MotionPlannerBase):
                 self.spheres.append((prim_path, float(sphere.radius)))
 
     def _get_robot_link_sphere_count(self) -> int:
-        """Calculate total number of collision spheres for robot links excluding attached objects.
+        """Calculate total number of collision spheres for robot links.
 
-        Iterates through all robot collision links (excluding the attached object link) and
-        counts the active collision spheres for each link. This count is used to determine
-        which spheres in the visualization represent robot links vs attached objects.
+        Counts active collision spheres for all robot links. Only excludes the attachment
+        link if it's a DEDICATED attachment link (not in collision_link_names). For humanoid
+        robots where the EE link is used for attachment, all spheres are counted as robot
+        spheres since the EE link is a real kinematic link.
 
         Returns:
-            Total number of active collision spheres for robot links only
+            Total number of active collision spheres for robot links
         """
         sphere_config = self.motion_gen.kinematics.kinematics_config
-        robot_links = [
-            link
-            for link in self.robot_cfg["kinematics"]["collision_link_names"]
-            if link != self.config.attached_object_link_name
-        ]
+        collision_link_names = self.robot_cfg["kinematics"]["collision_link_names"]
+        attached_link = self.config.attached_object_link_name
+
+        # Dedicated attachment link (Franka-style) should be excluded even if present in the list.
+        # Humanoid uses a real EE link for attachment, so we keep it in the robot links.
+        is_dedicated_attachment_link = attached_link and (
+            attached_link.startswith("attached_object") or attached_link not in collision_link_names
+        )
+
+        if is_dedicated_attachment_link:
+            robot_links = [link for link in collision_link_names if link != attached_link]
+        else:
+            robot_links = list(collision_link_names)
+
         return sum(
             int(torch.sum(sphere_config.get_link_spheres(link_name)[:, 3] > 0).item()) for link_name in robot_links
         )
@@ -1776,12 +1964,19 @@ class CuroboPlanner(MotionPlannerBase):
         Returns:
             True if sphere belongs to an attached object, False if it's a robot link sphere
         """
-        # Get total number of robot link spheres (excluding attached_object)
-        robot_links = [
-            link
-            for link in self.robot_cfg["kinematics"]["collision_link_names"]
-            if link != self.config.attached_object_link_name
-        ]
+        # Get total number of robot link spheres
+        collision_link_names = self.robot_cfg["kinematics"]["collision_link_names"]
+        attached_link = self.config.attached_object_link_name
+        # Dedicated attachment link (Franka-style) should be excluded even if present in the list.
+        # Humanoid uses a real EE link for attachment, so we keep it in the robot links.
+        is_dedicated_attachment_link = attached_link and (
+            attached_link.startswith("attached_object") or attached_link not in collision_link_names
+        )
+
+        if is_dedicated_attachment_link:
+            robot_links = [link for link in collision_link_names if link != attached_link]
+        else:
+            robot_links = list(collision_link_names)
 
         total_robot_spheres = 0
         for link_name in robot_links:
@@ -1867,15 +2062,18 @@ class CuroboPlanner(MotionPlannerBase):
                     obj_pos = obj.data.root_pos_w[env_id] - origin
                     self.logger.debug(f"Isaac Lab object position: {obj_pos}")
 
-                    # Debug end-effector position
-                    ee_frame_cfg = SceneEntityCfg("ee_frame")
-                    ee_frame = self.env.scene[ee_frame_cfg.name]
-                    ee_pos = ee_frame.data.target_pos_w[env_id, 0, :] - origin
-                    self.logger.debug(f"End-effector position: {ee_pos}")
-
-                    # Debug distance
-                    distance = torch.linalg.vector_norm(obj_pos - ee_pos).item()
-                    self.logger.debug(f"Distance EE to object: {distance:.4f}")
+                    # Debug end-effector position (handle missing ee_frame gracefully)
+                    # Note: InteractiveScene doesn't implement __contains__, use keys() instead
+                    try:
+                        scene_keys = set(self.env.scene.keys()) if hasattr(self.env.scene, "keys") else set()
+                        if "ee_frame" in scene_keys:
+                            ee_frame = self.env.scene["ee_frame"]
+                            ee_pos = ee_frame.data.target_pos_w[env_id, 0, :] - origin
+                            self.logger.debug(f"End-effector position: {ee_pos}")
+                            distance = torch.linalg.vector_norm(obj_pos - ee_pos).item()
+                            self.logger.debug(f"Distance EE to object: {distance:.4f}")
+                    except (KeyError, AttributeError):
+                        self.logger.debug("ee_frame not available in scene (bimanual robot)")
 
                     # Debug gripper state
                     gripper_open_val = self.config.grasp_gripper_open_val
@@ -1924,25 +2122,301 @@ class CuroboPlanner(MotionPlannerBase):
     def _check_object_grasped(self, gripper_pos: torch.Tensor, object_name: str) -> bool:
         """Check if a specific object is currently grasped by the robot.
 
-        Uses gripper position to determine if an object is grasped.
+        Supports multiple detection modes configured via config.grasp_detection_mode:
+        - 'gripper': Uses gripper joint position (for parallel jaw grippers like Franka)
+        - 'distance': Uses 3D object-to-EE distance (simple dexterous check)
+        - 'dexterous': Uses finger joint positions + XY distance (for cylindrical objects)
+        - 'callback': Uses environment's check_object_grasped method if available
 
         Args:
-            gripper_pos: Gripper position tensor
-            object_name: Name of object to check (e.g., "cube_1")
+            gripper_pos: Gripper position tensor (used in 'gripper' mode)
+            object_name: Name of object to check (e.g., "cube_1", "FactoryNut")
 
         Returns:
             True if object is detected as grasped
         """
-        gripper_open_val = self.config.grasp_gripper_open_val
-        object_grasped = gripper_pos[0].item() < gripper_open_val
+        detection_mode = getattr(self.config, "grasp_detection_mode", "gripper")
+        object_grasped = False
+
+        if detection_mode == "callback":
+            # Use environment callback if available
+            object_grasped = self._check_object_grasped_callback(object_name)
+
+        elif detection_mode == "distance":
+            # Simple 3D distance-based detection
+            object_grasped = self._check_object_grasped_by_distance(object_name)
+
+        elif detection_mode == "dexterous":
+            # Dexterous hand: finger joints + XY distance (for cylindrical objects)
+            object_grasped = self._check_object_grasped_dexterous(object_name)
+
+        else:
+            # Default: gripper-based detection for parallel jaw grippers
+            object_grasped = self._check_object_grasped_by_gripper(gripper_pos, object_name)
 
         self.logger.info(
-            f"Object {object_name} is grasped: {object_grasped}"
-            if object_grasped
-            else f"Object {object_name} is not grasped"
+            f"Object {object_name} grasp check ({detection_mode}): {object_grasped}"
         )
-
         return object_grasped
+
+    def _check_object_grasped_by_gripper(self, gripper_pos: torch.Tensor, object_name: str) -> bool:
+        """Check grasp using parallel jaw gripper position.
+
+        Args:
+            gripper_pos: Gripper joint positions tensor
+            object_name: Name of object to check
+
+        Returns:
+            True if gripper is closed (below open threshold)
+        """
+        gripper_open_val = self.config.grasp_gripper_open_val
+        return gripper_pos[0].item() < gripper_open_val
+
+    def _check_object_grasped_by_distance(self, object_name: str) -> bool:
+        """Check grasp using 3D distance between object and end-effector.
+
+        Simple distance check - suitable for small objects where center distance is meaningful.
+
+        Args:
+            object_name: Name of object to check
+
+        Returns:
+            True if object is within grasp_distance_threshold of EE
+        """
+        threshold = getattr(self.config, "grasp_distance_threshold", 0.08)
+        ee_frame_name = getattr(self.config, "grasp_ee_frame_name", None) or "ee_frame"
+
+        # Get object position
+        rigid_objects = self.env.scene.rigid_objects
+        if object_name not in rigid_objects:
+            self.logger.warning(f"Object {object_name} not found in scene rigid objects")
+            return False
+
+        obj = rigid_objects[object_name]
+        origin = self.env.scene.env_origins[self.env_id]
+        obj_pos = obj.data.root_pos_w[self.env_id] - origin
+
+        # Get EE position - try multiple approaches
+        ee_pos = self._get_ee_position_for_grasp_check(ee_frame_name)
+        if ee_pos is None:
+            self.logger.warning("Could not get EE position for grasp check")
+            return False
+
+        # Compute 3D distance
+        distance = torch.linalg.vector_norm(obj_pos - ee_pos).item()
+        self.logger.debug(f"Object {object_name} distance to EE: {distance:.4f}m (threshold: {threshold})")
+
+        return distance < threshold
+
+    def _check_object_grasped_dexterous(self, object_name: str) -> bool:
+        """Check grasp for dexterous hands using finger joints + XY distance.
+
+        For cylindrical objects like beakers that can be grasped at any height,
+        this method checks:
+        1. Finger joints are closed (bent past threshold)
+        2. Object is within XY distance of EE (ignoring Z for height variance)
+
+        The XY threshold is intentionally generous because the EE frame is typically
+        at the wrist/palm, while actual grasp contact is at the fingertips (10-15cm away).
+
+        Args:
+            object_name: Name of object to check
+
+        Returns:
+            True if fingers are closed AND object is within XY distance threshold
+        """
+        xy_threshold = getattr(self.config, "grasp_xy_distance_threshold", 0.15)  # Default 15cm for palm-to-fingertip
+        finger_threshold = getattr(self.config, "dexterous_finger_closed_threshold", 0.3)
+        ee_frame_name = getattr(self.config, "grasp_ee_frame_name", None) or "ee_frame"
+
+        print(f"\n=== DEXTEROUS GRASP CHECK: {object_name} ===")
+        print(f"  Thresholds: XY={xy_threshold:.3f}m, finger={finger_threshold:.3f}rad")
+
+        # Check finger joint positions - returns (is_closed, closed_ratio)
+        fingers_closed, closed_ratio = self._check_dexterous_fingers_closed(finger_threshold)
+        if not fingers_closed:
+            print("  RESULT: NOT GRASPED (fingers not closed)")
+            return False
+
+        # Get object position
+        rigid_objects = self.env.scene.rigid_objects
+        if object_name not in rigid_objects:
+            self.logger.warning(f"Object {object_name} not found in scene rigid objects")
+            return False
+
+        obj = rigid_objects[object_name]
+        origin = self.env.scene.env_origins[self.env_id]
+        obj_pos = obj.data.root_pos_w[self.env_id] - origin
+
+        # Get EE position
+        ee_pos = self._get_ee_position_for_grasp_check(ee_frame_name)
+        if ee_pos is None:
+            self.logger.warning("Could not get EE position for grasp check")
+            return False
+
+        # Compute distances
+        xy_diff = obj_pos[:2] - ee_pos[:2]
+        xy_distance = torch.linalg.vector_norm(xy_diff).item()
+        z_diff = abs(obj_pos[2].item() - ee_pos[2].item())
+        full_3d_distance = torch.linalg.vector_norm(obj_pos - ee_pos).item()
+
+        print(f"  Object pos (env frame): [{obj_pos[0].item():.3f}, {obj_pos[1].item():.3f}, {obj_pos[2].item():.3f}]")
+        print(f"  EE pos (env frame):     [{ee_pos[0].item():.3f}, {ee_pos[1].item():.3f}, {ee_pos[2].item():.3f}]")
+        print(f"  XY distance: {xy_distance:.4f}m (threshold: {xy_threshold}m) {'PASS' if xy_distance < xy_threshold else 'FAIL'}")
+        print(f"  Z difference: {z_diff:.4f}m (ignored for cylindrical objects)")
+        print(f"  Full 3D distance: {full_3d_distance:.4f}m")
+
+        # If all/most fingers are strongly closed, be more lenient with distance
+        # This handles cases where EE frame is at wrist but fingers are clearly wrapped around object
+        effective_threshold = xy_threshold
+        if closed_ratio >= 0.8:  # 80%+ fingers closed
+            effective_threshold = xy_threshold * 1.5  # 50% more lenient
+            print(f"  [Strong finger closure ({closed_ratio:.0%})] Using relaxed threshold: {effective_threshold:.3f}m")
+
+        is_grasped = xy_distance < effective_threshold
+        print(f"  RESULT: {'GRASPED' if is_grasped else 'NOT GRASPED'}")
+        print("=" * 50)
+
+        return is_grasped
+
+    def _check_dexterous_fingers_closed(self, threshold: float) -> tuple[bool, float]:
+        """Check if dexterous hand fingers are in closed/grasping position.
+
+        Checks if key finger joints are bent past the threshold, indicating
+        the hand is in a grasping configuration. Uses ABSOLUTE VALUE of joint
+        position since some robots (like GR1T2) use negative values for closed.
+
+        Args:
+            threshold: Joint position threshold (radians) for considering closed
+
+        Returns:
+            Tuple of (is_closed, closed_ratio) where:
+            - is_closed: True if sufficient fingers are closed
+            - closed_ratio: Fraction of fingers that are closed (0.0 to 1.0)
+        """
+        # Get configured finger joint names or use defaults
+        finger_joint_names = getattr(self.config, "dexterous_finger_joint_names", None)
+
+        if finger_joint_names is None:
+            # Default: use common finger joints for the robot
+            finger_joint_names = self._get_default_finger_joint_names()
+
+        if not finger_joint_names:
+            print("  [Finger Check] WARNING: No finger joint names configured, assuming grasped")
+            return True, 1.0  # Assume grasped if we can't check
+
+        # Get joint positions from robot
+        try:
+            joint_ids, found_names = self.robot.find_joints(finger_joint_names)
+            if len(joint_ids) == 0:
+                print(f"  [Finger Check] WARNING: Could not find finger joints: {finger_joint_names}")
+                return True, 1.0  # Assume grasped if joints not found
+
+            joint_positions = self.robot.data.joint_pos[self.env_id, joint_ids]
+
+            # Print each joint's position and status
+            # Use ABSOLUTE VALUE since GR1T2 and some robots use negative values for closed
+            print(f"  [Finger Check] Checking {len(joint_ids)} finger joints (threshold: {threshold:.3f} rad, using |pos|):")
+            closed_joints = []
+            open_joints = []
+            for i, (jid, jname) in enumerate(zip(joint_ids, found_names)):
+                pos = joint_positions[i].item()
+                abs_pos = abs(pos)
+                is_closed = abs_pos > threshold
+                status = "CLOSED" if is_closed else "open"
+                print(f"    - {jname}: {pos:.4f} rad (|{abs_pos:.4f}|) [{status}]")
+                if is_closed:
+                    closed_joints.append(jname)
+                else:
+                    open_joints.append(jname)
+
+            # Check how many fingers are closed (|joint position| > threshold)
+            closed_count = len(closed_joints)
+            total_joints = len(joint_ids)
+            closed_ratio = closed_count / total_joints if total_joints > 0 else 0.0
+
+            # Consider grasped if majority of finger joints are closed
+            min_closed = max(1, total_joints // 2)
+            fingers_closed = closed_count >= min_closed
+
+            print(f"  [Finger Check] Summary: {closed_count}/{total_joints} closed (min required: {min_closed})")
+            print(f"  [Finger Check] Result: {'FINGERS CLOSED' if fingers_closed else 'FINGERS OPEN'}")
+
+            return fingers_closed, closed_ratio
+
+        except Exception as e:
+            print(f"  [Finger Check] ERROR: {e}")
+            return True, 1.0  # Assume grasped on error
+
+    def _get_default_finger_joint_names(self) -> list[str]:
+        """Get default finger joint names based on robot configuration.
+
+        Override in subclasses for robot-specific finger joints.
+
+        Returns:
+            List of finger joint names to check for grasp detection
+        """
+        # Check if config has gripper joint names
+        if self.config.gripper_joint_names:
+            return list(self.config.gripper_joint_names)
+
+        # No default finger joints for base class
+        return []
+
+    def _get_ee_position_for_grasp_check(self, ee_frame_name: str) -> torch.Tensor | None:
+        """Get end-effector position for grasp distance checking.
+
+        Args:
+            ee_frame_name: Name of the EE frame in the scene
+
+        Returns:
+            EE position tensor (3,) relative to env origin, or None if not found
+        """
+        origin = self.env.scene.env_origins[self.env_id]
+
+        # Try to get EE frame from scene
+        # Note: InteractiveScene doesn't implement __contains__, use keys() instead
+        scene_keys = set(self.env.scene.keys()) if hasattr(self.env.scene, "keys") else set()
+        if ee_frame_name in scene_keys:
+            ee_frame = self.env.scene[ee_frame_name]
+            if hasattr(ee_frame, "data") and hasattr(ee_frame.data, "target_pos_w"):
+                return ee_frame.data.target_pos_w[self.env_id, 0, :] - origin
+
+        # Fallback: Use robot root position + FK from cuRobo
+        try:
+            cu_js = self._get_current_joint_state_for_curobo()
+            ee_pose = self.get_ee_pose(cu_js)
+            if ee_pose is not None and hasattr(ee_pose, "position"):
+                # EE pose from cuRobo is in robot base frame, need to convert
+                ee_pos_base = self._to_env_device(ee_pose.position).reshape(-1)
+                # Add robot base position (relative to env origin)
+                robot_pos = self.robot.data.root_pos_w[self.env_id] - origin
+                return robot_pos + ee_pos_base
+        except Exception as e:
+            self.logger.debug(f"FK fallback failed: {e}")
+
+        return None
+
+    def _check_object_grasped_callback(self, object_name: str) -> bool:
+        """Check grasp using environment callback.
+
+        Allows the environment to define custom grasp detection logic.
+
+        Args:
+            object_name: Name of object to check
+
+        Returns:
+            True if environment reports object as grasped
+        """
+        # Check if environment has custom grasp detection
+        if hasattr(self.env, "check_object_grasped"):
+            return bool(self.env.check_object_grasped(object_name, self.env_id))
+
+        # Fallback to distance-based if callback not available
+        self.logger.warning(
+            "Environment has no check_object_grasped method, falling back to distance mode"
+        )
+        return self._check_object_grasped_by_distance(object_name)
 
     def _set_gripper_state(self, has_attached_objects: bool) -> None:
         """Configure gripper joint positions based on object attachment status.
@@ -1986,13 +2460,20 @@ class CuroboPlanner(MotionPlannerBase):
 
         # Get sphere configuration
         sphere_config = self.motion_gen.kinematics.kinematics_config
+        collision_link_names = self.robot_cfg["kinematics"]["collision_link_names"]
+        attached_link = self.config.attached_object_link_name
 
-        # Count robot link spheres (excluding attached_object)
-        robot_links = [
-            link
-            for link in self.robot_cfg["kinematics"]["collision_link_names"]
-            if link != self.config.attached_object_link_name
-        ]
+        # Dedicated attachment link (Franka-style) should be excluded even if present in the list.
+        # Humanoid uses a real EE link for attachment, so we keep it in the robot links.
+        is_dedicated_attachment_link = attached_link and (
+            attached_link.startswith("attached_object") or attached_link not in collision_link_names
+        )
+
+        if is_dedicated_attachment_link:
+            robot_links = [link for link in collision_link_names if link != attached_link]
+        else:
+            robot_links = list(collision_link_names)
+
         robot_sphere_count = 0
         for link_name in robot_links:
             if hasattr(sphere_config, "get_link_spheres"):

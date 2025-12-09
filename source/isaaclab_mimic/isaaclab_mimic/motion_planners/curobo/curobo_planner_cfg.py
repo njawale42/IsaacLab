@@ -108,7 +108,34 @@ class CuroboPlannerCfg:
     """Distance to retreat at the start of the plan."""
 
     grasp_gripper_open_val: float = 0.04
-    """Gripper joint value when considered open for grasp detection."""
+    """Gripper joint value when considered open for grasp detection (parallel grippers)."""
+
+    # Grasp detection configuration
+    grasp_detection_mode: str = "gripper"
+    """Grasp detection mode:
+    - 'gripper': Parallel jaw gripper joint position (Franka)
+    - 'distance': 3D distance to EE (simple dexterous)
+    - 'dexterous': Finger joint positions + XY distance (GR1T2)
+    - 'callback': Environment-defined via env.check_object_grasped()
+    """
+
+    grasp_distance_threshold: float = 0.08
+    """Distance threshold for simple distance-based grasp detection (3D distance in meters)."""
+
+    grasp_xy_distance_threshold: float = 0.12
+    """XY distance threshold for dexterous mode (ignores Z for cylindrical objects)."""
+
+    grasp_ee_frame_name: str | None = None
+    """Name of the end-effector frame for distance-based grasp detection. None uses default 'ee_frame'."""
+
+    # Dexterous hand finger configuration
+    dexterous_finger_joint_names: list[str] | None = None
+    """List of finger joint names to check for grasp detection in 'dexterous' mode.
+    If None, uses default GR1T2 finger joints based on arm side."""
+
+    dexterous_finger_closed_threshold: float = 0.3
+    """Joint position threshold (radians) for considering fingers closed in 'dexterous' mode.
+    Fingers are considered closed when joint position > this threshold."""
 
     # Planning configuration
     enable_graph: bool = True
@@ -400,7 +427,7 @@ class CuroboPlannerCfg:
             n_repeat=None,
             motion_step_size=None,
             visualize_spheres=False,
-            visualize_plan=False,
+            visualize_plan=True,
             debug_planner=False,
             sphere_update_freq=5,
             motion_noise_scale=0.02,
@@ -419,7 +446,7 @@ class CuroboPlannerCfg:
         config.surface_sphere_radius = 0.01
         config.debug_planner = False
         config.collision_activation_distance = 0.02
-        config.visualize_plan = False
+        config.visualize_plan = True
         config.enable_finetune_trajopt = True
         config.motion_noise_scale = 0.02
         config.get_world_config = lambda: config._get_world_config_with_table_adjustment()
@@ -430,7 +457,7 @@ class CuroboPlannerCfg:
         """Create configuration for Franka stacking a normal cube."""
         config = cls.franka_config()
         config.static_objects = ["table"]
-        config.visualize_plan = False
+        config.visualize_plan = True
         config.debug_planner = False
         config.motion_noise_scale = 0.02
         config.collision_activation_distance = 0.01

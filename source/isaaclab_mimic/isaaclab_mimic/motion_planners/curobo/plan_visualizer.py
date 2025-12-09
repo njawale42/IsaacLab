@@ -390,8 +390,8 @@ class PlanVisualizer:
                 f"offset={self._base_translation}" if np.linalg.norm(self._base_translation) > 0 else "no offset"
             )
             print(
-                f"Visualizing plan: {len(plan.position)} waypoints, {robot_count} robot spheres (with offset),"
-                f" {attached_count} attached spheres (no offset), {offset_info}"
+                f"Visualizing plan: {len(plan.position)} waypoints, {robot_count} robot spheres,"
+                f" {attached_count} attached spheres, {offset_info}"
             )
 
         # Set timeline for static visualization (separate from animation)
@@ -545,11 +545,13 @@ class PlanVisualizer:
         Args:
             spheres: List of attached object spheres
         """
+        # Attached spheres are in robot base frame (computed via FK), so they
+        # need the same offset as robot spheres for correct visualization
         self._log_spheres(
             spheres=spheres,
             entity_type="attached",
             color=[255, 0, 0, 128],  # Semi-transparent red
-            apply_offset=False,
+            apply_offset=True,
         )
 
     def _clear_attached_spheres(self) -> None:
@@ -626,11 +628,13 @@ class PlanVisualizer:
             rr_path = f"world/scene/{node.replace('/', '_')}"
 
             # Always update transform (objects may move between calls)
-            # NOTE: World scene objects are already in correct world coordinates, no offset needed
+            # World scene obstacles are in robot base frame (same as robot spheres).
+            # Apply _base_translation to align with robot sphere visualization.
+            translation = tform[:3, 3] + self._base_translation
             rr.log(
                 rr_path,
                 rr.Transform3D(
-                    translation=tform[:3, 3],
+                    translation=translation,
                     mat3x3=tform[:3, :3],
                     axis_length=0.25,
                 ),
@@ -814,13 +818,17 @@ class PlanVisualizer:
                 pos = pos.reshape(-1)
                 radius = float(sphere.radius)
 
+                # ALL spheres from get_robot_as_spheres are in robot base frame
+                # and need the base translation offset for visualization
+                pos_with_offset = pos + self._base_translation
+
                 if i < robot_link_count:
-                    # Robot sphere - needs base translation offset
-                    robot_sphere_positions.append(pos + self._base_translation)
+                    # Robot link sphere
+                    robot_sphere_positions.append(pos_with_offset)
                     robot_sphere_radii.append(radius)
                 else:
-                    # Attached object sphere - already in world coordinates
-                    attached_sphere_positions.append(pos)
+                    # Attached object sphere (also in robot base frame via FK)
+                    attached_sphere_positions.append(pos_with_offset)
                     attached_sphere_radii.append(radius)
 
             # Log robot spheres with green color

@@ -20,7 +20,32 @@ def to_python(obj):
     return obj
 
 
-def build_humanoid_yaml_from_usd(usd_path: str, arm: str, inactive_joints: list[str] | None = None) -> str:
+def _scale_collision_sphere_radii(
+    robot_cfg: dict,
+    radius_scale: float = 1.0,
+    per_link_scale: dict[str, float] | None = None,
+) -> None:
+    """Scale collision sphere radii in-place."""
+    spheres = robot_cfg.get("kinematics", {}).get("collision_spheres")
+    if not spheres or radius_scale == 1.0 and not per_link_scale:
+        return
+    for link_name, link_spheres in spheres.items():
+        link_scale = per_link_scale.get(link_name, 1.0) if per_link_scale else 1.0
+        scale = radius_scale * link_scale
+        if scale == 1.0:
+            continue
+        for sphere in link_spheres:
+            if "radius" in sphere:
+                sphere["radius"] *= scale
+
+
+def build_humanoid_yaml_from_usd(
+    usd_path: str,
+    arm: str,
+    inactive_joints: list[str] | None = None,
+    radius_scale: float = 0.5,
+    per_link_radius_scale: dict[str, float] | None = None,
+) -> str:
     """Build cuRobo robot configuration YAML from USD file."""
     tmp_dir = tempfile.mkdtemp(prefix="gr1_curobo_")
     print("[PlanHumanoid] Converting USD to URDF...")
@@ -39,9 +64,10 @@ def build_humanoid_yaml_from_usd(usd_path: str, arm: str, inactive_joints: list[
     )
 
     # Configure sphere generation
-    max_spheres = 225 - len(tool_links) * 50
+    max_spheres = 400 - len(tool_links) * 50
     load_spheres(robot_config, max_spheres=max_spheres, max_link_spheres=int(1e9))
     robot_cfg_dict = robot_config["robot_cfg"]
+    _scale_collision_sphere_radii(robot_cfg_dict, radius_scale=radius_scale, per_link_scale=per_link_radius_scale)
     robot_cfg_yaml = to_python(robot_cfg_dict)
 
     def _strip_keys(obj, keys):

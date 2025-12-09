@@ -146,8 +146,18 @@ def main():
                     "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
                 ],
                 static_objects=["table", "scale", "bin"],
-                # Ignore entire USD /World for obstacle extraction; rely on YAML world only
-                world_ignore_substrings=["/World/"],
+                # Ignore specific USD prims; remove items one-by-one to debug collisions
+                world_ignore_substrings=[
+                    "/World/envs/env_0/Table",
+                    # "/World/envs/env_0/SortingScale",
+                    # "/World/envs/env_0/SortingBowl",
+                    # "/World/envs/env_0/SortingBeaker",
+                    "/World/envs/env_0/FactoryNut",
+                    # "/World/envs/env_0/BlackSortingBin",
+                    "/World/envs/env_0/RobotPOVCam",
+                    "/World/envs/env_0/Robot",
+                    "/World/GroundPlane",
+                ],
                 approach_distance=0.0,
                 retreat_distance=0.0,
                 time_dilation_factor=0.5,
@@ -157,6 +167,11 @@ def main():
                 visualize_spheres=False,
                 visualize_plan=True,
                 debug_planner=True,
+                # Dexterous hand grasp detection using finger joints + XY distance
+                # Works for cylindrical objects (beakers) grasped at any height
+                grasp_detection_mode="dexterous",
+                grasp_xy_distance_threshold=0.18,  # XY distance from EE (wrist) to object center
+                dexterous_finger_closed_threshold=0.2,  # Finger joint threshold (radians)
             )
 
         cfg_right = _mk_cfg(yaml_right)
@@ -209,8 +224,8 @@ def main():
             else:
                 planner_config = CuroboPlannerCfg.from_task_name(env_name)
                 # No planner visualization during dataset generation
-                planner_config.visualize_spheres = False
-                planner_config.visualize_plan = False
+                # planner_config.visualize_spheres = False
+                # planner_config.visualize_plan = False
                 motion_planners[env_id] = CuroboPlanner(
                     env=env,
                     robot=env.scene["robot"],

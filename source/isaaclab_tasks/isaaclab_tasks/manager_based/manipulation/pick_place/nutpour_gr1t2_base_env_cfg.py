@@ -74,7 +74,8 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9861], rot=[1, 0, 0, 0]),
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_beaker_red.usd",
-            scale=(0.5, 0.5, 1.5), # changed this for testing
+            # scale=(0.5, 0.5, 1.5),  # changed this for testing
+            scale=(0.45, 0.45, 1.3),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
         ),
     )
@@ -270,6 +271,19 @@ class EventCfg:
                 "x": [-0.01, 0.01],
                 "y": [-0.01, 0.01],
             },
+        },
+    )
+    # Set friction of sorting beaker to 1.4 for testing
+    set_sorting_beaker_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("sorting_beaker"),
+            "static_friction_range": (2.0, 2.0),
+            "dynamic_friction_range": (2.0, 2.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 1,
+            "make_consistent": True,
         },
     )
 
