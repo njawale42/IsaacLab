@@ -416,12 +416,16 @@ class CuroboPlanner(MotionPlannerBase):
 
         env_prim_path = f"/World/envs/env_{self.env_id}"
         robot_prim_path = self.config.robot_prim_path or f"{env_prim_path}/Robot"
-        ignore_list = self.config.world_ignore_substrings or [
-            robot_prim_path,
+
+        base_ignore = self.config.world_ignore_substrings or [
             f"{env_prim_path}/target",
             "/World/defaultGroundPlane",
             "/curobo",
         ]
+        ignore_list = self._expand_ignore_list_for_env(base_ignore, self.env_id)
+        # Always ignore the current robot prim for static obstacle extraction
+        if robot_prim_path not in ignore_list:
+            ignore_list.append(robot_prim_path)
 
         # Extract obstacles in WORLD FRAME (no reference prim).
         self._static_world_config = self.usd_helper.get_obstacles_from_stage(
@@ -498,6 +502,17 @@ class CuroboPlanner(MotionPlannerBase):
             _transform_list(getattr(cfg, "cylinder", None))
             _transform_list(getattr(cfg, "capsule", None))
             _transform_list(getattr(cfg, "sphere", None))
+
+    def _expand_ignore_list_for_env(self, items: list[str], env_id: int) -> list[str]:
+        """Clone ignore substrings for the current env id (replace /env_0/ -> /env_{env_id}/)."""
+        expanded: list[str] = []
+        token = f"/env_{env_id}/"
+        for s in items:
+            if "/env_0/" in s:
+                expanded.append(s.replace("/env_0/", token))
+            else:
+                expanded.append(s)
+        return expanded
 
     # =====================================================================================
     # PROPERTIES AND BASIC GETTERS
