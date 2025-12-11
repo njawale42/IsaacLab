@@ -65,6 +65,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
             scale=(1.0, 1.0, 1.5),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
             collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005),
         ),
     )
@@ -77,6 +78,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
             # scale=(0.5, 0.5, 1.5),  # changed this for testing
             scale=(0.45, 0.45, 1.3),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
         ),
     )
 
@@ -281,7 +283,7 @@ class EventCfg:
             "asset_cfg": SceneEntityCfg("sorting_beaker"),
             "static_friction_range": (2.0, 2.0),
             "dynamic_friction_range": (2.0, 2.0),
-            "restitution_range": (0.0, 0.0),
+            "restitution_range": (0.1, 0.1),
             "num_buckets": 1,
             "make_consistent": True,
         },

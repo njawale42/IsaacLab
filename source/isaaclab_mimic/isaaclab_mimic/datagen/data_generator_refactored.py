@@ -67,6 +67,7 @@ def drain_goal_visualizations(env: ManagerBasedRLMimicEnv) -> None:
                 print(f"Goal visualization failed; continuing without markers. Reason: {exc}")
                 _goal_viz_warning_emitted = True
 
+
 def transform_source_data_segment_using_delta_object_pose(
     src_eef_poses: torch.Tensor,
     delta_obj_pose: torch.Tensor,
@@ -197,31 +198,29 @@ class EEFGenerationState:
     Tracks the per-end-effector state machine used while stitching subtasks.
 
     Each arm/EEF independently progresses through its subtask list, occasionally pausing
-    for coordination or being temporarily swapped out for a motion-planned transition.
-    Keeping the bookkeeping in a dedicated structure avoids large clusters of parallel
-    dictionaries and makes serialization/debugging straightforward.
+    for coordination constraints. Keeping the bookkeeping in a dedicated structure avoids
+    large clusters of parallel dictionaries and makes serialization/debugging straightforward.
 
     Attributes:
         current_subtask_index: Index into `env_cfg.subtask_configs[eef_name]` that is
-            currently being generated/executed. Set to -1 while a motion plan is active.
+            currently being generated/executed.
         current_trajectory: Waypoints (post interpolation) that are currently executing.
-        subtask_step_index: Pointer into `current_trajectory`. `None` signals “ready to
-            build the next subtask trajectory”.
-        next_subtask_index_after_motion: Cached index used to resume the real skill after
-            finishing a motion planner transit segment.
-        next_subtask_trajectory_after_motion: Stored `WaypointTrajectory` representing the
-            actual skill to resume after the motion-planned path completes.
+            For SkillGen, this contains both MP waypoints and skill waypoints combined,
+            so constraints apply to the full (MP + skill) trajectory length.
+        subtask_step_index: Pointer into `current_trajectory`. `None` signals "ready to
+            build the next subtask trajectory".
         subtasks_done: Flag raised once the end-effector has finished its final skill; the
-            final waypoint is duplicated to keep the arm stationary during other arms’ work.
+            final waypoint is duplicated to keep the arm stationary during other arms' work.
+        constraint_hold_waypoint: Cached waypoint used when the EEF is paused due to a constraint.
+        last_commanded_gripper_action: The last gripper action sent to this EEF, used for
+            continuity during motion planning transitions.
+        subtask_started: Flag indicating whether the current subtask has started execution.
     """
 
     current_subtask_index: int = 0
     current_trajectory: list[Waypoint] = field(default_factory=list)
     subtask_step_index: int | None = None
-    next_subtask_index_after_motion: int | None = None
-    next_subtask_trajectory_after_motion: WaypointTrajectory | None = None
     subtasks_done: bool = False
-    waiting_on_constraint: bool = False
     constraint_hold_waypoint: Waypoint | None = None
     last_commanded_gripper_action: torch.Tensor | None = None
     subtask_started: bool = False
@@ -646,6 +645,7 @@ class DataGeneratorRefactored:
         subtask_index: int,
         prev_executed_traj: list[Waypoint] | None,
         subtask_trajectory: WaypointTrajectory,
+        force_use_prev_traj: bool = False,
     ) -> list[Waypoint]:
         """
         Merge a subtask trajectory into an executable trajectory for the robot end-effector.
@@ -657,7 +657,10 @@ class DataGeneratorRefactored:
 
         Behavior:
 
-        - If `datagen_config.generation_interpolate_from_last_target_pose` is True and
+        - If `force_use_prev_traj` is True and `prev_executed_traj` is provided,
+          interpolation starts from the last waypoint of `prev_executed_traj`.
+          This is used when combining MP + skill trajectories upfront.
+        - Else if `datagen_config.generation_interpolate_from_last_target_pose` is True and
           this is not the first subtask, interpolation starts from the last waypoint of
           `prev_executed_traj`.
         - Otherwise, interpolation starts from the current robot EEF pose (queried from the env)
@@ -675,6 +678,9 @@ class DataGeneratorRefactored:
                 is enabled and this is not the first subtask.
             subtask_trajectory:
                 Trajectory segment for the current subtask that will be merged after the initial interpolation segment.
+            force_use_prev_traj: If True, always use the last waypoint from prev_executed_traj
+                for interpolation, regardless of is_first_subtask. Used for SkillGen's combined
+                MP + skill trajectory building.
 
         Returns:
             list[Waypoint]: The full sequence of waypoints to execute (initial interpolation segment followed by the subtask segment),
@@ -685,7 +691,13 @@ class DataGeneratorRefactored:
         # and then execute it once we have the trajectory.
         traj_to_execute = WaypointTrajectory()
 
-        if self.env_cfg.datagen_config.generation_interpolate_from_last_target_pose and (not is_first_subtask):
+        # Determine whether to use prev_executed_traj's last waypoint or current robot pose
+        use_prev_traj = (
+            (force_use_prev_traj and prev_executed_traj)
+            or (self.env_cfg.datagen_config.generation_interpolate_from_last_target_pose and (not is_first_subtask))
+        )
+
+        if use_prev_traj:
             # Interpolation segment will start from last target pose (which may not have been achieved).
             assert prev_executed_traj is not None
             last_waypoint = prev_executed_traj[-1]
@@ -831,41 +843,27 @@ class DataGeneratorRefactored:
                     if eef_state.subtasks_done or eef_state.subtask_step_index is not None:
                         continue
 
-                    if eef_state.waiting_on_constraint:
-                        if self._should_wait_for_sequential_constraint(
-                            eef_name=eef_name,
-                            eef_state=eef_state,
-                            subtask_index=eef_state.current_subtask_index,
-                            runtime_constraints=runtime_subtask_constraints,
-                        ):
-                            continue
-                        self._exit_constraint_hold(eef_state)
+                    # NOTE: Removed pre-trajectory constraint hold logic here.
+                    # Sequential constraints are handled purely during execution in
+                    # _apply_constraint_progression_rules, matching the original
+                    # data_generator.py behavior. Trajectories are always generated;
+                    # constraints just stall execution near the end of the trajectory.
 
-                    if self._should_wait_for_sequential_constraint(
+                    eef_subtask_trajectory = self.generate_eef_subtask_trajectory(
+                        env_id=env_id,
                         eef_name=eef_name,
-                        eef_state=eef_state,
-                        subtask_index=eef_state.current_subtask_index,
-                        runtime_constraints=runtime_subtask_constraints,
-                    ):
-                        self._enter_constraint_hold(
-                            env_id=env_id,
-                            eef_name=eef_name,
-                            eef_state=eef_state,
-                        )
-                        continue
+                        subtask_ind=eef_state.current_subtask_index,
+                        all_randomized_subtask_boundaries=randomized_subtask_boundaries,
+                        runtime_subtask_constraints_dict=runtime_subtask_constraints,
+                        selected_src_demo_inds=selected_src_demo_inds,
+                    )
 
-                    if eef_state.next_subtask_index_after_motion is None:
-                        eef_subtask_trajectory = self.generate_eef_subtask_trajectory(
-                            env_id=env_id,
-                            eef_name=eef_name,
-                            subtask_ind=eef_state.current_subtask_index,
-                            all_randomized_subtask_boundaries=randomized_subtask_boundaries,
-                            runtime_subtask_constraints_dict=runtime_subtask_constraints,
-                            selected_src_demo_inds=selected_src_demo_inds,
-                        )
-
-                        if self.env_cfg.datagen_config.use_skillgen:
-                            transition_started, failure_result = self._start_motion_planned_transition_if_needed(
+                    if self.env_cfg.datagen_config.use_skillgen:
+                        # SkillGen: combine MP waypoints + skill waypoints into one trajectory
+                        # so that constraints apply to the full (MP + skill) length,
+                        # matching data_gen_bimanual.py behavior.
+                        transition_started, combined_waypoints, failure_result = (
+                            self._start_motion_planned_transition_if_needed(
                                 env_id=env_id,
                                 eef_name=eef_name,
                                 eef_state=eef_state,
@@ -874,26 +872,25 @@ class DataGeneratorRefactored:
                                 randomized_subtask_boundaries=randomized_subtask_boundaries,
                                 motion_planner=motion_planner,
                             )
-                            if failure_result is not None:
-                                return failure_result
-                            if transition_started:
-                                continue
+                        )
+                        if failure_result is not None:
+                            return failure_result
+                        if transition_started and combined_waypoints is not None:
+                            eef_state.current_trajectory = combined_waypoints
+                            eef_state.subtask_step_index = 0
+                            eef_state.subtask_started = True
+                            continue
 
-                        eef_state.current_trajectory = self.merge_eef_subtask_trajectory(
-                            env_id=env_id,
-                            eef_name=eef_name,
-                            subtask_index=eef_state.current_subtask_index,
-                            prev_executed_traj=eef_state.current_trajectory,
-                            subtask_trajectory=eef_subtask_trajectory,
-                        )
-                        eef_state.subtask_step_index = 0
-                        eef_state.subtask_started = True
-                    else:
-                        self._resume_motion_planned_subtask(
-                            env_id=env_id,
-                            eef_name=eef_name,
-                            eef_state=eef_state,
-                        )
+                    # Non-SkillGen path or no motion planner: just use skill waypoints
+                    eef_state.current_trajectory = self.merge_eef_subtask_trajectory(
+                        env_id=env_id,
+                        eef_name=eef_name,
+                        subtask_index=eef_state.current_subtask_index,
+                        prev_executed_traj=eef_state.current_trajectory,
+                        subtask_trajectory=eef_subtask_trajectory,
+                    )
+                    eef_state.subtask_step_index = 0
+                    eef_state.subtask_started = True
 
             eef_waypoints = self._collect_eef_waypoints(
                 env_id=env_id,
@@ -1066,15 +1063,14 @@ class DataGeneratorRefactored:
         selected_src_demo_inds: dict[str, int | None],
         randomized_subtask_boundaries: dict[str, np.ndarray],
         motion_planner: Any | None,
-    ) -> tuple[bool, dict | None]:
+    ) -> tuple[bool, list[Waypoint] | None, dict | None]:
         """
-        Launch a motion-planned transition between subtasks for a SkillGen run.
+        Launch a motion-planned transition and return combined MP + skill waypoints.
 
         When SkillGen is enabled, the generator inserts collision-free transit motions
-        between subtasks. This helper handles the entire lifecycle of the transit phase:
-        it logs intent, asks the planner to update its internal world, converts the
-        planned poses into `Waypoint`s (including source-demo gripper replay), and updates
-        the per-EEF state so the main loop knows a motion plan is in progress.
+        between subtasks. This helper plans the transition and returns a combined
+        trajectory of MP waypoints followed by skill waypoints, matching the behavior
+        of data_gen_bimanual.py where constraints apply to the full (MP + skill) length.
 
         Args:
             env_id: Environment instance being controlled.
@@ -1089,24 +1085,33 @@ class DataGeneratorRefactored:
             motion_planner: Planner instance responsible for producing the transit motion.
 
         Returns:
-            Tuple `(transition_started, failure_result)` where:
-                * `transition_started` is True when a motion plan was successfully created
-                  and injected into the EEF state (the caller should skip straight to
-                  execution in that case).
+            Tuple `(transition_started, combined_waypoints, failure_result)` where:
+                * `transition_started` is True when a motion plan was successfully created.
+                * `combined_waypoints` is the list of MP + skill waypoints if successful.
                 * `failure_result` is a result dictionary returned to the caller when
                   planning fails (the generator aborts immediately).
         """
         if motion_planner is None:
-            return False, None
-        # import pdb; pdb.set_trace()
+            return False, None, None
+
         target_pose = eef_subtask_trajectory[0].pose
-        # Use the gripper action last commanded from the previous skill segment if available.
-        # Fall back to the upcoming skill segment's first gripper action otherwise.
-        base_gripper_action = (
-            eef_state.last_commanded_gripper_action
-            if eef_state.last_commanded_gripper_action is not None
-            else eef_subtask_trajectory[0].gripper_action
-        )
+
+        # Determine the gripper action to use during the motion planning phase.
+        # Priority (matching data_gen_bimanual.py behavior):
+        # 1. Use last_commanded_gripper_action for continuity (if available)
+        # 2. For first subtask: use initial gripper action from source demo (should be open)
+        # 3. Fallback: use skill trajectory's first gripper action
+        if eef_state.last_commanded_gripper_action is not None:
+            base_gripper_action = eef_state.last_commanded_gripper_action
+        elif eef_state.current_subtask_index == 0:
+            # First subtask: use the FIRST gripper action from the source demo (timestep 0).
+            # This is guaranteed to be the "open" gripper state, matching data_gen_bimanual.py:
+            # "HACK: reading first source demo gripper action at start of demo - just to have an 'open' gripper action"
+            first_demo = self.src_demo_datagen_info_pool.datagen_infos[0]
+            base_gripper_action = first_demo.gripper_action[eef_name][0]
+        else:
+            # Non-first subtask without prior command: use skill trajectory's first action
+            base_gripper_action = eef_subtask_trajectory[0].gripper_action
 
         expected_attached_object = None
         if hasattr(self.env, "get_expected_attached_object"):
@@ -1138,16 +1143,11 @@ class DataGeneratorRefactored:
 
         if not planning_success:
             print(f"Env {env_id}: Motion planning failed for {eef_name}")
-            return False, {"success": False}
+            return False, None, {"success": False}
 
         print(f"Env {env_id}: Motion planning succeeded")
         # Enqueue goal visualization to be flushed on the main env loop thread.
         enqueue_goal_visualization(env_id=env_id, eef_name=eef_name, target_pose=target_pose)
-
-        target_subtask_index = eef_state.current_subtask_index
-        eef_state.next_subtask_index_after_motion = target_subtask_index
-        eef_state.next_subtask_trajectory_after_motion = eef_subtask_trajectory
-        eef_state.current_subtask_index = -1
 
         # Convert the planned Cartesian trajectory into waypoints, holding the gripper fixed
         # at the last skill segment action for the entire motion-planned transit.
@@ -1156,89 +1156,44 @@ class DataGeneratorRefactored:
             base_gripper_action,
         )
 
-        eef_state.current_trajectory = mp_waypoints
-        eef_state.subtask_step_index = 0
-        return True, None
-
-    def _resume_motion_planned_subtask(self, env_id: int, eef_name: str, eef_state: EEFGenerationState) -> None:
-        """
-        Resume the original skill trajectory after finishing a motion-planned transit.
-
-        Once the planner-produced waypoints have been executed, we need to continue with
-        the skill that was originally scheduled for this EEF. This helper restores the
-        cached target subtask, splices it with interpolation from the last transit pose,
-        and resets the motion-plan bookkeeping fields.
-
-        Args:
-            env_id: Environment index used for querying the current robot pose.
-            eef_name: Name of the end-effector that is resuming normal execution.
-            eef_state: Mutable state container storing both the completed transit
-                trajectory and the queued skill we are about to re-activate.
-        """
-        print("Finished executing motion-planned trajectory")
-        assert eef_state.next_subtask_index_after_motion is not None
-        assert eef_state.next_subtask_trajectory_after_motion is not None
-        prev_executed_traj = eef_state.current_trajectory
-        eef_state.current_subtask_index = eef_state.next_subtask_index_after_motion
-        eef_state.current_trajectory = self.merge_eef_subtask_trajectory(
+        # Merge the skill trajectory (with interpolation from MP end pose) and combine
+        # MP waypoints + skill waypoints into a single trajectory.
+        # This matches data_gen_bimanual.py behavior where constraints apply to full length.
+        # IMPORTANT: force_use_prev_traj=True ensures we interpolate from the LAST MP WAYPOINT
+        # (where the robot will be after MP), not from the current robot pose (before MP).
+        skill_waypoints = self.merge_eef_subtask_trajectory(
             env_id=env_id,
             eef_name=eef_name,
             subtask_index=eef_state.current_subtask_index,
-            prev_executed_traj=prev_executed_traj,
-            subtask_trajectory=eef_state.next_subtask_trajectory_after_motion,
+            prev_executed_traj=mp_waypoints if mp_waypoints else eef_state.current_trajectory,
+            subtask_trajectory=eef_subtask_trajectory,
+            force_use_prev_traj=True,
         )
-        eef_state.subtask_step_index = 0
-        eef_state.next_subtask_index_after_motion = None
-        eef_state.next_subtask_trajectory_after_motion = None
-        eef_state.subtask_started = True
 
-    def _should_wait_for_sequential_constraint(
-        self,
-        eef_name: str,
-        eef_state: EEFGenerationState,
-        subtask_index: int,
-        runtime_constraints: dict,
-    ) -> bool:
-        """Return True if the subtask is blocked by an unmet sequential pre-condition."""
-        key = (eef_name, subtask_index)
-        if key not in runtime_constraints:
-            return False
-        constraint = runtime_constraints[key]
-        if constraint["type"] != SubTaskConstraintType._SEQUENTIAL_LATTER:
-            return False
-        if constraint["fulfilled"]:
-            return False
-        min_time_diff = constraint.get("min_time_diff", 0)
-        if min_time_diff < 0:
-            return True
-        return not eef_state.subtask_started
+        # Combined trajectory: MP waypoints followed by skill waypoints
+        combined_waypoints = mp_waypoints + skill_waypoints
+        return True, combined_waypoints, None
 
-    def _enter_constraint_hold(self, env_id: int, eef_name: str, eef_state: EEFGenerationState) -> None:
-        """Freeze an end-effector at its last command while waiting for sequential constraints."""
-        if eef_state.waiting_on_constraint:
-            return
+    def _get_gripper_action_dim(self, eef_name: str) -> int:
+        """
+        Infer the gripper action dimensionality for the given end-effector.
 
-        hold_waypoint = eef_state.constraint_hold_waypoint
-        if hold_waypoint is None:
-            pose = self.env.get_robot_eef_pose(env_ids=[env_id], eef_name=eef_name)[0]
-            gripper_action = eef_state.last_commanded_gripper_action
-            if gripper_action is None:
-                gripper_action = torch.zeros(
-                    (1,),
-                    device=pose.device,
-                    dtype=pose.dtype,
-                )
-            hold_waypoint = Waypoint(pose=pose, gripper_action=gripper_action, noise=0.0)
-        eef_state.waiting_on_constraint = True
-        eef_state.current_trajectory = [deepcopy(hold_waypoint)]
-        eef_state.subtask_step_index = 0
+        Priority order:
+        1) Use the recorded source demo gripper action shape (always available during generation).
+        2) Derive from the action space assuming per-EEF pose components are 7D (pos + quat).
+        3) Fallback to 1 to remain robust even if shapes are misconfigured.
+        """
+        if self.src_demo_datagen_info_pool.datagen_infos:
+            first_demo = self.src_demo_datagen_info_pool.datagen_infos[0]
+            if eef_name in first_demo.gripper_action:
+                return int(first_demo.gripper_action[eef_name].shape[-1])
 
-    def _exit_constraint_hold(self, eef_state: EEFGenerationState) -> None:
-        """Release an end-effector from a sequential wait state so it can build the next subtask."""
-        eef_state.waiting_on_constraint = False
-        eef_state.current_trajectory = []
-        eef_state.subtask_step_index = None
-        eef_state.subtask_started = False
+        action_dim = int(self.env.action_space.shape[-1])
+        num_eefs = max(len(self.env_cfg.subtask_configs), 1)
+        remaining = action_dim - 7 * num_eefs
+        if remaining > 0 and remaining % num_eefs == 0:
+            return remaining // num_eefs
+        return 1
 
     def _collect_eef_waypoints(
         self,
@@ -1321,13 +1276,20 @@ class DataGeneratorRefactored:
                 return
             min_time_diff = task_constraint["min_time_diff"]
             traj_len = len(eef_state.current_trajectory)
+            if traj_len == 0:
+                return
             if min_time_diff < 0:
-                hold_start_idx = 0
+                # Strict ordering (min_time_diff == -1): hold from the very beginning
+                # until the precondition is met.
+                should_hold = True
             else:
-                hold_start_idx = max(0, traj_len - min_time_diff)
-            stall_idx = max(0, hold_start_idx - 1)
-            if step_index >= hold_start_idx:
-                eef_state.subtask_step_index = stall_idx
+                # Hold once we reach the last @min_time_diff steps of the trajectory.
+                # This matches data_gen_bimanual.py: hold when step_ind >= traj_len - min_time_diff
+                should_hold = step_index >= traj_len - min_time_diff
+            if should_hold and step_index > 0:
+                # Decrement the index (which will be incremented later in _advance_subtask_progress)
+                # to stay at the previous waypoint. The guard step_index > 0 prevents going negative.
+                eef_state.subtask_step_index = step_index - 1
             return
 
         if task_constraint["type"] != SubTaskConstraintType.COORDINATION:
@@ -1402,8 +1364,6 @@ class DataGeneratorRefactored:
         """
         for eef_name, eef_state in eef_states.items():
             if eef_state.subtask_step_index is None:
-                continue
-            if eef_state.waiting_on_constraint:
                 continue
 
             eef_state.subtask_step_index += 1
