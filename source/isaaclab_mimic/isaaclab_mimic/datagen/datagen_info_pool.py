@@ -203,13 +203,13 @@ class DataGenInfoPool:
 
             self._subtask_boundaries[eef_name].append(eef_subtask_boundaries)
 
-    def load_from_dataset_file(self, file_path, select_demo_keys: str | None = None):
+    def load_from_dataset_file(self, file_path, select_demo_keys: list[str] | None = None):
         """
         Load from a dataset file.
 
         Args:
             file_path (str): path to the dataset file
-            select_demo_keys (str or None): keys of the demos to load
+            select_demo_keys (list[str] or None): keys of the demos to load
         """
         dataset_file_handler = HDF5DatasetFileHandler()
         dataset_file_handler.open(file_path)

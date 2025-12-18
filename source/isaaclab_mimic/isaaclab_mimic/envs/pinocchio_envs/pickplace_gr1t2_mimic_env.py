@@ -11,6 +11,23 @@ from isaaclab.envs import ManagerBasedRLMimicEnv
 
 
 class PickPlaceGR1T2MimicEnv(ManagerBasedRLMimicEnv):
+    """Mimic environment for GR1T2 bimanual pick-place tasks.
+
+    IMPORTANT: The GR1T2 robot's hand joints are ordered in an INTERLEAVED pattern:
+        L proximal (5), R proximal (5), L intermediate (5), R intermediate (5), L distal (1), R distal (1)
+
+    This means the action tensor's 22 hand joint values have LEFT and RIGHT joints mixed together.
+    The methods in this class properly separate/combine left and right gripper actions
+    to work with this interleaved joint ordering.
+    """
+
+    # Indices of LEFT hand joints within the 22-element hand joint action (interleaved order)
+    # These correspond to: L_proximal(5) + L_intermediate(5) + L_distal(1) = 11 joints
+    LEFT_HAND_JOINT_INDICES = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 20]
+
+    # Indices of RIGHT hand joints within the 22-element hand joint action (interleaved order)
+    # These correspond to: R_proximal(5) + R_intermediate(5) + R_distal(1) = 11 joints
+    RIGHT_HAND_JOINT_INDICES = [5, 6, 7, 8, 9, 15, 16, 17, 18, 19, 21]
 
     def get_robot_eef_pose(self, eef_name: str, env_ids: Sequence[int] | None = None) -> torch.Tensor:
         """
@@ -63,9 +80,9 @@ class PickPlaceGR1T2MimicEnv(ManagerBasedRLMimicEnv):
         target_left_eef_rot_quat = PoseUtils.quat_from_matrix(left_target_rot)
         target_right_eef_rot_quat = PoseUtils.quat_from_matrix(right_target_rot)
 
-        # gripper actions
-        left_gripper_action = gripper_action_dict["left"]
-        right_gripper_action = gripper_action_dict["right"]
+        # gripper actions - need to interleave left and right to match the hand_joint_names order
+        left_gripper_action = gripper_action_dict["left"]  # 11 LEFT hand joint values
+        right_gripper_action = gripper_action_dict["right"]  # 11 RIGHT hand joint values
 
         if action_noise_dict is not None:
             pos_noise_left = action_noise_dict["left"] * torch.randn_like(target_left_eef_pos)
@@ -78,14 +95,22 @@ class PickPlaceGR1T2MimicEnv(ManagerBasedRLMimicEnv):
             target_left_eef_rot_quat += quat_noise_left
             target_right_eef_rot_quat += quat_noise_right
 
+        # Interleave left and right gripper actions to match the hand_joint_names order:
+        # L_proximal(5), R_proximal(5), L_intermediate(5), R_intermediate(5), L_distal(1), R_distal(1)
+        # This creates a 22-element tensor from the 11 left + 11 right values
+        interleaved_gripper = torch.zeros(22, device=left_gripper_action.device, dtype=left_gripper_action.dtype)
+        for i, idx in enumerate(self.LEFT_HAND_JOINT_INDICES):
+            interleaved_gripper[idx] = left_gripper_action[i]
+        for i, idx in enumerate(self.RIGHT_HAND_JOINT_INDICES):
+            interleaved_gripper[idx] = right_gripper_action[i]
+
         return torch.cat(
             (
                 target_left_eef_pos,
                 target_left_eef_rot_quat,
                 target_right_eef_pos,
                 target_right_eef_rot_quat,
-                left_gripper_action,
-                right_gripper_action,
+                interleaved_gripper,
             ),
             dim=0,
         )
@@ -120,13 +145,32 @@ class PickPlaceGR1T2MimicEnv(ManagerBasedRLMimicEnv):
         """
         Extracts the gripper actuation part from a sequence of env actions (compatible with env.step).
 
+        The GR1T2 robot has interleaved hand joint ordering, so we need to extract
+        LEFT and RIGHT hand joints from their respective positions in the 22-element
+        hand joint action (indices 14:36 in the full action tensor).
+
         Args:
             actions: environment actions. The shape is (num_envs, num steps in a demo, action_dim).
 
         Returns:
             A dictionary of torch.Tensor gripper actions. Key to each dict is an eef_name.
+            Each value is a tensor of shape (num_envs, num_steps, 11) containing only
+            that hand's joint values.
         """
-        return {"left": actions[:, 14:25], "right": actions[:, 25:]}
+        # Extract the 22 hand joint values from the action tensor
+        hand_joints = actions[:, 14:36]  # Shape: (num_envs, num_steps, 22) or (num_steps, 22)
+
+        # Handle both 2D and 3D tensor inputs
+        if hand_joints.dim() == 2:
+            # Shape: (num_steps, 22)
+            left_gripper = hand_joints[:, self.LEFT_HAND_JOINT_INDICES]
+            right_gripper = hand_joints[:, self.RIGHT_HAND_JOINT_INDICES]
+        else:
+            # Shape: (num_envs, num_steps, 22)
+            left_gripper = hand_joints[:, :, self.LEFT_HAND_JOINT_INDICES]
+            right_gripper = hand_joints[:, :, self.RIGHT_HAND_JOINT_INDICES]
+
+        return {"left": left_gripper, "right": right_gripper}
 
     def get_expected_attached_object(self, eef_name: str, subtask_index: int, env_cfg) -> str | None:
         """

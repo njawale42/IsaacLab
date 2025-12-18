@@ -173,7 +173,7 @@ def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: s
     print("\n============= Loaded Environment Metadata =============")
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=config.train.data)
     shape_meta = FileUtils.get_shape_metadata_from_dataset(
-        dataset_path=config.train.data, all_obs_keys=config.all_obs_keys, verbose=True
+        dataset_config={"path": config.train.data}, action_keys=config.train.action_keys, all_obs_keys=config.all_obs_keys, verbose=True
     )
 
     if config.experiment.env is not None:
@@ -390,7 +390,7 @@ def main(args: argparse.Namespace):
     # change location of experiment directory
     config.train.output_dir = os.path.abspath(os.path.join("./logs", args.log_dir, args.task))
 
-    log_dir, ckpt_dir, video_dir = TrainUtils.get_exp_dir(config)
+    log_dir, ckpt_dir, video_dir, _ = TrainUtils.get_exp_dir(config)
 
     if args.normalize_training_actions:
         config.train.data = normalize_hdf5_actions(config, log_dir)

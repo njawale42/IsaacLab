@@ -224,6 +224,8 @@ class EEFGenerationState:
     constraint_hold_waypoint: Waypoint | None = None
     last_commanded_gripper_action: torch.Tensor | None = None
     subtask_started: bool = False
+    is_currently_paused: bool = False  # Track if arm is paused due to constraint - used to skip step increment
+    _was_paused_prev_iter: bool = False  # Internal: track pause state transitions for proper waypoint capture
 
 
 class DataGeneratorRefactored:
@@ -1105,13 +1107,17 @@ class DataGeneratorRefactored:
             base_gripper_action = eef_state.last_commanded_gripper_action
         elif eef_state.current_subtask_index == 0:
             # First subtask: use the FIRST gripper action from the source demo (timestep 0).
-            # This is guaranteed to be the "open" gripper state, matching data_gen_bimanual.py:
-            # "HACK: reading first source demo gripper action at start of demo - just to have an 'open' gripper action"
+            # This matches data_gen_bimanual.py: "HACK: reading first source demo gripper action
+            # at start of demo - just to have an 'open' gripper action"
             first_demo = self.src_demo_datagen_info_pool.datagen_infos[0]
             base_gripper_action = first_demo.gripper_action[eef_name][0]
-        else:
-            # Non-first subtask without prior command: use skill trajectory's first action
+        elif len(eef_subtask_trajectory) > 0:
+            # Non-first subtask: use skill trajectory's first gripper action
             base_gripper_action = eef_subtask_trajectory[0].gripper_action
+        else:
+            # Fallback: use the FIRST gripper action from the source demo (timestep 0).
+            first_demo = self.src_demo_datagen_info_pool.datagen_infos[0]
+            base_gripper_action = first_demo.gripper_action[eef_name][0]
 
         expected_attached_object = None
         if hasattr(self.env, "get_expected_attached_object"):
@@ -1226,13 +1232,41 @@ class DataGeneratorRefactored:
             if eef_state.subtask_step_index is None:
                 continue
 
-            self._apply_constraint_progression_rules(
+            is_paused = self._apply_constraint_progression_rules(
                 eef_name=eef_name,
                 eef_state=eef_state,
                 runtime_constraints=runtime_constraints,
                 eef_states=eef_states,
             )
-            waypoint = eef_state.current_trajectory[eef_state.subtask_step_index]
+
+            # Track pause state transitions for proper waypoint capture.
+            # This matches data_gen_bimanual.py behavior where get_paused_arm_waypoint()
+            # uses prev_executed_waypoints_in_base_frame instead of trajectory[step_index].
+            was_paused = getattr(eef_state, '_was_paused_prev_iter', False)
+            just_paused = not was_paused and is_paused  # First iteration of being paused
+            eef_state._was_paused_prev_iter = is_paused
+            # Store current pause status so _advance_subtask_progress can skip incrementing
+            eef_state.is_currently_paused = is_paused
+
+            if is_paused:
+                # On the FIRST iteration of being paused, capture the CURRENT trajectory
+                # waypoint as the hold waypoint. This ensures we hold the correct pose/gripper
+                # state rather than using a stale waypoint from a previous step.
+                if just_paused:
+                    eef_state.constraint_hold_waypoint = deepcopy(
+                        eef_state.current_trajectory[eef_state.subtask_step_index]
+                    )
+
+                if eef_state.constraint_hold_waypoint is not None:
+                    waypoint = deepcopy(eef_state.constraint_hold_waypoint)
+                else:
+                    # Fallback: should not happen after the fix above, but just in case
+                    waypoint = eef_state.current_trajectory[eef_state.subtask_step_index]
+                    eef_state.constraint_hold_waypoint = deepcopy(waypoint)
+            else:
+                waypoint = eef_state.current_trajectory[eef_state.subtask_step_index]
+                # When not paused, keep updating the hold waypoint as a fallback
+                eef_state.constraint_hold_waypoint = deepcopy(waypoint)
 
             if motion_planner and getattr(motion_planner, "visualize_spheres", False):
                 current_joints = self.env.scene["robot"].data.joint_pos[env_id]
@@ -1248,7 +1282,7 @@ class DataGeneratorRefactored:
         eef_state: EEFGenerationState,
         runtime_constraints: dict,
         eef_states: dict[str, EEFGenerationState],
-    ) -> None:
+    ) -> bool:
         """
         Enforce sequential and coordination constraints for a single EEF.
 
@@ -1261,23 +1295,27 @@ class DataGeneratorRefactored:
             eef_state: Mutable execution state for that EEF.
             runtime_constraints: Global constraint dictionary populated during init.
             eef_states: Full collection of EEF states (needed for coordination checks).
+
+        Returns:
+            True if the EEF is paused due to a constraint (should use constraint_hold_waypoint),
+            False otherwise.
         """
         subtask_key = (eef_name, eef_state.current_subtask_index)
         if subtask_key not in runtime_constraints:
-            return
+            return False
 
         step_index = eef_state.subtask_step_index
         if step_index is None:
-            return
+            return False
 
         task_constraint = runtime_constraints[subtask_key]
         if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER:
             if task_constraint["fulfilled"]:
-                return
+                return False
             min_time_diff = task_constraint["min_time_diff"]
             traj_len = len(eef_state.current_trajectory)
             if traj_len == 0:
-                return
+                return False
             if min_time_diff < 0:
                 # Strict ordering (min_time_diff == -1): hold from the very beginning
                 # until the precondition is met.
@@ -1286,14 +1324,14 @@ class DataGeneratorRefactored:
                 # Hold once we reach the last @min_time_diff steps of the trajectory.
                 # This matches data_gen_bimanual.py: hold when step_ind >= traj_len - min_time_diff
                 should_hold = step_index >= traj_len - min_time_diff
-            if should_hold and step_index > 0:
-                # Decrement the index (which will be incremented later in _advance_subtask_progress)
-                # to stay at the previous waypoint. The guard step_index > 0 prevents going negative.
-                eef_state.subtask_step_index = step_index - 1
-            return
+            if should_hold:
+                # Signal that this EEF is paused. The step index is NOT modified here;
+                # _advance_subtask_progress will skip incrementing for paused arms.
+                return True
+            return False
 
         if task_constraint["type"] != SubTaskConstraintType.COORDINATION:
-            return
+            return False
 
         synchronous_steps = task_constraint["synchronous_steps"]
         concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
@@ -1307,7 +1345,7 @@ class DataGeneratorRefactored:
             and concurrent_state.current_subtask_index < concurrent_subtask_ind
         ):
             eef_state.subtask_step_index = 0
-            return
+            return True  # Signal that this EEF is paused waiting for coordination start
 
         if (
             not concurrent_constraint["fulfilled"]
@@ -1317,9 +1355,10 @@ class DataGeneratorRefactored:
 
         if not task_constraint["fulfilled"]:
             if step_index >= len(eef_state.current_trajectory) - synchronous_steps:
-                if step_index > 0:
-                    step_index -= 1
-                    eef_state.subtask_step_index = step_index
+                # Signal that this EEF is paused. The step index is NOT modified here;
+                # _advance_subtask_progress will skip incrementing for paused arms.
+                return True
+        return False
 
     def _update_execution_buffers(self, exec_results: dict, buffers: GenerationBuffers) -> None:
         """
@@ -1364,6 +1403,11 @@ class DataGeneratorRefactored:
         """
         for eef_name, eef_state in eef_states.items():
             if eef_state.subtask_step_index is None:
+                continue
+
+            # Skip incrementing step_index if the arm is paused due to a constraint.
+            # This ensures we resume from the correct trajectory position when released.
+            if eef_state.is_currently_paused:
                 continue
 
             eef_state.subtask_step_index += 1

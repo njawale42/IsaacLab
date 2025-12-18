@@ -46,30 +46,30 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
 
         # The following are the subtask configurations for the stack task.
         subtask_configs = []
-        subtask_configs.append(
-            SubTaskConfig(
-                # Each subtask involves manipulation with respect to a single object frame.
-                object_ref="sorting_bowl",
-                # This key corresponds to the binary indicator in "datagen_info" that signals
-                # when this subtask is finished (e.g., on a 0 to 1 edge).
-                subtask_term_signal="idle_right",
-                first_subtask_start_offset_range=(0, 0),
-                # Randomization range for starting index of the first subtask
-                subtask_term_offset_range=(0, 0),
-                # Selection strategy for the source subtask segment during data generation
-                selection_strategy="nearest_neighbor_object",
-                # Optional parameters for the selection strategy function
-                selection_strategy_kwargs={"nn_k": 3},
-                # Amount of action noise to apply during this subtask
-                action_noise=0.0,
-                # Number of interpolation steps to bridge to this subtask segment
-                num_interpolation_steps=5,
-                # Additional fixed steps for the robot to reach the necessary pose
-                num_fixed_steps=0,
-                # If True, apply action noise during the interpolation phase and execution
-                apply_noise_during_interpolation=False,
-            )
-        )
+        # subtask_configs.append(
+        #     SubTaskConfig(
+        #         # Each subtask involves manipulation with respect to a single object frame.
+        #         object_ref="sorting_bowl",
+        #         # This key corresponds to the binary indicator in "datagen_info" that signals
+        #         # when this subtask is finished (e.g., on a 0 to 1 edge).
+        #         subtask_term_signal="idle_right",
+        #         first_subtask_start_offset_range=(0, 0),
+        #         # Randomization range for starting index of the first subtask
+        #         subtask_term_offset_range=(0, 0),
+        #         # Selection strategy for the source subtask segment during data generation
+        #         selection_strategy="nearest_neighbor_object",
+        #         # Optional parameters for the selection strategy function
+        #         selection_strategy_kwargs={"nn_k": 3},
+        #         # Amount of action noise to apply during this subtask
+        #         action_noise=0.0,
+        #         # Number of interpolation steps to bridge to this subtask segment
+        #         num_interpolation_steps=5,
+        #         # Additional fixed steps for the robot to reach the necessary pose
+        #         num_fixed_steps=0,
+        #         # If True, apply action noise during the interpolation phase and execution
+        #         apply_noise_during_interpolation=False,
+        #     )
+        # )
         subtask_configs.append(
             SubTaskConfig(
                 # Each subtask involves manipulation with respect to a single object frame.
@@ -167,12 +167,10 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         )
         self.subtask_configs["left"] = subtask_configs
 
-        # with a buffer near the end of the latter's trajectory.
-        # This mirrors TwoArmPouringHumanoid_SG1_Config: temporal_before((left, pour), (right, grasp)).
-        # self.task_constraint_configs.append(
-        #     SubTaskConstraintConfig(
-        #         eef_subtask_constraint_tuple=[("left", 1), ("right", 1)],
-        #         constraint_type=SubTaskConstraintType.SEQUENTIAL,
-        #         sequential_min_time_diff=40,
-        #     )
-        # )
+        self.task_constraint_configs.append(
+            SubTaskConstraintConfig(
+                eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
+                constraint_type=SubTaskConstraintType.SEQUENTIAL,
+                sequential_min_time_diff=80,
+            )
+        )

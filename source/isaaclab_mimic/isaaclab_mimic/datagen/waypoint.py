@@ -386,6 +386,7 @@ class MultiWaypoint:
         # construct action from target poses and gripper actions
         target_eef_pose_dict = {eef_name: waypoint.pose for eef_name, waypoint in self.waypoints.items()}
         gripper_action_dict = {eef_name: waypoint.gripper_action for eef_name, waypoint in self.waypoints.items()}
+
         if "action_noise_dict" in inspect.signature(env.target_eef_pose_to_action).parameters:
             action_noise_dict = {eef_name: waypoint.noise for eef_name, waypoint in self.waypoints.items()}
             play_action = env.target_eef_pose_to_action(
