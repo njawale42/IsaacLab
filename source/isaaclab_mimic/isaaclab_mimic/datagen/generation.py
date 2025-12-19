@@ -109,7 +109,7 @@ def env_loop(
             env.step(actions)
 
             # Flush any queued goal visualizations on the main thread.
-            drain_goal_visualizations(env)
+            # drain_goal_visualizations(env)
 
             # mark done so the data generators can continue with the step results
             for i in range(env.num_envs):

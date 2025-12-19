@@ -59,7 +59,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": nutpour_gr1t2_pink_ik_env_cfg.NutPourGR1T2PinkIKEnvCfg,
-        "robomimic_bc_cfg_entry_point": os.path.join(agents.__path__[0], "robomimic/bc_rnn_low_dim.json"),
+        "robomimic_bc_cfg_entry_point": os.path.join(agents.__path__[0], "robomimic/bc_rnn_image_nut_pouring.json"),
     },
     disable_env_checker=True,
 )

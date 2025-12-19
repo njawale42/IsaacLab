@@ -103,11 +103,13 @@ def rollout(policy, env, success_term, horizon, device):
             for image_name in env.cfg.image_obs_list:
                 if image_name in obs_dict["policy"].keys():
                     # Convert from chw uint8 to hwc normalized float
+                    # image = torch.squeeze(obs_dict["policy"][image_name])
+                    # image = image.permute(2, 0, 1).clone().float()
+                    # image = image / 255.0
+                    # image = image.clip(0.0, 1.0)
                     image = torch.squeeze(obs_dict["policy"][image_name])
-                    image = image.permute(2, 0, 1).clone().float()
-                    image = image / 255.0
-                    image = image.clip(0.0, 1.0)
-                    obs[image_name] = image
+                    obs[image_name] = image.numpy()
+                    # obs[image_name] = image
 
         traj["obs"].append(obs)
 

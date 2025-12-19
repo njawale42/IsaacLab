@@ -1153,7 +1153,7 @@ class DataGeneratorRefactored:
 
         print(f"Env {env_id}: Motion planning succeeded")
         # Enqueue goal visualization to be flushed on the main env loop thread.
-        enqueue_goal_visualization(env_id=env_id, eef_name=eef_name, target_pose=target_pose)
+        # enqueue_goal_visualization(env_id=env_id, eef_name=eef_name, target_pose=target_pose)
 
         # Convert the planned Cartesian trajectory into waypoints, holding the gripper fixed
         # at the last skill segment action for the entire motion-planned transit.

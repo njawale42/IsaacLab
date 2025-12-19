@@ -164,16 +164,20 @@ def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: s
     # read config to set up metadata for observation modalities (e.g. detecting rgb observations)
     ObsUtils.initialize_obs_utils_with_config(config)
 
-    # make sure the dataset exists
-    dataset_path = os.path.expanduser(config.train.data)
+    # make sure the dataset exists (use first dataset if config.train.data is a list)
+    if isinstance(config.train.data, list):
+        first_dataset_path = config.train.data[0]["path"]
+    else:
+        first_dataset_path = config.train.data
+    dataset_path = os.path.expanduser(first_dataset_path)
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset at provided path {dataset_path} not found!")
 
     # load basic metadata from training file
     print("\n============= Loaded Environment Metadata =============")
-    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=config.train.data)
+    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=first_dataset_path)
     shape_meta = FileUtils.get_shape_metadata_from_dataset(
-        dataset_config={"path": config.train.data}, action_keys=config.train.action_keys, all_obs_keys=config.all_obs_keys, verbose=True
+        dataset_config={"path": first_dataset_path}, action_keys=config.train.action_keys, all_obs_keys=config.all_obs_keys, verbose=True
     )
 
     if config.experiment.env is not None:
@@ -397,6 +401,10 @@ def main(args: argparse.Namespace):
 
     # get torch device
     device = TorchUtils.get_torch_device(try_to_use_cuda=config.train.cuda)
+
+    # Convert config.train.data from string to list format expected by robomimic
+    if isinstance(config.train.data, str):
+        config.train.data = [{"path": config.train.data}]
 
     config.lock()
 

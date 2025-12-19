@@ -165,7 +165,7 @@ def main():
                 collision_activation_distance=0.0,
                 motion_step_size=None,
                 visualize_spheres=False,
-                visualize_plan=True,
+                visualize_plan=False,
                 debug_planner=True,
                 # Dexterous hand grasp detection using finger joints + XY distance
                 # Works for cylindrical objects (beakers) grasped at any height
