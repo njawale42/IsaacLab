@@ -13,10 +13,8 @@ from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManager
 from isaaclab.managers import DatasetExportMode, TerminationTermCfg
 
 from isaaclab_mimic.datagen.data_generator import DataGenerator
-from isaaclab_mimic.datagen.data_generator_refactored import (
-    DataGeneratorRefactored,
-    drain_goal_visualizations,
-)
+from isaaclab_mimic.datagen.data_generator_refactored import DataGeneratorRefactored
+from isaaclab_mimic.datagen.data_generator_scheduled import DataGeneratorScheduled
 from isaaclab_mimic.datagen.datagen_info_pool import DataGenInfoPool
 
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -32,7 +30,7 @@ async def run_data_generator(
     env_id: int,
     env_reset_queue: asyncio.Queue,
     env_action_queue: asyncio.Queue,
-    data_generator: DataGenerator,
+    data_generator: DataGenerator | DataGeneratorRefactored | DataGeneratorScheduled,
     success_term: TerminationTermCfg,
     pause_subtask: bool = False,
     motion_planner: Any = None,
@@ -230,7 +228,7 @@ def setup_async_generation(
     print(f"Loaded {shared_datagen_info_pool.num_datagen_infos} to datagen info pool")
 
     # Create and schedule data generator tasks
-    data_generator = DataGeneratorRefactored(
+    data_generator = DataGeneratorScheduled(
         env=env,
         src_demo_datagen_info_pool=shared_datagen_info_pool,
         skillgen_type=skillgen_type,

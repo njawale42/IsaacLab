@@ -7,6 +7,7 @@
 
 from .data_generator import *
 from .data_generator_refactored import *
+from .data_generator_scheduled import *
 from .datagen_info import *
 from .datagen_info_pool import *
 from .generation import *

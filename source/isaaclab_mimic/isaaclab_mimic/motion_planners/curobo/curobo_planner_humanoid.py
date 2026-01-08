@@ -74,14 +74,6 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             tuple(collision_active_link_substrings) if collision_active_link_substrings else None
         )
 
-        # Override attached_object_link_name to use the EE link for humanoid
-        # Unlike Franka which has a dedicated "attached_object" link in its URDF,
-        # the humanoid robot attaches objects directly to the end-effector link
-        ee_link = self.config.ee_link_name or self.robot_cfg["kinematics"].get("ee_link")
-        if ee_link:
-            self.config.attached_object_link_name = ee_link
-            self.logger.info(f"Using EE link for object attachment: {ee_link}")
-
         # Populate hand_link_names from substrings if provided
         if self.hand_link_substrings:
             all_links = list(self.robot_cfg["kinematics"]["collision_link_names"])
@@ -178,6 +170,19 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         if not torch.allclose(pos, pos_tensor):
             self.logger.debug("Clamped start state within joint limits")
 
+        # Debug: Log what the humanoid planner reads as start state
+        import os
+        if os.environ.get("DEBUG_REPLAY", "0") == "1":
+            try:
+                from isaaclab_mimic.datagen.data_generator_refactored import get_debug_logger
+                logger = get_debug_logger()
+                if logger:
+                    arm_side = self._arm_side() or "unknown"
+                    logger.log(f"[HUMANOID PLANNER _get_current_joint_state] arm={arm_side}")
+                    logger.log(f"  planner joints (clamped): {pos[0, :10].cpu().numpy()} ... (first 10)")
+            except ImportError:
+                pass
+
         return JointState(
             position=pos,
             velocity=torch.zeros_like(pos),
@@ -197,10 +202,18 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
         *,
         input_is_site_frame: bool = False,
+        start_joint_state: torch.Tensor | None = None,
+        skip_world_update: bool = False,
     ) -> bool:
         """Plan motion for single humanoid arm with collision management.
 
         Accepts target_pose as a world-frame tool pose and converts to planner frame.
+
+        Args:
+            start_joint_state: Optional start joint state in cuRobo planner ordering.
+                If provided, bypasses reading from articulation buffer (useful for offline planning).
+            skip_world_update: If True, skip world synchronization (for offline planning where
+                object poses are pre-set in the collision world).
         """
         # Convert controller-site/world input to tool/world if requested
         target_pose_world_tool: torch.Tensor
@@ -298,87 +311,10 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
                 step_size=step_size,
                 enable_retiming=enable_retiming,
                 link_target_poses_base=link_target_poses_base,
+                start_joint_state=start_joint_state,
+                skip_world_update=skip_world_update,
             )
             return result
         finally:
             if inactive_links:
                 self._set_active_links(inactive_links, active=True)
-
-    # ---- Grasp detection for dexterous hands ----
-    def _get_ee_position_for_grasp_check(self, ee_frame_name: str) -> torch.Tensor | None:
-        """Get end-effector position for grasp distance checking.
-
-        Override to use arm-specific EE frame based on which arm this planner controls.
-
-        Args:
-            ee_frame_name: Base name of the EE frame (may be modified per arm)
-
-        Returns:
-            EE position tensor (3,) relative to env origin, or None if not found
-        """
-        origin = self.env.scene.env_origins[self.env_id]
-        arm_side = self._arm_side()
-
-        # Try arm-specific frame names first
-        arm_frame_names = []
-        if arm_side:
-            arm_frame_names.append(f"{arm_side}_{ee_frame_name}")
-            arm_frame_names.append(f"{ee_frame_name}_{arm_side}")
-
-        # Also try original name and generic fallbacks
-        arm_frame_names.extend([ee_frame_name, "ee_frame"])
-
-        # Get available scene keys to check membership properly
-        # InteractiveScene doesn't implement __contains__, so we use keys()
-        available_keys = set(self.env.scene.keys()) if hasattr(self.env.scene, "keys") else set()
-
-        for frame_name in arm_frame_names:
-            if frame_name in available_keys:
-                ee_frame = self.env.scene[frame_name]
-                if hasattr(ee_frame, "data") and hasattr(ee_frame.data, "target_pos_w"):
-                    pos = ee_frame.data.target_pos_w[self.env_id, 0, :] - origin
-                    print(f"  [EE Position] Found via scene frame '{frame_name}'")
-                    return pos
-
-        # Try to get arm EE pose from env's get_robot_eef_pose if available
-        if arm_side and hasattr(self.env, "get_robot_eef_pose"):
-            try:
-                eef_pose = self.env.get_robot_eef_pose(arm_side, env_ids=[self.env_id])[0]
-                # Extract position from 4x4 pose matrix
-                pos = eef_pose[:3, 3]
-                print(f"  [EE Position] Found via env.get_robot_eef_pose('{arm_side}')")
-                return pos
-            except Exception as e:
-                self.logger.debug(f"get_robot_eef_pose failed for {arm_side}: {e}")
-
-        # Fall back to parent implementation (uses FK)
-        print("  [EE Position] Using FK fallback")
-        return super()._get_ee_position_for_grasp_check(ee_frame_name)
-
-    def _get_default_finger_joint_names(self) -> list[str]:
-        """Get default finger joint names for GR1T2 Fourier hand.
-
-        Returns arm-specific finger joints based on which arm this planner controls.
-
-        Returns:
-            List of finger joint names for the active arm
-        """
-        arm_side = self._arm_side()
-        if arm_side is None:
-            print("  [Finger Joints] WARNING: Could not determine arm side")
-            return []
-
-        # GR1T2 Fourier hand finger joint naming convention
-        prefix = "L_" if arm_side == "left" else "R_"
-
-        # Key proximal joints that indicate finger closure
-        finger_joints = [
-            f"{prefix}index_proximal_joint",
-            f"{prefix}middle_proximal_joint",
-            f"{prefix}ring_proximal_joint",
-            f"{prefix}pinky_proximal_joint",
-            f"{prefix}thumb_proximal_pitch_joint",
-        ]
-
-        print(f"  [Finger Joints] Using {arm_side} arm joints: {finger_joints}")
-        return finger_joints

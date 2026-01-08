@@ -137,7 +137,9 @@ def main():
         yaml_right = build_humanoid_yaml_from_usd(usd_path, arm="right", inactive_joints=inactive_joint_names_right)
         yaml_left = build_humanoid_yaml_from_usd(usd_path, arm="left", inactive_joints=inactive_joint_names_left)
 
-        def _mk_cfg(yaml_path: str) -> CuroboPlannerCfg:
+        def _mk_cfg(yaml_path: str, arm: str) -> CuroboPlannerCfg:
+            # Set arm-specific attachment link (the hand pitch link for each arm)
+            attached_link = f"GR1T2_fourier_hand_6dof_{arm}_hand_pitch_link"
             return CuroboPlannerCfg(
                 robot_config_file=yaml_path,
                 robot_name="gr1",
@@ -145,15 +147,18 @@ def main():
                     "GR1T2_fourier_hand_6dof_right_hand_pitch_link",
                     "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
                 ],
+                # Use actual EE link for object attachment (not virtual "attached_object" link)
+                attached_object_link_name=attached_link,
+                ee_link_name=attached_link,
                 static_objects=["table", "scale", "bin"],
                 # Ignore specific USD prims; remove items one-by-one to debug collisions
                 world_ignore_substrings=[
                     "/World/envs/env_0/Table",
-                    # "/World/envs/env_0/SortingScale",
-                    # "/World/envs/env_0/SortingBowl",
-                    # "/World/envs/env_0/SortingBeaker",
+                    "/World/envs/env_0/SortingScale",
+                    "/World/envs/env_0/SortingBowl",
+                    "/World/envs/env_0/SortingBeaker",
                     "/World/envs/env_0/FactoryNut",
-                    # "/World/envs/env_0/BlackSortingBin",
+                    "/World/envs/env_0/BlackSortingBin",
                     "/World/envs/env_0/RobotPOVCam",
                     "/World/envs/env_0/Robot",
                     "/World/GroundPlane",
@@ -165,7 +170,7 @@ def main():
                 collision_activation_distance=0.0,
                 motion_step_size=None,
                 visualize_spheres=False,
-                visualize_plan=False,
+                visualize_plan=True,
                 debug_planner=True,
                 # Dexterous hand grasp detection using finger joints + XY distance
                 # Works for cylindrical objects (beakers) grasped at any height
@@ -174,8 +179,8 @@ def main():
                 dexterous_finger_closed_threshold=0.2,  # Finger joint threshold (radians)
             )
 
-        cfg_right = _mk_cfg(yaml_right)
-        cfg_left = _mk_cfg(yaml_left)
+        cfg_right = _mk_cfg(yaml_right, "right")
+        cfg_left = _mk_cfg(yaml_left, "left")
         prebuilt_humanoid_cfgs = (cfg_left, cfg_right)
 
     # Create environment AFTER prebuilding robot YAML/configs

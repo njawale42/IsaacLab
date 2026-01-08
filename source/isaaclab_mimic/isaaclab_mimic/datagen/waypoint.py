@@ -21,17 +21,20 @@ class Waypoint:
     Represents a single desired 6-DoF waypoint, along with corresponding gripper actuation for this point.
     """
 
-    def __init__(self, pose, gripper_action, noise=None):
+    def __init__(self, pose, gripper_action, noise=None, joint_seed=None):
         """
         Args:
             pose (torch.Tensor): 4x4 pose target for robot controller
             gripper_action (torch.Tensor): gripper action for robot controller
             noise (float or None): action noise amplitude to apply during execution at this timestep
                 (for arm actions, not gripper actions)
+            joint_seed (torch.Tensor or None): optional joint configuration seed for IK solving or
+                for tracking joint positions during offline scheduling
         """
         self.pose = pose
         self.gripper_action = gripper_action
         self.noise = noise
+        self.joint_seed = joint_seed
 
     def __str__(self):
         """String representation of the waypoint."""
@@ -56,7 +59,7 @@ class WaypointSequence:
             self.sequence = deepcopy(sequence)
 
     @classmethod
-    def from_poses(cls, poses, gripper_actions, action_noise):
+    def from_poses(cls, poses, gripper_actions, action_noise, joint_positions=None):
         """
         Instantiate a WaypointSequence object given a sequence of poses,
         gripper actions, and action noise.
@@ -69,6 +72,8 @@ class WaypointSequence:
                 magnitudes that should be applied at each timestep. If a
                 single float is provided, the noise magnitude will be
                 constant over the trajectory.
+            joint_positions (list[torch.Tensor] or None): optional list of joint
+                configurations corresponding to each waypoint for offline scheduling.
         """
         assert isinstance(action_noise, (float, torch.Tensor))
 
@@ -79,14 +84,19 @@ class WaypointSequence:
         action_noise = action_noise.reshape(-1, 1)
 
         # make WaypointSequence instance
-        sequence = [
-            Waypoint(
-                pose=poses[t],
-                gripper_action=gripper_actions[t],
-                noise=action_noise[t, 0],
+        sequence = []
+        for t in range(num_timesteps):
+            joint_seed = None
+            if joint_positions is not None and t < len(joint_positions):
+                joint_seed = joint_positions[t]
+            sequence.append(
+                Waypoint(
+                    pose=poses[t],
+                    gripper_action=gripper_actions[t],
+                    noise=action_noise[t, 0],
+                    joint_seed=joint_seed,
+                )
             )
-            for t in range(num_timesteps)
-        ]
         return cls(sequence=sequence)
 
     def get_poses(self):

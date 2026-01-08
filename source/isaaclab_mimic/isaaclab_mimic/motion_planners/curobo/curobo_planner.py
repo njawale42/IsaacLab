@@ -1053,15 +1053,30 @@ class CuroboPlanner(MotionPlannerBase):
 
         # Call cuRobo's detach for tracked links
         for link_name in link_names:
-            self.motion_gen.detach_object_from_robot(link_name=link_name)
-            self.logger.debug(f"Called cuRobo detach for link {link_name}")
+            try:
+                self.motion_gen.detach_object_from_robot(link_name=link_name)
+                self.logger.debug(f"Called cuRobo detach for link {link_name}")
+            except ValueError:
+                # No spheres attached to this link - continue to next
+                self.logger.debug(f"No spheres attached to {link_name}, skipping detach")
 
-        # ALWAYS detach from configured attachment link to clean up any orphaned spheres
-        # This handles cases where cuRobo has spheres attached but our tracking doesn't know
+        # Detach from configured attachment link to clean up any orphaned spheres
+        # Only do this if the link actually exists in the kinematics model
         configured_link = self.config.attached_object_link_name
         if configured_link and configured_link not in link_names:
-            self.motion_gen.detach_object_from_robot(link_name=configured_link)
-            self.logger.debug(f"Called cuRobo detach for configured attachment link: {configured_link}")
+            # Check if the link exists in the kinematics model before calling detach
+            # This prevents cuRobo from logging errors for non-existent links (e.g., "attached_object" on humanoids)
+            link_idx_map = getattr(
+                self.motion_gen.kinematics.kinematics_config, "link_name_to_idx_map", {}
+            )
+            if configured_link in link_idx_map:
+                try:
+                    self.motion_gen.detach_object_from_robot(link_name=configured_link)
+                    self.logger.debug(f"Called cuRobo detach for configured attachment link: {configured_link}")
+                except ValueError:
+                    pass
+            else:
+                self.logger.debug(f"Skipping detach for non-existent link: {configured_link}")
 
         return True
 
@@ -1232,10 +1247,14 @@ class CuroboPlanner(MotionPlannerBase):
             active: True to enable collision checking, False to disable
         """
         for link in links:
-            if active:
-                self.motion_gen.kinematics.kinematics_config.enable_link_spheres(link)
-            else:
-                self.motion_gen.kinematics.kinematics_config.disable_link_spheres(link)
+            try:
+                if active:
+                    self.motion_gen.kinematics.kinematics_config.enable_link_spheres(link)
+                else:
+                    self.motion_gen.kinematics.kinematics_config.disable_link_spheres(link)
+            except ValueError:
+                # Link not found in sphere configuration - skip
+                self.logger.debug(f"Link {link} not found in sphere config, skipping")
 
     def plan_motion(
         self,
@@ -2024,6 +2043,7 @@ class CuroboPlanner(MotionPlannerBase):
         step_size: float | None = None,
         enable_retiming: bool | None = None,
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
+        skip_world_update: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Complete planning pipeline with world updates and object attachment handling.
@@ -2038,6 +2058,8 @@ class CuroboPlanner(MotionPlannerBase):
             env_id: Environment ID for multi-environment setups
             step_size: Step size for linear retiming if retiming is enabled
             enable_retiming: Whether to enable linear retiming of trajectory
+            skip_world_update: If True, skip world synchronization (for offline planning where
+                object poses are pre-set in the collision world)
 
         Returns:
             True if complete planning pipeline succeeded, False if any step failed
@@ -2048,7 +2070,10 @@ class CuroboPlanner(MotionPlannerBase):
         self.logger.debug("=== MOTION PLANNING DEBUG ===")
         self.logger.debug(f"Expected attached object: {expected_attached_object}")
 
-        self.update_world()
+        if not skip_world_update:
+            self.update_world()
+        else:
+            self.logger.debug("Skipping world update (offline mode)")
         gripper_closed = expected_attached_object is not None
         self._set_gripper_state(gripper_closed)
         current_attached = self.get_attached_objects()
@@ -2110,9 +2135,12 @@ class CuroboPlanner(MotionPlannerBase):
                 self.logger.debug(f"Object {expected_attached_object} not found in world mappings")
 
         # Detach objects if no object should be attached (i.e., placing/releasing)
-        if expected_attached_object is None and current_attached:
+        # But skip if in offline mode (skip_world_update=True) - attachments are managed externally
+        if expected_attached_object is None and current_attached and not skip_world_update:
             self.logger.debug("Detaching all objects as no object expected to be attached")
             self._detach_objects()
+        elif expected_attached_object is None and current_attached and skip_world_update:
+            self.logger.debug("Preserving attachment in offline mode (skip_world_update=True)")
 
         self.logger.debug(f"Planning motion with attached objects: {self.get_attached_objects()}")
 
@@ -2126,7 +2154,11 @@ class CuroboPlanner(MotionPlannerBase):
         self.logger.debug(f"Planning result: {plan_success}")
         self.logger.debug("=== END POST-GRASP DEBUG ===")
 
-        self._detach_objects()
+        # Only detach in online mode (not skip_world_update)
+        # In offline mode (skip_world_update=True), attachments are managed by the data generator
+        # and should persist across multiple planning calls
+        if not skip_world_update and self.has_attached_objects():
+            self._detach_objects()
 
         return plan_success
 

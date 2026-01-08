@@ -218,6 +218,7 @@ class BimanualHumanoidPlanner(MotionPlannerBase):
         enable_retiming: bool | None = None,
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
         arm: str | None = None,
+        skip_world_update: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Plan motion to target pose with optional object attachment.
@@ -230,6 +231,7 @@ class BimanualHumanoidPlanner(MotionPlannerBase):
             enable_retiming: Whether to enable trajectory retiming
             link_target_poses_base: Optional link target poses in base frame
             arm: Force specific arm ("left" or "right"), or None to auto-select
+            skip_world_update: If True, skip world synchronization (for offline planning)
             **kwargs: Additional arguments (e.g., input_is_site_frame)
 
         Returns:
@@ -250,6 +252,7 @@ class BimanualHumanoidPlanner(MotionPlannerBase):
                     step_size=step_size,
                     enable_retiming=enable_retiming,
                     link_target_poses_base=link_target_poses_base,
+                    skip_world_update=skip_world_update,
                     **kwargs,
                 )
                 if ok:
