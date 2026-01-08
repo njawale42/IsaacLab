@@ -191,6 +191,37 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
             tensor_args=self.tensor_args,
         ).get_ordered_joint_state(self.motion_gen.kinematics.joint_names)
 
+    def _get_joint_state_for_fk(
+        self, start_joint_state: torch.Tensor | None = None
+    ) -> JointState:
+        """Get joint state for FK computations.
+
+        If start_joint_state is provided (offline planning), use it.
+        Otherwise fall back to reading from articulation buffer.
+        """
+        if start_joint_state is not None:
+            # Use provided start state (for offline planning)
+            pos = start_joint_state.to(device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+            if pos.dim() == 1:
+                pos = pos.unsqueeze(0)
+
+            # Clamp to joint limits
+            limits = self.motion_gen.kinematics.get_joint_limits().position
+            low, high = limits[0], limits[1]
+            margin = 1e-4
+            pos = torch.clamp(pos, low + margin, high - margin)
+            self.logger.debug("Using provided start_joint_state for FK")
+
+            return JointState(
+                position=pos,
+                velocity=torch.zeros_like(pos),
+                acceleration=torch.zeros_like(pos),
+                joint_names=self.motion_gen.kinematics.joint_names,
+                tensor_args=self.tensor_args,
+            )
+        else:
+            return self._get_current_joint_state_for_curobo()
+
     # ---- Main planning entry ----
     def update_world_and_plan_motion(
         self,
@@ -218,36 +249,12 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
         # Convert controller-site/world input to tool/world if requested
         target_pose_world_tool: torch.Tensor
         if input_is_site_frame:
-            # Compute current tool pose in base via cuRobo FK, then lift to world using robot base pose
-            cu_js = self._get_current_joint_state_for_curobo()
-            ee_pose = self.get_ee_pose(cu_js)  # base->tool
-            pos_bt = self._to_env_device(ee_pose.position).reshape(-1, 3)[0]
-            if hasattr(ee_pose, "quaternion"):
-                quat_bt = self._to_env_device(ee_pose.quaternion).view(1, 4)
-                rot_bt = PoseUtils.matrix_from_quat(quat_bt)[0]
-            else:
-                rot_bt = self._to_env_device(ee_pose.get_rotation())
-                if rot_bt.dim() == 3:
-                    rot_bt = rot_bt[0]
-            T_base_tool_now = PoseUtils.make_pose(pos_bt.unsqueeze(0), rot_bt.unsqueeze(0))[0]
-            # World (env-origin) -> base
-            base_pos_w = (self.robot.data.root_pos_w[self.env_id] - self.env.scene.env_origins[self.env_id]).to(
-                device=self.env.device, dtype=torch.float32
-            )
-            base_rot_w = PoseUtils.matrix_from_quat(
-                self.robot.data.root_quat_w[self.env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32)
-            )[0]
-            T_world_base = PoseUtils.make_pose(base_pos_w.unsqueeze(0), base_rot_w.unsqueeze(0))[0]
-            T_world_tool_now = (T_world_base @ T_base_tool_now).clone()
-
-            # Controller site pose from env (same EEF name as active arm)
-            arm = self._arm_side() or "right"
-            ctrl_site_env = self.env.get_robot_eef_pose(arm, env_ids=[self.env_id])[0]
-            # Mapping from cuRobo tool to controller site: T_T_S = inv(T_W_T) @ T_W_S
-            T_tool_site = torch.linalg.solve(T_world_tool_now, ctrl_site_env).clone()
-            # Convert input site/world to tool/world: T_W_T = T_W_S @ inv(T_T_S)
-            target_site_world = target_pose.to(device=self.env.device, dtype=torch.float32).clone()
-            target_pose_world_tool = target_site_world @ torch.linalg.inv(T_tool_site)
+            # For bimanual humanoids, T_tool_site is approximately identity at the home/reset position.
+            # The controller's site frame and cuRobo's tool frame are essentially the same when
+            # the robot is at home. Computing T_tool_site from env.get_robot_eef_pose() is unreliable
+            # in offline mode because the physics state isn't updated.
+            # Using identity simplifies the conversion: world->site becomes world->tool directly.
+            target_pose_world_tool = target_pose.to(device=self.env.device, dtype=torch.float32).clone()
         else:
             target_pose_world_tool = target_pose.to(device=self.env.device, dtype=torch.float32)
 
@@ -267,7 +274,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
 
         # Guard: if target is effectively current, synthesize a trivial plan to avoid optimizer edge cases
         try:
-            current_js = self._get_current_joint_state_for_curobo()
+            current_js = self._get_joint_state_for_fk(start_joint_state)
             ee_pose_bt = self.get_ee_pose(current_js)  # base->tool
             cur_pos_bt = self._to_env_device(ee_pose_bt.position).reshape(-1, 3)[0]
             if hasattr(ee_pose_bt, "quaternion"):

@@ -1263,6 +1263,7 @@ class CuroboPlanner(MotionPlannerBase):
         enable_retiming: bool | None = None,
         *,
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
+        start_joint_state: torch.Tensor | None = None,
     ) -> bool:
         """Plan collision-free motion to target pose.
 
@@ -1274,6 +1275,8 @@ class CuroboPlanner(MotionPlannerBase):
             target_pose: Target end-effector pose as 4x4 transformation matrix
             step_size: Step size for linear retiming, enables retiming if provided
             enable_retiming: Whether to enable linear retiming, auto-detected from step_size if None
+            start_joint_state: Optional start joint state tensor in cuRobo planner ordering.
+                If provided, bypasses reading from articulation buffer (for offline planning).
 
         Returns:
             True if planning succeeded and a valid trajectory was found, False otherwise
@@ -1292,7 +1295,27 @@ class CuroboPlanner(MotionPlannerBase):
             quaternion=PoseUtils.quat_from_matrix(target_rot),
         )
 
-        start_state: JointState = self._get_current_joint_state_for_curobo()
+        start_state: JointState
+        if start_joint_state is not None:
+            # Use provided start state (for offline planning)
+            pos = start_joint_state.to(device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+            if pos.dim() == 1:
+                pos = pos.unsqueeze(0)
+            # Clamp to joint limits
+            limits = self.motion_gen.kinematics.get_joint_limits().position
+            low, high = limits[0], limits[1]
+            margin = 1e-4
+            pos = torch.clamp(pos, low + margin, high - margin)
+            self.logger.debug("Using provided start_joint_state for planning")
+            start_state = JointState(
+                position=pos,
+                velocity=torch.zeros_like(pos),
+                acceleration=torch.zeros_like(pos),
+                joint_names=self.motion_gen.kinematics.joint_names,
+                tensor_args=self.tensor_args,
+            )
+        else:
+            start_state = self._get_current_joint_state_for_curobo()
 
         self.logger.debug(f"Retiming enabled: {enable_retiming}, Step size: {step_size}")
 
@@ -2044,6 +2067,7 @@ class CuroboPlanner(MotionPlannerBase):
         enable_retiming: bool | None = None,
         link_target_poses_base: dict[str, torch.Tensor] | None = None,
         skip_world_update: bool = False,
+        start_joint_state: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> bool:
         """Complete planning pipeline with world updates and object attachment handling.
@@ -2060,6 +2084,8 @@ class CuroboPlanner(MotionPlannerBase):
             enable_retiming: Whether to enable linear retiming of trajectory
             skip_world_update: If True, skip world synchronization (for offline planning where
                 object poses are pre-set in the collision world)
+            start_joint_state: Optional start joint state tensor in cuRobo planner ordering.
+                If provided, bypasses reading from articulation buffer (for offline planning).
 
         Returns:
             True if complete planning pipeline succeeded, False if any step failed
@@ -2149,6 +2175,7 @@ class CuroboPlanner(MotionPlannerBase):
             step_size,
             enable_retiming,
             link_target_poses_base=link_target_poses_base,
+            start_joint_state=start_joint_state,
         )
 
         self.logger.debug(f"Planning result: {plan_success}")
