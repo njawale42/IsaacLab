@@ -1917,15 +1917,18 @@ class DataGeneratorScheduled:
             #           f"traj_len={len(eef_state.current_trajectory)}, "
             #           f"done={eef_state.subtasks_done}")
 
-            eef_waypoints = self._collect_offline_waypoints(
+            eef_waypoints, global_robot_joint_state = self._collect_offline_waypoints(
                 env_id=env_id,
                 eef_states=eef_states,
                 runtime_constraints=runtime_subtask_constraints,
                 motion_planner=motion_planner,
+                global_robot_joint_state=global_robot_joint_state,
             )
             if not eef_waypoints:
                 raise RuntimeError("Offline build produced no waypoints for active timestep.")
 
+            # Store per-arm 21-joint vectors (already in planner space).
+            # These come from last_commanded_joint_position which is set during MP or IK solving.
             for eef_name, waypoint in eef_waypoints.items():
                 eef_state = eef_states[eef_name]
                 joint_vec = eef_state.last_commanded_joint_position
@@ -2459,12 +2462,14 @@ class DataGeneratorScheduled:
         eef_states: dict[str, EEFGenerationState],
         runtime_constraints: dict,
         motion_planner: Any | None,
-    ) -> dict[str, Waypoint]:
+        global_robot_joint_state: torch.Tensor,
+    ) -> tuple[dict[str, Waypoint], torch.Tensor]:
         """
         Collect waypoints for the current timestep without stepping the simulator.
 
         This mirrors _collect_eef_waypoints but also tracks joint positions and
-        solves IK for skill segment waypoints.
+        solves IK for skill segment waypoints. Returns the updated global robot
+        joint state to maintain consistency across arms for collision detection.
         """
         eef_waypoint_dict: dict[str, Waypoint] = {}
         for eef_name in sorted(self.env_cfg.subtask_configs.keys()):
@@ -2515,15 +2520,21 @@ class DataGeneratorScheduled:
 
             if joint_vec is not None:
                 eef_state.last_commanded_joint_position = joint_vec.clone()
-                # Update robot state for subsequent IK/motion planning (skip sim sync in offline mode)
+                # Merge this arm's joints into the global state for consistency
                 if motion_planner is not None:
                     arm_planner = self._get_arm_planner(motion_planner, eef_name)
+                    global_robot_joint_state = self._merge_arm_joints_to_global(
+                        global_state=global_robot_joint_state,
+                        arm_joints=joint_vec,
+                        arm_planner=arm_planner,
+                    )
+                    # Update robot state for subsequent IK/motion planning (skip sim sync in offline mode)
                     self._set_robot_joint_state(env_id, joint_vec, arm_planner, skip_sim_sync=True)
 
             eef_waypoint_dict[eef_name] = waypoint
             eef_state.last_commanded_gripper_action = waypoint.gripper_action
 
-        return eef_waypoint_dict
+        return eef_waypoint_dict, global_robot_joint_state
 
     def _solve_ik_for_waypoint(
         self,
@@ -2889,14 +2900,22 @@ class DataGeneratorScheduled:
         arm_planner = self._get_arm_planner(motion_planner, eef_name)
         planner_dof = self._get_planner_dof(arm_planner)
 
+        # Get planner's device (CUDA) - cuRobo kinematics requires CUDA tensors
+        tensor_args = getattr(arm_planner, "tensor_args", None)
+        if tensor_args is None and hasattr(arm_planner, "motion_gen"):
+            tensor_args = getattr(arm_planner.motion_gen, "tensor_args", None)
+        planner_device = getattr(tensor_args, "device", self.env.device) if tensor_args else self.env.device
+        planner_dtype = getattr(tensor_args, "dtype", torch.float32) if tensor_args else torch.float32
+
         joints: list[torch.Tensor] = []
         last_valid: torch.Tensor | None = None
 
         for entry in entries:
             joint_vec = entry.get("joint")
             if joint_vec is not None:
-                # Use recorded joint position
+                # Use recorded joint position (already in planner space, just ensure device/dtype)
                 projected = self._project_joint_to_planner(joint_vec, arm_planner)
+                projected = projected.to(device=planner_device, dtype=planner_dtype)
                 joints.append(projected)
                 last_valid = projected
             else:
@@ -2905,12 +2924,13 @@ class DataGeneratorScheduled:
                 solved = self._solve_ik_for_waypoint(waypoint.pose, arm_planner, last_valid)
                 if solved is not None:
                     projected = self._project_joint_to_planner(solved, arm_planner)
+                    projected = projected.to(device=planner_device, dtype=planner_dtype)
                     joints.append(projected)
                     last_valid = projected
                 elif last_valid is not None:
                     joints.append(last_valid.clone())
                 else:
-                    joints.append(torch.zeros(planner_dof, device=self.env.device))
+                    joints.append(torch.zeros(planner_dof, device=planner_device, dtype=planner_dtype))
 
         return torch.stack(joints, dim=0)
 
@@ -2927,7 +2947,22 @@ class DataGeneratorScheduled:
         ]
         planner_joint_names = list(planner.motion_gen.kinematics.joint_names)
 
-        indices = [env_joint_names.index(name) for name in planner_joint_names if name in env_joint_names]
+        indices = []
+        for name in planner_joint_names:
+            if name in env_joint_names:
+                indices.append(env_joint_names.index(name))
+            else:
+                # Joint not found - this is a problem!
+                print(f"[PROJECT WARNING] Planner joint '{name}' not found in env joints!")
+
+        if len(indices) != planner_dof:
+            print(f"[PROJECT WARNING] Expected {planner_dof} joints but found {len(indices)} matching joints")
+
+        if not indices:
+            # Return zeros if no matches found
+            print("[PROJECT ERROR] No matching joints found! Returning zeros.")
+            return torch.zeros(planner_dof, device=self.env.device)
+
         return joint_vec[indices].to(device=self.env.device)
 
     def _get_planner_dof(self, planner: Any) -> int:
@@ -3084,13 +3119,39 @@ class DataGeneratorScheduled:
         """
         buffers = GenerationBuffers()
 
-        # NOTE: For humanoid robots with arm-only action spaces, we do NOT directly set
-        # joint positions during replay. The controller handles converting target poses
-        # to arm actions via env.target_eef_pose_to_action(). Directly setting joint
-        # positions would bypass the controller and cause weird body motion.
-        #
-        # For tabletop robots (Franka) where the whole robot is the arm, you might want
-        # to set initial joint state. But for humanoids, this is not needed.
+        # Set the initial joint state ONCE at the start of replay to align with first waypoints.
+        # This is important even for humanoids - we need the robot to start from the correct
+        # configuration before the controller takes over with pose targets.
+        if planner_map is not None and schedule.left_indices.numel() > 0 and schedule.right_indices.numel() > 0:
+            left_idx_0 = int(schedule.left_indices[0].item())
+            right_idx_0 = int(schedule.right_indices[0].item())
+            print(f"[Replay] Setting initial joint state: left_idx={left_idx_0}, right_idx={right_idx_0}")
+            print(f"[Replay] Left pose[0]: {arm_paths['left'].poses[left_idx_0][:3, 3].cpu().numpy()}")
+            print(f"[Replay] Right pose[0]: {arm_paths['right'].poses[right_idx_0][:3, 3].cpu().numpy()}")
+
+            # Debug: Check if schedule actually delays arms (non-sequential indices)
+            left_seq = torch.arange(schedule.left_indices.shape[0])
+            right_seq = torch.arange(schedule.right_indices.shape[0])
+            left_diff = (schedule.left_indices.cpu() - left_seq).abs().sum().item()
+            right_diff = (schedule.right_indices.cpu() - right_seq).abs().sum().item()
+            print(f"[Replay] Schedule deviation from sequential: left={left_diff:.0f}, right={right_diff:.0f}")
+            if left_diff < 1 and right_diff < 1:
+                print("[Replay] WARNING: Schedule is nearly sequential - no collision avoidance applied!")
+
+            # Show a few sample schedule indices
+            n = schedule.left_indices.shape[0]
+            sample_ticks = [0, n // 4, n // 2, n - 1]
+            for t in sample_ticks:
+                if t < schedule.left_indices.shape[0]:
+                    print(f"[Replay] tick={t}: left_idx={schedule.left_indices[t].item()}, right_idx={schedule.right_indices[t].item()}")
+
+            self._apply_scheduled_joint_state(
+                env_id=env_id,
+                arm_paths=arm_paths,
+                left_idx=left_idx_0,
+                right_idx=right_idx_0,
+                planner_map=planner_map,
+            )
 
         # Configurable smoothing: max joint change per tick (radians)
         max_joint_step_rad = float(getattr(self.env_cfg.datagen_config, "max_joint_step_rad", 0.1))
@@ -3098,9 +3159,14 @@ class DataGeneratorScheduled:
         prev_right_idx = -1
 
         num_ticks = schedule.left_indices.shape[0]
+        print(f"[Replay] Starting replay loop with {num_ticks} ticks")
         for tick in range(num_ticks):
             left_idx = int(schedule.left_indices[tick].item())
             right_idx = int(schedule.right_indices[tick].item())
+
+            # Debug output every 50 ticks
+            if tick % 50 == 0 or tick == num_ticks - 1:
+                print(f"[Replay] tick={tick}: left_idx={left_idx}, right_idx={right_idx}")
 
             # Check if we need interpolation steps for smooth motion
             interp_steps = self._compute_interpolation_steps(
@@ -3158,6 +3224,8 @@ class DataGeneratorScheduled:
 
             prev_left_idx = left_idx
             prev_right_idx = right_idx
+
+        print(f"[Replay] Completed {num_ticks} ticks. Success: {buffers.success}")
 
         generated_actions: list[torch.Tensor] | torch.Tensor
         if buffers.actions:

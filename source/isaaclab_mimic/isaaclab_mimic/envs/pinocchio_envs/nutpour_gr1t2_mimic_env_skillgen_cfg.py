@@ -43,6 +43,13 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         self.datagen_config.num_demo_to_render = 10
         self.datagen_config.num_fail_demo_to_render = 25
         self.datagen_config.seed = 10
+        # Scheduling parameters for bimanual collision avoidance
+        self.datagen_config.schedule_densify_factor = 0
+        self.datagen_config.schedule_pair_batch = 4096
+        self.datagen_config.schedule_collision_margin = 0.0
+        # self.datagen_config.schedule_min_dt = 0.05  # Match step_dt for consistency
+        self.datagen_config.schedule_all_offline = True
+        self.datagen_config.final_hold_steps = 10
 
         # The following are the subtask configurations for the stack task.
         subtask_configs = []

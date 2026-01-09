@@ -58,27 +58,47 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         ),
     )
 
+    # sorting_bowl = RigidObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/SortingBowl",
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=[0.02779, 0.43007, 0.9860], rot=[1, 0, 0, 0]),
+    #     spawn=UsdFileCfg(
+    #         usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
+    #         scale=(1.0, 1.0, 1.5),
+    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+    #         mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+    #         collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005),
+    #     ),
+    # )
+
+    # sorting_beaker = RigidObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/SortingBeaker",
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9861], rot=[1, 0, 0, 0]),
+    #     spawn=UsdFileCfg(
+    #         usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_beaker_red.usd",
+    #         # scale=(0.5, 0.5, 1.5),  # changed this for testing
+    #         scale=(0.45, 0.45, 1.3),
+    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+    #         mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+    #     ),
+    # )
     sorting_bowl = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/SortingBowl",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=[0.02779, 0.43007, 0.9860], rot=[1, 0, 0, 0]),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.05739, 0.59793, 0.9861], rot=[1, 0, 0, 0]), # [0.02779, 0.43007, 0.9860]
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
             scale=(1.0, 1.0, 1.5),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
             collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005),
         ),
     )
 
     sorting_beaker = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/SortingBeaker",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9861], rot=[1, 0, 0, 0]),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.03, 0.43007, 0.9860], rot=[1, 0, 0, 0]), # [-0.13739, 0.45793, 0.9861]
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_beaker_red.usd",
-            # scale=(0.5, 0.5, 1.5),  # changed this for testing
             scale=(0.45, 0.45, 1.3),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
         ),
     )
 

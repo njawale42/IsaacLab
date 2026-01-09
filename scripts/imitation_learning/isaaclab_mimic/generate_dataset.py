@@ -154,11 +154,11 @@ def main():
                 # Ignore specific USD prims; remove items one-by-one to debug collisions
                 world_ignore_substrings=[
                     "/World/envs/env_0/Table",
-                    "/World/envs/env_0/SortingScale",
-                    "/World/envs/env_0/SortingBowl",
-                    "/World/envs/env_0/SortingBeaker",
+                    # "/World/envs/env_0/SortingScale",
+                    # "/World/envs/env_0/SortingBowl",
+                    # "/World/envs/env_0/SortingBeaker",
                     "/World/envs/env_0/FactoryNut",
-                    "/World/envs/env_0/BlackSortingBin",
+                    # "/World/envs/env_0/BlackSortingBin",
                     "/World/envs/env_0/RobotPOVCam",
                     "/World/envs/env_0/Robot",
                     "/World/GroundPlane",
