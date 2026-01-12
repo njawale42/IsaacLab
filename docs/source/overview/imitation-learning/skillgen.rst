@@ -282,7 +282,7 @@ Start with a small dataset to verify everything works:
    --generation_num_trials 10 \
    --input_file ./datasets/annotated_dataset_skillgen.hdf5 \
    --output_file ./datasets/generated_dataset_small_skillgen_cube_stack.hdf5 \
-   --task Isaac-Stack-Cube-Franka-IK-Rel-Skillgen-v0 \
+   --task Isaac-Stack-Cube-Franka-IK-Rel-Skillgen-Mimic-v0 \
    --use_skillgen
 
 Full-Scale Generation
@@ -299,7 +299,7 @@ Once satisfied with small-scale results, generate a full training dataset:
    --generation_num_trials 1000 \
    --input_file ./datasets/annotated_dataset_skillgen.hdf5 \
    --output_file ./datasets/generated_dataset_skillgen_cube_stack.hdf5 \
-   --task Isaac-Stack-Cube-Franka-IK-Rel-Skillgen-v0 \
+   --task Isaac-Stack-Cube-Franka-IK-Rel-Skillgen-Mimic-v0 \
    --use_skillgen
 
 .. note::
@@ -399,7 +399,7 @@ Train a policy for the more complex adaptive bin stacking:
 .. code:: bash
 
    ./isaaclab.sh -p scripts/imitation_learning/robomimic/train.py \
-   --task Isaac-Stack-Cube-Bin-Franka-IK-Rel-Mimic-v0 \
+   --task Isaac-Stack-Cube-Bin-Franka-IK-Rel-v0 \
    --algo bc \
    --dataset ./datasets/generated_dataset_skillgen_bin_cube_stack.hdf5
 
@@ -426,7 +426,7 @@ Test your trained policies:
    # Adaptive bin cube stacking evaluation
    ./isaaclab.sh -p scripts/imitation_learning/robomimic/play.py \
    --device cpu \
-   --task Isaac-Stack-Cube-Bin-Franka-IK-Rel-Mimic-v0 \
+   --task Isaac-Stack-Cube-Bin-Franka-IK-Rel-v0 \
    --num_rollouts 50 \
    --checkpoint /path/to/model_checkpoint.pth
 
