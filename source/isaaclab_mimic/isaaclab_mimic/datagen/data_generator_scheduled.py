@@ -25,6 +25,20 @@ from isaaclab.envs import (
 from isaaclab.managers import TerminationTermCfg
 
 from isaaclab_mimic.datagen.datagen_info import DatagenInfo
+from isaaclab_mimic.datagen.offline_scheduling_helpers import (
+    JointMapperCache,
+    OfflineObjectHelper,
+    compute_interpolation_steps,
+    force_grasp_check,
+    get_ee_position_from_fk,
+    get_world_to_base_transform,
+    interpolate_pose,
+    is_grasp_subtask,
+    is_place_subtask,
+    get_subtask_object_ref,
+    resolve_eef_name_from_planner,
+    transform_base_to_world,
+)
 from isaaclab_mimic.datagen.scheduling import ArmPath, DiscreteSchedule, build_collision_aware_schedule
 from isaaclab_mimic.datagen.selection_strategy import make_selection_strategy
 from isaaclab_mimic.datagen.waypoint import MultiWaypoint, Waypoint, WaypointSequence, WaypointTrajectory
@@ -283,6 +297,10 @@ class DataGeneratorScheduled:
             raise AttributeError(
                 "DataGeneratorRefactored expects the environment scene to expose a 'robot' articulation"
             ) from exc
+
+        # Initialize helpers for offline scheduling
+        self._joint_mapper_cache = JointMapperCache(self._robot_articulation, self.env.device)
+        self._object_helper = OfflineObjectHelper(self.env)
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -1193,14 +1211,14 @@ class DataGeneratorScheduled:
 
         # Convert the planned Cartesian trajectory into waypoints, holding the gripper fixed
         # at the last skill segment action for the entire motion-planned transit.
-        mp_waypoints = self._convert_planned_trajectory_to_waypoints(
+        result = self._convert_planned_trajectory_to_waypoints(
             motion_planner,
             base_gripper_action,
         )
+        mp_waypoints: list[Waypoint] = result if isinstance(result, list) else result[0]
 
         # Merge the skill trajectory (with interpolation from MP end pose) and combine
         # MP waypoints + skill waypoints into a single trajectory.
-        # This matches data_gen_bimanual.py behavior where constraints apply to full length.
         # IMPORTANT: force_use_prev_traj=True ensures we interpolate from the LAST MP WAYPOINT
         # (where the robot will be after MP), not from the current robot pose (before MP).
         skill_waypoints = self.merge_eef_subtask_trajectory(
@@ -1531,65 +1549,101 @@ class DataGeneratorScheduled:
         return all(state.subtasks_done for state in eef_states.values())
 
     def _convert_planned_trajectory_to_waypoints(
-        self, motion_planner: Any, gripper_action: torch.Tensor
-    ) -> list[Waypoint]:
+        self,
+        motion_planner: Any,
+        gripper_action: torch.Tensor,
+        include_joints: bool = False,
+    ) -> list[Waypoint] | tuple[list[Waypoint], list[torch.Tensor]]:
         """
         Convert the planner's raw pose sequence into executable `Waypoint` objects.
 
         Motion planners operate in their own reference frames (base->tool, site frames,
-        etc.). The controller, however, expects waypoints expressed in the controller site
-        frame with an associated gripper command. This helper performs the appropriate
-        frame conversions (including the bimanual base->site transform) and annotates
-        each pose with the constant gripper action used during transits.
+        etc.). The controller expects waypoints in the controller site frame. This method
+        performs frame conversions and optionally extracts joint positions.
 
         Args:
-            motion_planner: Planner instance exposing `get_planned_poses()` and, optionally,
-                configuration data such as `motion_noise_scale`, `_last_arm`, or `_arm_side`.
-            gripper_action: Gripper tensor to attach to every waypoint in the transit.
+            motion_planner: Planner instance exposing `get_planned_poses()`.
+            gripper_action: Gripper tensor to attach to every waypoint.
+            include_joints: If True, also return joint positions from the plan.
 
         Returns:
-            List of `Waypoint` objects ready to be executed by the MultiWaypoint controller.
+            List of Waypoint objects, or tuple of (waypoints, joints) if include_joints=True.
         """
-        # Get motion noise scale from the planner's configuration
         motion_noise_scale = getattr(motion_planner.config, "motion_noise_scale", 0.0)
-
         planned_poses = motion_planner.get_planned_poses()
+        planned_joints = self._get_planned_joint_positions(motion_planner) if include_joints else None
 
-        # For tabletop tasks, planned poses are already in the env's expected frame
+        waypoints: list[Waypoint] = []
+        joints: list[torch.Tensor] = []
+
+        # For tabletop tasks, poses are already in the correct frame
         if self.skillgen_type != "bimanual":
-            return [Waypoint(pose=p, gripper_action=gripper_action, noise=motion_noise_scale) for p in planned_poses]
+            for idx, pose in enumerate(planned_poses):
+                joint_vec = None
+                if planned_joints is not None and idx < planned_joints.shape[0]:
+                    joint_vec = planned_joints[idx].clone()
+                waypoints.append(Waypoint(
+                    pose=pose.clone() if include_joints else pose,
+                    gripper_action=gripper_action.clone() if include_joints else gripper_action,
+                    noise=motion_noise_scale,
+                    joint_seed=joint_vec,
+                ))
+                if include_joints:
+                    if joint_vec is not None:
+                        joints.append(joint_vec)
+                    elif joints:
+                        joints.append(joints[-1].clone())
+            return (waypoints, joints) if include_joints else waypoints
 
-        # Bimanual/humanoid: convert base->tool to site/world before wrapping as waypoints
-        # Determine which arm this plan corresponds to
-        eef_name = None
-        if hasattr(motion_planner, "_last_arm") and motion_planner._last_arm is not None:
-            eef_name = motion_planner._last_arm
-        elif hasattr(motion_planner, "_arm_side"):
-            try:
-                eef_name = motion_planner._arm_side()
-            except Exception:
-                eef_name = None
-        if eef_name is None:
-            eef_name = "right"
-
+        # Bimanual/humanoid: convert base->tool to world->site frame
+        eef_name = resolve_eef_name_from_planner(motion_planner)
         env_id = getattr(motion_planner, "env_id", 0)
-
-        # Compute world->base transform
-        base_pos_world = (self.env.scene["robot"].data.root_pos_w[env_id] - self.env.scene.env_origins[env_id]).to(
-            device=self.env.device, dtype=torch.float32
+        T_world_base = get_world_to_base_transform(
+            self._robot_articulation, self.env.scene.env_origins, env_id, self.env.device
         )
-        base_rot_world = PoseUtils.matrix_from_quat(
-            self.env.scene["robot"]
-            .data.root_quat_w[env_id]
-            .unsqueeze(0)
-            .to(device=self.env.device, dtype=torch.float32)
-        )[0]
-        T_world_base = PoseUtils.make_pose(base_pos_world.unsqueeze(0), base_rot_world.unsqueeze(0))[0]
 
-        # Compute fixed tool->site mapping at current configuration
+        # For offline mode (include_joints=True), use identity for T_tool_site because:
+        # - The physics state isn't updated during offline path building
+        # - Computing T_tool_site from articulation buffer is unreliable
+        # - The controller's site frame and cuRobo's tool frame are essentially the same at home position
+        if include_joints:
+            T_tool_site = torch.eye(4, device=self.env.device, dtype=torch.float32)
+        else:
+            T_tool_site = self._compute_tool_to_site_transform(motion_planner, T_world_base, eef_name, env_id)
+
+        for idx, planned_pose in enumerate(planned_poses):
+            p_bt = planned_pose.to(device=self.env.device, dtype=torch.float32)
+            T_world_site = transform_base_to_world(p_bt, T_world_base, T_tool_site)
+
+            joint_vec = None
+            if planned_joints is not None and idx < planned_joints.shape[0]:
+                joint_vec = planned_joints[idx].clone()
+
+            waypoints.append(Waypoint(
+                pose=T_world_site,
+                gripper_action=gripper_action.clone() if include_joints else gripper_action,
+                noise=motion_noise_scale,
+                joint_seed=joint_vec,
+            ))
+            if include_joints:
+                if joint_vec is not None:
+                    joints.append(joint_vec)
+                elif joints:
+                    joints.append(joints[-1].clone())
+
+        return (waypoints, joints) if include_joints else waypoints
+
+    def _compute_tool_to_site_transform(
+        self,
+        motion_planner: Any,
+        T_world_base: torch.Tensor,
+        eef_name: str,
+        env_id: int,
+    ) -> torch.Tensor:
+        """Compute the tool-to-site transform for bimanual robots."""
         try:
             cu_js = motion_planner._get_current_joint_state_for_curobo()
-            ee_pose_bt = motion_planner.get_ee_pose(cu_js)  # base->tool
+            ee_pose_bt = motion_planner.get_ee_pose(cu_js)
             pos_bt = (
                 ee_pose_bt.position
                 if isinstance(ee_pose_bt.position, torch.Tensor)
@@ -1607,22 +1661,9 @@ class DataGeneratorScheduled:
             T_base_tool_now = PoseUtils.make_pose(pos_bt.unsqueeze(0), rot_bt.unsqueeze(0))[0]
             T_world_tool_now = (T_world_base @ T_base_tool_now).clone()
             ctrl_site_env = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])[0]
-            T_tool_site = torch.linalg.solve(T_world_tool_now, ctrl_site_env).clone()
+            return torch.linalg.solve(T_world_tool_now, ctrl_site_env).clone()
         except Exception:
-            # Fallback: assume identity tool->site (may be okay if controller site == tool)
-            # TODO: Neel We need to figure this all out for humanoid
-            T_tool_site = torch.eye(4, device=self.env.device, dtype=torch.float32)
-
-        waypoints = []
-        for planned_pose in planned_poses:
-            # planned_pose is base->tool; map to world->tool and then to world->site
-            p_bt = planned_pose.to(device=self.env.device, dtype=torch.float32)
-            T_world_tool = (T_world_base @ p_bt).clone()
-            T_world_site = (T_world_tool @ T_tool_site).clone()
-            waypoint = Waypoint(pose=T_world_site, gripper_action=gripper_action, noise=motion_noise_scale)
-            waypoints.append(waypoint)
-
-        return waypoints
+            return torch.eye(4, device=self.env.device, dtype=torch.float32)
 
     def _get_goal_visualizer(self, env_id: int, eef_name: str) -> VisualizationMarkers:
         """
@@ -1685,12 +1726,7 @@ class DataGeneratorScheduled:
 
         initial_state, arm_paths = build_result
 
-        print("[DEBUG] Stage 1 complete - Built arm paths:")
-        # print(f"Right: {arm_paths['right'].poses.shape[0]} waypoints, joints shape: {arm_paths['right'].joint_positions.shape}")
-        # print(f"Left: {arm_paths['left'].poses.shape[0]} waypoints, joints shape: {arm_paths['left'].joint_positions.shape}")
-
         # Stage 2: Build collision-aware schedule
-        print("[DEBUG] Stage 2: Building collision-aware schedule...")
         try:
             schedule = build_collision_aware_schedule(
                 arm_right=arm_paths["right"],
@@ -1703,17 +1739,13 @@ class DataGeneratorScheduled:
                 collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
                 min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
             )
-            print(f"[DEBUG] Schedule built: {schedule.left_indices.shape[0]} ticks, total_time={schedule.total_time:.3f}s")
         except Exception as e:
-            print(f"[ERROR] Scheduling failed: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Scheduling failed: {e}")
             return {"success": False}
 
         schedule.append_hold(int(getattr(self.env_cfg.datagen_config, "final_hold_steps", 0)))
 
         # Stage 3: Replay scheduled actions in simulator
-        print("[DEBUG] Stage 3: Replaying scheduled actions in simulator...")
         env_id_tensor = torch.tensor([env_id], dtype=torch.int64, device=self.env.device)
         self.env.scene.reset_to(initial_state, env_ids=env_id_tensor, is_relative=True)
         self.env.recorder_manager.reset(env_ids=env_id_tensor)
@@ -1809,8 +1841,6 @@ class DataGeneratorScheduled:
                 )
             else:
                 eef_states[eef_name].last_commanded_joint_position = initial_joints.clone()
-        print("[DEBUG] Initialized joint positions for all EEFs from reset state")
-
         # Waypoint logs: list of dicts per EEF with waypoint, joint position
         waypoint_logs: dict[str, list[dict[str, Any]]] = {
             eef_name: [] for eef_name in self.env_cfg.subtask_configs.keys()
@@ -1910,13 +1940,6 @@ class DataGeneratorScheduled:
                     eef_state.subtask_started = True
 
             # Collect waypoints for this timestep (without stepping simulator)
-            # print(f"[DEBUG] Collecting offline waypoints, iteration {len(waypoint_logs.get('right', []))}")
-            # for eef_name, eef_state in eef_states.items():
-            #     print(f"  {eef_name}: subtask_idx={eef_state.current_subtask_index}, "
-            #           f"step_idx={eef_state.subtask_step_index}, "
-            #           f"traj_len={len(eef_state.current_trajectory)}, "
-            #           f"done={eef_state.subtasks_done}")
-
             eef_waypoints, global_robot_joint_state = self._collect_offline_waypoints(
                 env_id=env_id,
                 eef_states=eef_states,
@@ -1965,7 +1988,6 @@ class DataGeneratorScheduled:
                 )
 
             if self._all_subtasks_completed(eef_states):
-                print("[DEBUG] All subtasks completed, breaking loop")
                 break
 
         # Build ArmPath objects from collected waypoints
@@ -2034,9 +2056,6 @@ class DataGeneratorScheduled:
                 eef_state.current_subtask_index,
                 self.env.cfg,
             )
-            print(f"[Offline Attach] {eef_name} subtask {eef_state.current_subtask_index}: expected_attached_object = {expected_attached_object}")
-        else:
-            print("[Offline Attach] env has no get_expected_attached_object method")
 
         # Get arm-specific planner for this EEF
         arm_planner = self._get_arm_planner(motion_planner, eef_name)
@@ -2047,12 +2066,10 @@ class DataGeneratorScheduled:
         start_joint_state_for_planner = None
         if eef_state.last_commanded_joint_position is not None:
             start_joint_state_for_planner = eef_state.last_commanded_joint_position.clone()
-            print(f"[Offline] Using last_commanded_joint_position for {eef_name}: first 6 = {start_joint_state_for_planner[:6].cpu().numpy()}")
         elif global_robot_joint_state is not None:
             start_joint_state_for_planner = self._project_joint_to_planner(
                 global_robot_joint_state, arm_planner
             )
-            print(f"[Offline] Using projected global state for {eef_name}")
 
         # Update articulation buffer with the start joint state for frame conversions
         # The planner's frame conversion (T_tool_site) reads from articulation buffer
@@ -2067,32 +2084,7 @@ class DataGeneratorScheduled:
             self._robot_articulation.data.joint_pos[env_id] = global_robot_joint_state.clone()
             self._robot_articulation.data.joint_pos_target[env_id] = global_robot_joint_state.clone()
 
-        print(f"\n--- Environment {env_id}: Offline planning motion for {eef_name} ---")
-        print(f"Target pose position: {target_pose[:3, 3].cpu().numpy()}")
-        print(f"Expected attached object: {expected_attached_object}")
-
-        # For offline planning with object attachment:
-        # 1. Move object to EE position in simulator (so relative pose is correct)
-        # 2. Force the grasp check to pass
-        # 3. Plan motion
-        # 4. Restore object position
-        original_check_method = None
-        original_object_pose = None
-
-        if expected_attached_object is not None:
-            # For offline planning with expected attachment:
-            # 1. Force grasp check to pass BEFORE moving object (so patch is in place)
-            # 2. Move object to EE position (for correct relative pose computation)
-            # 3. Sync world to cuRobo (done by update_world_and_plan_motion)
-            # 4. Plan motion with object attached
-            # 5. Restore object position after planning
-            original_check_method = self._force_grasp_check_to_pass(arm_planner, expected_attached_object)
-            original_object_pose = self._move_object_to_ee_for_offline(
-                env_id=env_id,
-                object_name=expected_attached_object,
-                arm_planner=arm_planner,
-            )
-
+        # Build planner kwargs
         planner_kwargs = dict(
             target_pose=target_pose,
             expected_attached_object=expected_attached_object,
@@ -2102,92 +2094,39 @@ class DataGeneratorScheduled:
         )
         if self.skillgen_type == "bimanual":
             planner_kwargs["input_is_site_frame"] = True
-            # Force the specific arm to avoid auto-selection based on proximity
             planner_kwargs["arm"] = eef_name
-            # Pass start joint state to bypass articulation buffer reads
             if start_joint_state_for_planner is not None:
                 planner_kwargs["start_joint_state"] = start_joint_state_for_planner
 
-        try:
-            planning_success = motion_planner.update_world_and_plan_motion(**planner_kwargs)
-        finally:
-            # Restore original grasp check method
-            if original_check_method is not None:
-                self._restore_grasp_check(arm_planner, original_check_method)
-            # Restore object position after planning (object should remain at original position)
-            if original_object_pose is not None and expected_attached_object is not None:
-                self._restore_object_pose_for_offline(
-                    env_id=env_id,
-                    object_name=expected_attached_object,
-                    original_pose=original_object_pose,
-                )
-
-        if not planning_success:
-            print(f"Env {env_id}: Motion planning failed for {eef_name}")
-            return {"success": False}
-
-        print(f"Env {env_id}: Motion planning succeeded")
-
-        # Extract planned poses and joint positions
-        mp_waypoints, mp_joints = self._convert_planned_trajectory_to_waypoints_with_joints(
-            arm_planner, base_gripper_action
+        # Execute motion planning with optional object attachment setup
+        planning_success = self._execute_motion_planning_with_attachment(
+            env_id=env_id,
+            arm_planner=arm_planner,
+            expected_attached_object=expected_attached_object,
+            motion_planner=motion_planner,
+            planner_kwargs=planner_kwargs,
         )
 
+        if not planning_success:
+            print(f"Motion planning failed for {eef_name}")
+            return {"success": False}
+
+        # Extract planned poses and joint positions
+        result = self._convert_planned_trajectory_to_waypoints(
+            arm_planner, base_gripper_action, include_joints=True
+        )
+        mp_waypoints: list[Waypoint] = result[0] if isinstance(result, tuple) else result
+        mp_joints: list[torch.Tensor] = result[1] if isinstance(result, tuple) else []
+
         if len(mp_waypoints) == 0:
-            print(f"Info: Motion plan for {eef_name} produced 0 waypoints, skipping")
             return None
 
         # Update last commanded joint position for next motion plan
         if mp_joints:
             eef_state.last_commanded_joint_position = mp_joints[-1].clone()
-            # Also update robot state for subsequent planning (skip sim sync in offline mode)
             self._set_robot_joint_state(env_id, mp_joints[-1], arm_planner, skip_sim_sync=True)
 
         return mp_waypoints, mp_joints
-
-    def _force_grasp_check_to_pass(self, arm_planner: Any, expected_object: str) -> Any:
-        """
-        Temporarily monkey-patch the arm planner's grasp check to always return True
-        for the expected object. This allows the normal attachment flow to work in
-        offline mode where the robot isn't at the actual grasping position.
-
-        Args:
-            arm_planner: The arm-specific planner instance.
-            expected_object: The object name that should pass the grasp check.
-
-        Returns:
-            The original _check_object_grasped method to restore later.
-        """
-        if arm_planner is None:
-            print("[Offline] Warning: arm_planner is None")
-            return None
-        if not hasattr(arm_planner, "_check_object_grasped"):
-            print(f"[Offline] Warning: {type(arm_planner).__name__} has no _check_object_grasped method")
-            return None
-
-        # Save the original unbound method from the class
-        original_method = arm_planner._check_object_grasped
-        expected_lower = expected_object.lower()
-
-        def forced_grasp_check(gripper_pos, object_name):
-            # Use case-insensitive substring matching for robustness
-            object_lower = object_name.lower() if object_name else ""
-            if expected_lower in object_lower or object_lower in expected_lower:
-                print(f"[Offline] Forcing grasp check to PASS for {object_name} (matched {expected_object})")
-                return True
-            # Call original method properly - it's a bound method
-            return original_method(gripper_pos, object_name)
-
-        # Replace the method on the instance - Python will use instance attribute first
-        arm_planner._check_object_grasped = forced_grasp_check
-        print(f"[Offline] Installed forced grasp check for {expected_object} on {type(arm_planner).__name__}")
-        return original_method
-
-    def _restore_grasp_check(self, arm_planner: Any, original_method: Any) -> None:
-        """Restore the original grasp check method."""
-        if arm_planner is not None and original_method is not None:
-            arm_planner._check_object_grasped = original_method
-            print("[Offline] Restored original grasp check method")
 
     def _move_object_to_ee_for_offline(
         self,
@@ -2195,87 +2134,11 @@ class DataGeneratorScheduled:
         object_name: str,
         arm_planner: Any,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """
-        Move an object to the EE position in the simulator for offline planning.
-
-        In offline mode, the robot hasn't physically grasped the object, so the object
-        is still at its original position. For correct attachment computation, we need
-        to temporarily move the object to the EE position so the relative pose is ~zero.
-
-        Args:
-            env_id: Environment ID.
-            object_name: Name of the object to move.
-            arm_planner: The arm-specific planner to get EE position from.
-
-        Returns:
-            Tuple of (original_pos, original_quat) to restore later, or None if failed.
-        """
-        # Find the object in the scene
-        rigid_objects = self.env.scene.rigid_objects
-        obj_handle = None
-        for name, obj in rigid_objects.items():
-            if object_name in name or name in object_name:
-                obj_handle = obj
-                break
-
-        if obj_handle is None:
-            print(f"[Offline] Warning: Could not find object {object_name} in scene")
-            return None
-
-        # Save original pose
-        original_pos = obj_handle.data.root_pos_w[env_id].clone()
-        original_quat = obj_handle.data.root_quat_w[env_id].clone()
-
-        # Get EE position using FK from the arm planner
-        ee_pos = self._get_ee_position_from_planner(env_id, arm_planner)
+        """Move an object to the EE position for offline planning."""
+        ee_pos = get_ee_position_from_fk(self._robot_articulation, arm_planner, env_id)
         if ee_pos is None:
-            print("[Offline] Warning: Could not get EE position for object teleport")
             return None
-
-        print(f"[Offline] Moving {object_name} to EE position: {original_pos.cpu().numpy()} -> {ee_pos.cpu().numpy()}")
-
-        # Move object to EE position (keep original orientation)
-        # We write directly to the data buffer - this is what _sync_object_poses_with_isaaclab reads
-        # No need for write_root_pose_to_sim() or update() in offline mode
-        device = obj_handle.data.root_pos_w.device
-        obj_handle.data.root_pos_w[env_id] = ee_pos.to(device=device)
-
-        # Return as tuple since pos (3) and quat (4) have different shapes
-        return (original_pos, original_quat)
-
-    def _get_ee_position_from_planner(self, env_id: int, arm_planner: Any) -> torch.Tensor | None:
-        """Get the EE position using FK from the arm planner's current joint state."""
-        from isaaclab.utils.math import quat_apply
-
-        if arm_planner is None:
-            return None
-
-        # Get current joint state that was set for offline planning
-        joint_state = arm_planner._get_current_joint_state_for_curobo()
-        if joint_state is None:
-            return None
-
-        # Get the attachment link name
-        link_name = getattr(arm_planner.config, "attached_object_link_name", None)
-        if link_name is None:
-            return None
-
-        # Use FK to get link pose in base frame
-        if hasattr(arm_planner, "get_attached_pose"):
-            link_pose = arm_planner.get_attached_pose(link_name, joint_state)
-            if link_pose is not None:
-                # Link pose is in robot base frame, convert to world frame
-                # p_world = p_robot + R_robot * p_link
-                base_pos = self._robot_articulation.data.root_pos_w[env_id]
-                base_quat = self._robot_articulation.data.root_quat_w[env_id]  # (w, x, y, z)
-                link_pos_base = link_pose.position.squeeze().to(device=base_pos.device)
-
-                # Rotate link position by robot orientation and add to base position
-                link_pos_rotated = quat_apply(base_quat, link_pos_base)
-                ee_pos_world = base_pos + link_pos_rotated
-                return ee_pos_world
-
-        return None
+        return self._object_helper.move_to_ee_position(env_id, object_name, ee_pos)
 
     def _restore_object_pose_for_offline(
         self,
@@ -2284,23 +2147,44 @@ class DataGeneratorScheduled:
         original_pose: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         """Restore an object's original pose after offline planning."""
-        rigid_objects = self.env.scene.rigid_objects
-        obj_handle = None
-        for name, obj in rigid_objects.items():
-            if object_name in name or name in object_name:
-                obj_handle = obj
-                break
+        self._object_helper.restore_pose(env_id, object_name, original_pose)
 
-        if obj_handle is None:
-            return
+    def _execute_motion_planning_with_attachment(
+        self,
+        env_id: int,
+        arm_planner: Any,
+        expected_attached_object: str | None,
+        motion_planner: Any,
+        planner_kwargs: dict,
+    ) -> bool:
+        """
+        Execute motion planning with optional object attachment setup.
 
-        original_pos, original_quat = original_pose
+        Uses context manager for grasp check patching and handles object pose
+        save/restore for correct attachment computation in offline mode.
+        """
+        if expected_attached_object is None:
+            return motion_planner.update_world_and_plan_motion(**planner_kwargs)
 
-        # Write directly to data buffer - no sim write/update needed in offline mode
-        device = obj_handle.data.root_pos_w.device
-        obj_handle.data.root_pos_w[env_id] = original_pos.to(device=device)
-        obj_handle.data.root_quat_w[env_id] = original_quat.to(device=device)
-        print(f"[Offline] Restored {object_name} to original position")
+        # Move object to EE and save original pose
+        original_object_pose = self._move_object_to_ee_for_offline(
+            env_id=env_id,
+            object_name=expected_attached_object,
+            arm_planner=arm_planner,
+        )
+
+        try:
+            with force_grasp_check(arm_planner, expected_attached_object):
+                planning_success = motion_planner.update_world_and_plan_motion(**planner_kwargs)
+        finally:
+            if original_object_pose is not None:
+                self._restore_object_pose_for_offline(
+                    env_id=env_id,
+                    object_name=expected_attached_object,
+                    original_pose=original_object_pose,
+                )
+
+        return planning_success
 
     def _preemptively_attach_object_after_grasp_mp(
         self,
@@ -2311,138 +2195,25 @@ class DataGeneratorScheduled:
     ) -> None:
         """
         After MP planning for a grasp subtask, preemptively move the target object
-        to the EE position to simulate grasping.
-
-        This prevents collision when the other arm plans - without this, the arm's
-        collision spheres at the approach position would overlap with the object.
-
-        In non-offline mode, the skill (grasp) is executed which attaches the object.
-        In offline mode, we simulate this by moving the object to EE position.
-
-        Args:
-            env_id: Environment ID.
-            eef_name: Name of the end-effector ("left" or "right").
-            subtask_index: Current subtask index.
-            arm_planner: The arm-specific planner instance.
+        to the EE position to simulate grasping. This prevents collision when the
+        other arm plans.
         """
-        if eef_name not in self.env_cfg.subtask_configs:
+        subtask_cfg = self._get_subtask_config(eef_name, subtask_index)
+        if subtask_cfg is None or not is_grasp_subtask(subtask_cfg):
             return
 
+        object_ref = get_subtask_object_ref(subtask_cfg)
+        if object_ref:
+            self._move_object_to_ee_for_offline(env_id, object_ref, arm_planner)
+
+    def _get_subtask_config(self, eef_name: str, subtask_index: int) -> Any | None:
+        """Get subtask configuration for the given EEF and index."""
+        if eef_name not in self.env_cfg.subtask_configs:
+            return None
         subtask_configs = self.env_cfg.subtask_configs[eef_name]
         if not (0 <= subtask_index < len(subtask_configs)):
-            return
-
-        subtask_cfg = subtask_configs[subtask_index]
-        subtask_signal = str(subtask_cfg.subtask_term_signal).lower()
-
-        # Check if this is a grasp subtask
-        if "grasp" not in subtask_signal:
-            return
-
-        # Get the object being grasped
-        object_ref = getattr(subtask_cfg, "object_ref", None)
-        if not object_ref:
-            return
-
-        print(f"[Offline] Grasp subtask detected for {eef_name}: moving {object_ref} to EE")
-
-        # Move the object to EE position (simulating completed grasp)
-        # This ensures other arm's planning won't collide with the object
-        self._move_object_to_ee_for_offline(env_id, object_ref, arm_planner)
-
-    def _convert_planned_trajectory_to_waypoints_with_joints(
-        self,
-        motion_planner: Any,
-        gripper_action: torch.Tensor,
-    ) -> tuple[list[Waypoint], list[torch.Tensor]]:
-        """
-        Convert the planner's trajectory to waypoints and extract joint positions.
-
-        Similar to _convert_planned_trajectory_to_waypoints but also returns
-        the joint positions from the motion plan. Includes proper frame conversion
-        for bimanual humanoid robots.
-        """
-        motion_noise_scale = getattr(motion_planner.config, "motion_noise_scale", 0.0)
-        planned_poses = motion_planner.get_planned_poses()
-        planned_joints = self._get_planned_joint_positions(motion_planner)
-
-        waypoints = []
-        joints = []
-
-        # For tabletop (non-bimanual), poses are already in the correct frame
-        if self.skillgen_type != "bimanual":
-            for idx, pose in enumerate(planned_poses):
-                joint_vec = None
-                if planned_joints is not None and idx < planned_joints.shape[0]:
-                    joint_vec = planned_joints[idx].clone()
-                waypoints.append(Waypoint(
-                    pose=pose.clone(),
-                    gripper_action=gripper_action.clone(),
-                    noise=motion_noise_scale,
-                    joint_seed=joint_vec,
-                ))
-                if joint_vec is not None:
-                    joints.append(joint_vec)
-                elif joints:
-                    joints.append(joints[-1].clone())
-            return waypoints, joints
-
-        # Bimanual/humanoid: convert base->tool to world->site frame
-        # (same conversion as _convert_planned_trajectory_to_waypoints)
-        eef_name = None
-        if hasattr(motion_planner, "_last_arm") and motion_planner._last_arm is not None:
-            eef_name = motion_planner._last_arm
-        elif hasattr(motion_planner, "_arm_side"):
-            try:
-                eef_name = motion_planner._arm_side()
-            except Exception:
-                eef_name = None
-        if eef_name is None:
-            eef_name = "right"
-
-        env_id = getattr(motion_planner, "env_id", 0)
-
-        # Compute world->base transform
-        base_pos_world = (self.env.scene["robot"].data.root_pos_w[env_id] - self.env.scene.env_origins[env_id]).to(
-            device=self.env.device, dtype=torch.float32
-        )
-        base_rot_world = PoseUtils.matrix_from_quat(
-            self.env.scene["robot"]
-            .data.root_quat_w[env_id]
-            .unsqueeze(0)
-            .to(device=self.env.device, dtype=torch.float32)
-        )[0]
-        T_world_base = PoseUtils.make_pose(base_pos_world.unsqueeze(0), base_rot_world.unsqueeze(0))[0]
-
-        # For bimanual humanoids, T_tool_site is approximately identity at the home/reset position.
-        # The controller's site frame and cuRobo's tool frame are essentially the same when
-        # the robot is at home. Computing T_tool_site from articulation buffer is unreliable
-        # in offline mode because the physics state isn't updated.
-        # Using identity simplifies the conversion: world->tool becomes world->site directly.
-        T_tool_site = torch.eye(4, device=self.env.device, dtype=torch.float32)
-
-        for idx, planned_pose in enumerate(planned_poses):
-            # planned_pose is base->tool; map to world->tool and then to world->site
-            p_bt = planned_pose.to(device=self.env.device, dtype=torch.float32)
-            T_world_tool = (T_world_base @ p_bt).clone()
-            T_world_site = (T_world_tool @ T_tool_site).clone()
-
-            joint_vec = None
-            if planned_joints is not None and idx < planned_joints.shape[0]:
-                joint_vec = planned_joints[idx].clone()
-
-            waypoints.append(Waypoint(
-                pose=T_world_site,
-                gripper_action=gripper_action.clone(),
-                noise=motion_noise_scale,
-                joint_seed=joint_vec,
-            ))
-            if joint_vec is not None:
-                joints.append(joint_vec)
-            elif joints:
-                joints.append(joints[-1].clone())
-
-        return waypoints, joints
+            return None
+        return subtask_configs[subtask_index]
 
     def _get_planned_joint_positions(self, motion_planner: Any) -> torch.Tensor | None:
         """Extract joint positions from the planner's current plan."""
@@ -2614,16 +2385,11 @@ class DataGeneratorScheduled:
 
     def _convert_world_pose_to_planner_frame(self, pose: torch.Tensor, env_id: int) -> torch.Tensor:
         """Convert a world-frame pose to the planner's base frame."""
-        base_pos = (self._robot_articulation.data.root_pos_w[env_id] - self.env.scene.env_origins[env_id]).to(
-            device=self.env.device,
-            dtype=torch.float32,
+        T_world_base = get_world_to_base_transform(
+            self._robot_articulation, self.env.scene.env_origins, env_id, self.env.device
         )
-        base_rot = PoseUtils.matrix_from_quat(
-            self._robot_articulation.data.root_quat_w[env_id].unsqueeze(0).to(device=self.env.device, dtype=torch.float32)
-        )[0]
-        T_env_base = PoseUtils.make_pose(base_pos.unsqueeze(0), base_rot.unsqueeze(0))[0]
-        T_base_env = torch.linalg.inv(T_env_base)
-        return (T_base_env @ pose.to(device=self.env.device, dtype=torch.float32)).clone()
+        T_base_world = torch.linalg.inv(T_world_base)
+        return (T_base_world @ pose.to(device=self.env.device, dtype=torch.float32)).clone()
 
     def _set_robot_joint_state(
         self, env_id: int, joint_values: torch.Tensor, planner: Any | None = None, skip_sim_sync: bool = False
@@ -2658,39 +2424,9 @@ class DataGeneratorScheduled:
         planner: Any,
         env_id: int,
     ) -> torch.Tensor:
-        """Expand planner joint vector to full articulation ordering.
-
-        Only expands joints that are ACTIVE for the arm planner (matching
-        active_joint_substrings). This prevents torso/body joints from being
-        modified during arm motion planning.
-        """
-        full_size = self._robot_articulation.data.joint_pos.shape[1]
-        if joint_vec.shape[0] == full_size:
-            return joint_vec.to(device=self.env.device)
-
-        env_joint_names = [
-            name.decode("utf-8") if isinstance(name, bytes) else str(name)
-            for name in self._robot_articulation.data.joint_names
-        ]
-        planner_joint_names = list(planner.motion_gen.kinematics.joint_names)
-
-        # Only update joints that belong to the active arm (not torso/body joints)
-        active_substrings = getattr(planner, "active_joint_substrings", None)
-
-        full = self._robot_articulation.data.joint_pos[env_id].clone()
-        vec = joint_vec.to(device=full.device)
-        for idx, name in enumerate(planner_joint_names):
-            if name not in env_joint_names:
-                continue
-            # Only update joints that match the active arm's substring
-            if active_substrings:
-                is_active = any(sub in name for sub in active_substrings)
-                if not is_active:
-                    continue
-            env_idx = env_joint_names.index(name)
-            if idx < len(vec):
-                full[env_idx] = vec[idx]
-        return full
+        """Expand planner joint vector to full articulation ordering."""
+        mapper = self._joint_mapper_cache.get(planner)
+        return mapper.expand_to_full(joint_vec, env_id)
 
     def _merge_arm_joints_to_global(
         self,
@@ -2698,46 +2434,9 @@ class DataGeneratorScheduled:
         arm_joints: torch.Tensor,
         arm_planner: Any,
     ) -> torch.Tensor:
-        """
-        Merge an arm's joint positions into the global robot state.
-
-        For bimanual robots, this updates only the joints controlled by the
-        specified arm planner while preserving the other arm's positions.
-
-        Args:
-            global_state: Current global robot joint state.
-            arm_joints: New joint positions from the arm planner.
-            arm_planner: The arm-specific planner (to get joint mapping).
-
-        Returns:
-            Updated global robot joint state.
-        """
-        env_joint_names = [
-            name.decode("utf-8") if isinstance(name, bytes) else str(name)
-            for name in self._robot_articulation.data.joint_names
-        ]
-        planner_joint_names = list(arm_planner.motion_gen.kinematics.joint_names)
-
-        # Get active joint substrings from the planner to only merge planned joints
-        # This prevents overwriting the other arm's joints with optimizer artifacts
-        active_substrings = getattr(arm_planner, "active_joint_substrings", None)
-
-        updated = global_state.clone()
-        arm_vec = arm_joints.to(device=updated.device)
-
-        for idx, name in enumerate(planner_joint_names):
-            if name not in env_joint_names:
-                continue
-            # Only merge joints that belong to the active arm
-            if active_substrings:
-                is_active = any(sub in name for sub in active_substrings)
-                if not is_active:
-                    continue
-            env_idx = env_joint_names.index(name)
-            if idx < len(arm_vec):
-                updated[env_idx] = arm_vec[idx]
-
-        return updated
+        """Merge an arm's joint positions into the global robot state."""
+        mapper = self._joint_mapper_cache.get(arm_planner)
+        return mapper.merge_to_global(global_state, arm_joints)
 
     def _advance_subtask_progress_offline(
         self,
@@ -2785,32 +2484,18 @@ class DataGeneratorScheduled:
         for eef_name, completed_subtask_idx in completing_subtasks.items():
             eef_state = eef_states[eef_name]
 
-            # Update robot joint state to final trajectory position (skip sim sync in offline mode)
+            # Update robot joint state to final trajectory position
             if eef_state.last_commanded_joint_position is not None and motion_planner is not None:
                 arm_planner = self._get_arm_planner(motion_planner, eef_name)
                 self._set_robot_joint_state(env_id, eef_state.last_commanded_joint_position, arm_planner, skip_sim_sync=True)
-                print(f"[Offline] Updated {eef_name} robot joint state after subtask {completed_subtask_idx}")
 
-            # Check if this was a "place" or "release" subtask
-            subtask_configs = self.env_cfg.subtask_configs.get(eef_name, [])
-            if completed_subtask_idx < len(subtask_configs):
-                subtask_cfg = subtask_configs[completed_subtask_idx]
-                subtask_signal = str(subtask_cfg.subtask_term_signal).lower()
-
-                # If this was a place/release subtask, update object position
-                if "place" in subtask_signal or "release" in subtask_signal:
-                    object_ref = getattr(subtask_cfg, "object_ref", None)
-                    if object_ref and eef_state.current_trajectory:
-                        # Get the final EE pose from the trajectory - this is where object is placed
-                        final_waypoint = eef_state.current_trajectory[-1]
-                        final_pose = final_waypoint.pose
-
-                        self._update_object_position_after_place(
-                            env_id=env_id,
-                            object_name=object_ref,
-                            final_ee_pose=final_pose,
-                        )
-                        print(f"[Offline] Updated {object_ref} position after {eef_name} place subtask")
+            # If this was a place/release subtask, update object position
+            subtask_cfg = self._get_subtask_config(eef_name, completed_subtask_idx)
+            if subtask_cfg is not None and is_place_subtask(subtask_cfg):
+                object_ref = get_subtask_object_ref(subtask_cfg)
+                if object_ref and eef_state.current_trajectory:
+                    final_pose = eef_state.current_trajectory[-1].pose
+                    self._update_object_position_after_place(env_id, object_ref, final_pose)
 
     def _update_object_position_after_place(
         self,
@@ -2818,36 +2503,9 @@ class DataGeneratorScheduled:
         object_name: str,
         final_ee_pose: torch.Tensor,
     ) -> None:
-        """
-        Update an object's position to reflect where it was placed.
-
-        After a place/release subtask, the object should be at the EE position
-        (or slightly below due to the release). This updates the Isaac Lab buffers
-        so subsequent world syncs reflect the new object position.
-
-        Args:
-            env_id: Environment ID.
-            object_name: Name of the object that was placed.
-            final_ee_pose: 4x4 pose matrix of the EE at the place location.
-        """
-        rigid_objects = self.env.scene.rigid_objects
-        obj_handle = None
-        for name, obj in rigid_objects.items():
-            if object_name in name or name in object_name:
-                obj_handle = obj
-                break
-
-        if obj_handle is None:
-            print(f"[Offline] Warning: Could not find object {object_name} for place update")
-            return
-
-        # Extract position from the EE pose (object is at EE position when placed)
+        """Update an object's position to reflect where it was placed."""
         new_pos = final_ee_pose[:3, 3].clone()
-
-        # Update object position in Isaac Lab buffers
-        device = obj_handle.data.root_pos_w.device
-        obj_handle.data.root_pos_w[env_id] = new_pos.to(device=device)
-        print(f"[Offline] Moved {object_name} to place position: {new_pos.cpu().numpy()}")
+        self._object_helper.set_object_position(env_id, object_name, new_pos)
 
     def _build_arm_paths_from_logs(
         self,
@@ -2936,43 +2594,13 @@ class DataGeneratorScheduled:
 
     def _project_joint_to_planner(self, joint_vec: torch.Tensor, planner: Any) -> torch.Tensor:
         """Project a joint vector to the planner's expected joint ordering."""
-        planner_dof = self._get_planner_dof(planner)
-        if joint_vec.shape[-1] == planner_dof:
-            return joint_vec.to(device=self.env.device)
-
-        # Need to extract planner joints from full articulation
-        env_joint_names = [
-            name.decode("utf-8") if isinstance(name, bytes) else str(name)
-            for name in self._robot_articulation.data.joint_names
-        ]
-        planner_joint_names = list(planner.motion_gen.kinematics.joint_names)
-
-        indices = []
-        for name in planner_joint_names:
-            if name in env_joint_names:
-                indices.append(env_joint_names.index(name))
-            else:
-                # Joint not found - this is a problem!
-                print(f"[PROJECT WARNING] Planner joint '{name}' not found in env joints!")
-
-        if len(indices) != planner_dof:
-            print(f"[PROJECT WARNING] Expected {planner_dof} joints but found {len(indices)} matching joints")
-
-        if not indices:
-            # Return zeros if no matches found
-            print("[PROJECT ERROR] No matching joints found! Returning zeros.")
-            return torch.zeros(planner_dof, device=self.env.device)
-
-        return joint_vec[indices].to(device=self.env.device)
+        mapper = self._joint_mapper_cache.get(planner)
+        return mapper.project_to_planner(joint_vec)
 
     def _get_planner_dof(self, planner: Any) -> int:
         """Get the number of DOFs for the planner."""
-        motion_gen = getattr(planner, "motion_gen", None)
-        if motion_gen is not None and hasattr(motion_gen, "kinematics"):
-            joint_names = getattr(motion_gen.kinematics, "joint_names", None)
-            if joint_names is not None:
-                return len(joint_names)
-        return 7  # Default assumption
+        mapper = self._joint_mapper_cache.get(planner)
+        return mapper.planner_dof
 
     def _apply_scheduled_joint_state(
         self,
@@ -3013,34 +2641,21 @@ class DataGeneratorScheduled:
         curr_right_idx: int,
         max_joint_step: float,
     ) -> int:
-        """
-        Compute number of interpolation steps needed to smooth large joint jumps.
-        """
-        import math
-
+        """Compute number of interpolation steps needed to smooth large joint jumps."""
         if prev_left_idx < 0 or prev_right_idx < 0:
             return 0
 
-        max_delta = 0.0
+        max_steps = 0
+        for arm_name, prev_idx, curr_idx in [("left", prev_left_idx, curr_left_idx), ("right", prev_right_idx, curr_right_idx)]:
+            joints = arm_paths[arm_name].joint_positions
+            if joints is None or joints.numel() == 0:
+                continue
+            if prev_idx >= joints.shape[0] or curr_idx >= joints.shape[0]:
+                continue
+            steps = compute_interpolation_steps(joints[prev_idx], joints[curr_idx], max_joint_step)
+            max_steps = max(max_steps, steps)
 
-        # Check left arm joint delta
-        left_joints = arm_paths["left"].joint_positions
-        if left_joints is not None and left_joints.numel() > 0:
-            if prev_left_idx < left_joints.shape[0] and curr_left_idx < left_joints.shape[0]:
-                delta = (left_joints[curr_left_idx] - left_joints[prev_left_idx]).abs().max().item()
-                max_delta = max(max_delta, delta)
-
-        # Check right arm joint delta
-        right_joints = arm_paths["right"].joint_positions
-        if right_joints is not None and right_joints.numel() > 0:
-            if prev_right_idx < right_joints.shape[0] and curr_right_idx < right_joints.shape[0]:
-                delta = (right_joints[curr_right_idx] - right_joints[prev_right_idx]).abs().max().item()
-                max_delta = max(max_delta, delta)
-
-        if max_delta <= max_joint_step:
-            return 0
-
-        return int(math.ceil(max_delta / max_joint_step)) - 1
+        return max_steps
 
     def _interpolate_waypoints(
         self,
@@ -3051,30 +2666,9 @@ class DataGeneratorScheduled:
         curr_right_idx: int,
         alpha: float,
     ) -> dict[str, Waypoint]:
-        """
-        Create interpolated waypoints between previous and current indices.
-        """
-        def _interp_tensor(t0: torch.Tensor, t1: torch.Tensor, a: float) -> torch.Tensor:
-            return t0 * (1.0 - a) + t1 * a
-
-        def _interp_pose(p0: torch.Tensor, p1: torch.Tensor, a: float) -> torch.Tensor:
-            """Interpolate 4x4 pose matrices (linear translation, blended rotation)."""
-            t_interp = p0[:3, 3] * (1.0 - a) + p1[:3, 3] * a
-            R_blend = p0[:3, :3] * (1.0 - a) + p1[:3, :3] * a
-            # Orthogonalize via SVD for valid rotation
-            U, _, Vh = torch.linalg.svd(R_blend)
-            R_interp = U @ Vh
-            result = torch.eye(4, device=p0.device, dtype=p0.dtype)
-            result[:3, :3] = R_interp
-            result[:3, 3] = t_interp
-            return result
-
+        """Create interpolated waypoints between previous and current indices."""
         result = {}
-        arm_indices = [
-            ("left", prev_left_idx, curr_left_idx),
-            ("right", prev_right_idx, curr_right_idx),
-        ]
-        for arm_name, prev_idx, curr_idx in arm_indices:
+        for arm_name, prev_idx, curr_idx in [("left", prev_left_idx, curr_left_idx), ("right", prev_right_idx, curr_right_idx)]:
             arm_path = arm_paths[arm_name]
             p0 = arm_path.poses[prev_idx].to(device=self.env.device, dtype=torch.float32)
             p1 = arm_path.poses[curr_idx].to(device=self.env.device, dtype=torch.float32)
@@ -3082,8 +2676,8 @@ class DataGeneratorScheduled:
             g1 = arm_path.gripper_actions[curr_idx].to(device=self.env.device, dtype=torch.float32)
 
             result[arm_name] = Waypoint(
-                pose=_interp_pose(p0, p1, alpha),
-                gripper_action=_interp_tensor(g0, g1, alpha),
+                pose=interpolate_pose(p0, p1, alpha),
+                gripper_action=g0 * (1.0 - alpha) + g1 * alpha,
                 noise=0.0,
             )
         return result
@@ -3125,26 +2719,6 @@ class DataGeneratorScheduled:
         if planner_map is not None and schedule.left_indices.numel() > 0 and schedule.right_indices.numel() > 0:
             left_idx_0 = int(schedule.left_indices[0].item())
             right_idx_0 = int(schedule.right_indices[0].item())
-            print(f"[Replay] Setting initial joint state: left_idx={left_idx_0}, right_idx={right_idx_0}")
-            print(f"[Replay] Left pose[0]: {arm_paths['left'].poses[left_idx_0][:3, 3].cpu().numpy()}")
-            print(f"[Replay] Right pose[0]: {arm_paths['right'].poses[right_idx_0][:3, 3].cpu().numpy()}")
-
-            # Debug: Check if schedule actually delays arms (non-sequential indices)
-            left_seq = torch.arange(schedule.left_indices.shape[0])
-            right_seq = torch.arange(schedule.right_indices.shape[0])
-            left_diff = (schedule.left_indices.cpu() - left_seq).abs().sum().item()
-            right_diff = (schedule.right_indices.cpu() - right_seq).abs().sum().item()
-            print(f"[Replay] Schedule deviation from sequential: left={left_diff:.0f}, right={right_diff:.0f}")
-            if left_diff < 1 and right_diff < 1:
-                print("[Replay] WARNING: Schedule is nearly sequential - no collision avoidance applied!")
-
-            # Show a few sample schedule indices
-            n = schedule.left_indices.shape[0]
-            sample_ticks = [0, n // 4, n // 2, n - 1]
-            for t in sample_ticks:
-                if t < schedule.left_indices.shape[0]:
-                    print(f"[Replay] tick={t}: left_idx={schedule.left_indices[t].item()}, right_idx={schedule.right_indices[t].item()}")
-
             self._apply_scheduled_joint_state(
                 env_id=env_id,
                 arm_paths=arm_paths,
@@ -3159,14 +2733,9 @@ class DataGeneratorScheduled:
         prev_right_idx = -1
 
         num_ticks = schedule.left_indices.shape[0]
-        print(f"[Replay] Starting replay loop with {num_ticks} ticks")
         for tick in range(num_ticks):
             left_idx = int(schedule.left_indices[tick].item())
             right_idx = int(schedule.right_indices[tick].item())
-
-            # Debug output every 50 ticks
-            if tick % 50 == 0 or tick == num_ticks - 1:
-                print(f"[Replay] tick={tick}: left_idx={left_idx}, right_idx={right_idx}")
 
             # Check if we need interpolation steps for smooth motion
             interp_steps = self._compute_interpolation_steps(
