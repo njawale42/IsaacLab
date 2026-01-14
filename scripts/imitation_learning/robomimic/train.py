@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -59,6 +59,7 @@ import argparse
 # Third-party imports
 import gymnasium as gym
 import h5py
+import importlib
 import json
 import numpy as np
 import os
@@ -84,6 +85,7 @@ from robomimic.utils.log_utils import DataLogger, PrintLogger
 
 # Isaac Lab imports (needed so that environment is registered)
 import isaaclab_tasks  # noqa: F401
+import isaaclab_tasks.manager_based.locomanipulation.pick_place  # noqa: F401
 import isaaclab_tasks.manager_based.manipulation.pick_place  # noqa: F401
 
 
@@ -164,20 +166,16 @@ def train(config: Config, device: str, log_dir: str, ckpt_dir: str, video_dir: s
     # read config to set up metadata for observation modalities (e.g. detecting rgb observations)
     ObsUtils.initialize_obs_utils_with_config(config)
 
-    # make sure the dataset exists (use first dataset if config.train.data is a list)
-    if isinstance(config.train.data, list):
-        first_dataset_path = config.train.data[0]["path"]
-    else:
-        first_dataset_path = config.train.data
-    dataset_path = os.path.expanduser(first_dataset_path)
+    # make sure the dataset exists
+    dataset_path = os.path.expanduser(config.train.data)
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset at provided path {dataset_path} not found!")
 
     # load basic metadata from training file
     print("\n============= Loaded Environment Metadata =============")
-    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=first_dataset_path)
+    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=config.train.data)
     shape_meta = FileUtils.get_shape_metadata_from_dataset(
-        dataset_config={"path": first_dataset_path}, action_keys=config.train.action_keys, all_obs_keys=config.all_obs_keys, verbose=True
+        dataset_path=config.train.data, all_obs_keys=config.all_obs_keys, verbose=True
     )
 
     if config.experiment.env is not None:
@@ -372,7 +370,18 @@ def main(args: argparse.Namespace):
                 f" Please check that the gym registry has the entry point: '{cfg_entry_point_key}'."
             )
 
-        with open(cfg_entry_point_file) as f:
+        # resolve module path if needed
+        if ":" in cfg_entry_point_file:
+            mod_name, file_name = cfg_entry_point_file.split(":")
+            mod = importlib.import_module(mod_name)
+            if mod.__file__ is None:
+                raise ValueError(f"Could not find module file for: '{mod_name}'")
+            mod_path = os.path.dirname(mod.__file__)
+            config_file = os.path.join(mod_path, file_name)
+        else:
+            config_file = cfg_entry_point_file
+
+        with open(config_file) as f:
             ext_cfg = json.load(f)
             config = config_factory(ext_cfg["algo_name"])
         # update config with external json - this will throw errors if
@@ -394,17 +403,13 @@ def main(args: argparse.Namespace):
     # change location of experiment directory
     config.train.output_dir = os.path.abspath(os.path.join("./logs", args.log_dir, args.task))
 
-    log_dir, ckpt_dir, video_dir, _ = TrainUtils.get_exp_dir(config)
+    log_dir, ckpt_dir, video_dir = TrainUtils.get_exp_dir(config)
 
     if args.normalize_training_actions:
         config.train.data = normalize_hdf5_actions(config, log_dir)
 
     # get torch device
     device = TorchUtils.get_torch_device(try_to_use_cuda=config.train.cuda)
-
-    # Convert config.train.data from string to list format expected by robomimic
-    if isinstance(config.train.data, str):
-        config.train.data = [{"path": config.train.data}]
 
     config.lock()
 

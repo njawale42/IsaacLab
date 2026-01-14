@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -70,6 +70,7 @@ import robomimic.utils.torch_utils as TorchUtils
 
 if args_cli.enable_pinocchio:
     import isaaclab_tasks.manager_based.manipulation.pick_place  # noqa: F401
+    import isaaclab_tasks.manager_based.locomanipulation.pick_place  # noqa: F401
 
 from isaaclab_tasks.utils import parse_env_cfg
 
@@ -103,15 +104,15 @@ def rollout(policy, env, success_term, horizon, device):
             for image_name in env.cfg.image_obs_list:
                 if image_name in obs_dict["policy"].keys():
                     # Convert from chw uint8 to hwc normalized float
-                    # image = torch.squeeze(obs_dict["policy"][image_name])
-                    # image = image.permute(2, 0, 1).clone().float()
-                    # image = image / 255.0
-                    # image = image.clip(0.0, 1.0)
                     image = torch.squeeze(obs_dict["policy"][image_name])
-                    obs[image_name] = image.numpy()
-                    # obs[image_name] = image
+                    image = image.permute(2, 0, 1).clone().float()
+                    image = image / 255.0
+                    image = image.clip(0.0, 1.0)
+                    obs[image_name] = image
 
         traj["obs"].append(obs)
+        # prev_left_quat = None
+        # prev_right_quat = None
 
         # Compute actions
         actions = policy(obs)
@@ -123,6 +124,15 @@ def rollout(policy, env, success_term, horizon, device):
             ) / 2 + args_cli.norm_factor_min
 
         actions = torch.from_numpy(actions).to(device=device).view(1, env.action_space.shape[1])
+
+        # Debug: Log action differences to identify source of jerks
+        if i > 0 and len(traj["actions"]) > 0:
+            prev_actions = torch.tensor(traj["actions"][-1], device=device)
+            diff = (actions - prev_actions).abs()
+            total_diff = diff.norm().item()
+            if total_diff > 0.1:  # Log only significant jumps
+                hand_diff = diff[0, 14:36].norm().item() if actions.shape[1] > 14 else 0.0
+                print(f"[Step {i}] Total: {total_diff:.4f} | L_pos: {diff[0, 0:3].norm().item():.4f} | L_quat: {diff[0, 3:7].norm().item():.4f} | R_pos: {diff[0, 7:10].norm().item():.4f} | R_quat: {diff[0, 10:14].norm().item():.4f} | Hand: {hand_diff:.4f}")
 
         # Apply actions
         obs_dict, _, terminated, truncated, _ = env.step(actions)
