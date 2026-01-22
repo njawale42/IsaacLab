@@ -10,6 +10,7 @@ from isaaclab.envs.mimic_env_cfg import (
     SubTaskConstraintType,
 )
 from isaaclab.utils.configclass import configclass
+from isaaclab.envs.common import ViewerCfg
 
 from isaaclab_tasks.manager_based.manipulation.pick_place.nutpour_gr1t2_pink_ik_env_cfg import NutPourGR1T2PinkIKEnvCfg
 
@@ -21,9 +22,9 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         # Calling post init of parents
         super().__post_init__()
         # from isaaclab.envs.common import ViewerCfg
-        # self.viewer = ViewerCfg(
-        #     eye=(0.0, 2.0, 2.0), lookat=(0.0, 0.0, 0.2), origin_type="asset_body", asset_name="robot", body_name="base_link"
-        # )
+        self.viewer = ViewerCfg(
+            eye=(0.0, 2.0, 2.0), lookat=(0.0, 0.0, 0.2), origin_type="asset_body", asset_name="robot", body_name="base_link"
+        )
 
         # Enable SkillGen to consume start boundaries and plan transitions
         self.datagen_config.use_skillgen = True
@@ -44,39 +45,39 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         self.datagen_config.num_fail_demo_to_render = 25
         self.datagen_config.seed = 10
         # Scheduling parameters for bimanual collision avoidance
-        self.datagen_config.schedule_densify_factor = 0
+        self.datagen_config.schedule_densify_factor = 1
         self.datagen_config.schedule_pair_batch = 4096
-        self.datagen_config.schedule_collision_margin = 0.0
+        self.datagen_config.schedule_collision_margin = 0.01  # 1cm margin (was 0.12 - too conservative)
         # self.datagen_config.schedule_min_dt = 0.05  # Match step_dt for consistency
         self.datagen_config.schedule_all_offline = True
-        self.datagen_config.final_hold_steps = 10
+        # self.datagen_config.final_hold_steps = 10
 
         # The following are the subtask configurations for the stack task.
         subtask_configs = []
-        subtask_configs.append(
-            SubTaskConfig(
-                # Each subtask involves manipulation with respect to a single object frame.
-                object_ref="sorting_bowl",
-                # This key corresponds to the binary indicator in "datagen_info" that signals
-                # when this subtask is finished (e.g., on a 0 to 1 edge).
-                subtask_term_signal="idle_right",
-                first_subtask_start_offset_range=(0, 0),
-                # Randomization range for starting index of the first subtask
-                subtask_term_offset_range=(0, 0),
-                # Selection strategy for the source subtask segment during data generation
-                selection_strategy="nearest_neighbor_object",
-                # Optional parameters for the selection strategy function
-                selection_strategy_kwargs={"nn_k": 3},
-                # Amount of action noise to apply during this subtask
-                action_noise=0.0,
-                # Number of interpolation steps to bridge to this subtask segment
-                num_interpolation_steps=5,
-                # Additional fixed steps for the robot to reach the necessary pose
-                num_fixed_steps=0,
-                # If True, apply action noise during the interpolation phase and execution
-                apply_noise_during_interpolation=False,
-            )
-        )
+        # subtask_configs.append(
+        #     SubTaskConfig(
+        #         # Each subtask involves manipulation with respect to a single object frame.
+        #         object_ref="sorting_bowl",
+        #         # This key corresponds to the binary indicator in "datagen_info" that signals
+        #         # when this subtask is finished (e.g., on a 0 to 1 edge).
+        #         subtask_term_signal="idle_right",
+        #         first_subtask_start_offset_range=(0, 0),
+        #         # Randomization range for starting index of the first subtask
+        #         subtask_term_offset_range=(0, 0),
+        #         # Selection strategy for the source subtask segment during data generation
+        #         selection_strategy="nearest_neighbor_object",
+        #         # Optional parameters for the selection strategy function
+        #         selection_strategy_kwargs={"nn_k": 3},
+        #         # Amount of action noise to apply during this subtask
+        #         action_noise=0.0,
+        #         # Number of interpolation steps to bridge to this subtask segment
+        #         num_interpolation_steps=5,
+        #         # Additional fixed steps for the robot to reach the necessary pose
+        #         num_fixed_steps=0,
+        #         # If True, apply action noise during the interpolation phase and execution
+        #         apply_noise_during_interpolation=False,
+        #     )
+        # )
         subtask_configs.append(
             SubTaskConfig(
                 # Each subtask involves manipulation with respect to a single object frame.
@@ -174,10 +175,10 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         )
         self.subtask_configs["left"] = subtask_configs
 
-        # self.task_constraint_configs.append(
-        #     SubTaskConstraintConfig(
-        #         eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
-        #         constraint_type=SubTaskConstraintType.SEQUENTIAL,
-        #         sequential_min_time_diff=80,
-        #     )
-        # )
+        self.task_constraint_configs.append(
+            SubTaskConstraintConfig(
+                eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
+                constraint_type=SubTaskConstraintType.SEQUENTIAL,
+                sequential_min_time_diff=80,
+            )
+        )

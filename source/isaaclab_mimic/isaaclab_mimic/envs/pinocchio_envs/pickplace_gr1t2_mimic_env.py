@@ -80,6 +80,10 @@ class PickPlaceGR1T2MimicEnv(ManagerBasedRLMimicEnv):
         target_left_eef_rot_quat = PoseUtils.quat_from_matrix(left_target_rot)
         target_right_eef_rot_quat = PoseUtils.quat_from_matrix(right_target_rot)
 
+        # Canonicalize quaternions to w >= 0 to avoid sign ambiguity in recorded actions
+        target_left_eef_rot_quat = PoseUtils.quat_unique(target_left_eef_rot_quat)
+        target_right_eef_rot_quat = PoseUtils.quat_unique(target_right_eef_rot_quat)
+
         # gripper actions - need to interleave left and right to match the hand_joint_names order
         left_gripper_action = gripper_action_dict["left"]  # 11 LEFT hand joint values
         right_gripper_action = gripper_action_dict["right"]  # 11 RIGHT hand joint values

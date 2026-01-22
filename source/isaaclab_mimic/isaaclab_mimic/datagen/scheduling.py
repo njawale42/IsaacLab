@@ -5,11 +5,18 @@ Utilities for building collision-aware schedules over recorded arm trajectories.
 from __future__ import annotations
 
 import math
+import os
+import pickle
 from dataclasses import dataclass
 from typing import Sequence
 
 import torch
 from nvplan.applications.custream.retime import retime_paths
+
+
+# Global debug settings
+_COLLISION_DEBUG_ENABLED = os.environ.get("COLLISION_DEBUG", "0") == "1"
+_COLLISION_DEBUG_PATH = os.environ.get("COLLISION_DEBUG_PATH", "/tmp/collision_debug.pkl")
 
 
 @dataclass
@@ -72,6 +79,73 @@ def _densify_path(path: torch.Tensor, factor: int) -> tuple[torch.Tensor, torch.
     return torch.stack(dense, dim=0), torch.tensor(mapping, device=path.device, dtype=torch.long)
 
 
+# def _compute_collision_pairs(
+#     joint_path_r: torch.Tensor,
+#     joint_path_l: torch.Tensor,
+#     kin_right,
+#     kin_left,
+#     *,
+#     densify_factor: int = 4,
+#     pair_batch: int = 4096,
+#     collision_margin: float = 0.0,
+# ) -> list[tuple[int, int]]:
+#     """Find colliding waypoint pairs using sphere overlaps produced by cuRobo kinematics."""
+#     if joint_path_r.numel() == 0 or joint_path_l.numel() == 0:
+#         return []
+
+#     dev = joint_path_r.device
+#     pos_r_dense, map_r = _densify_path(joint_path_r, densify_factor)
+#     pos_l_dense, map_l = _densify_path(joint_path_l, densify_factor)
+
+#     Nr = int(pos_r_dense.shape[0])
+#     Nl = int(pos_l_dense.shape[0])
+#     if Nr == 0 or Nl == 0:
+#         return []
+
+#     q_r = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)
+#     q_l = pos_l_dense.repeat(Nr, 1)
+#     total_rows = q_r.shape[0]
+
+#     colliding_rows: list[int] = []
+
+#     for start in range(0, total_rows, pair_batch):
+#         end = min(total_rows, start + pair_batch)
+#         q_r_b = q_r[start:end]
+#         q_l_b = q_l[start:end]
+#         batch_size = q_r_b.shape[0]
+
+#         state_r = kin_right.get_state(q_r_b)
+#         state_l = kin_left.get_state(q_l_b)
+#         sph_r = state_r.link_spheres_tensor.view(batch_size, -1, 4)
+#         sph_l = state_l.link_spheres_tensor.view(batch_size, -1, 4)
+
+#         c_r = sph_r[..., :3]
+#         r_r = sph_r[..., 3]
+#         c_l = sph_l[..., :3]
+#         r_l = sph_l[..., 3]
+
+#         aa = (c_r * c_r).sum(dim=-1, keepdim=True)
+#         bb = (c_l * c_l).sum(dim=-1).unsqueeze(1)
+#         ab = torch.bmm(c_r, c_l.transpose(1, 2))
+#         dist2 = torch.clamp(aa + bb - 2.0 * ab, min=0.0)
+
+#         radii = r_r.unsqueeze(-1) + r_l.unsqueeze(-2) + collision_margin
+#         thresh2 = radii * radii
+#         collide = (dist2 <= thresh2).any(dim=(1, 2))
+#         rows = torch.nonzero(collide, as_tuple=False).flatten()
+#         if rows.numel() > 0:
+#             colliding_rows.extend((start + int(idx.item())) for idx in rows)
+
+#     if not colliding_rows:
+#         return []
+
+#     pairs: list[tuple[int, int]] = []
+#     for row in colliding_rows:
+#         i_dense = row // Nl
+#         j_dense = row % Nl
+#         pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
+#     return pairs
+
 def _compute_collision_pairs(
     joint_path_r: torch.Tensor,
     joint_path_l: torch.Tensor,
@@ -81,8 +155,18 @@ def _compute_collision_pairs(
     densify_factor: int = 4,
     pair_batch: int = 4096,
     collision_margin: float = 0.0,
-) -> list[tuple[int, int]]:
-    """Find colliding waypoint pairs using sphere overlaps produced by cuRobo kinematics."""
+    n_shared_joints: int = 6,
+    debug_save_path: str | None = None,
+) -> list[tuple[int, int, float]]:
+    """Find colliding waypoint pairs using sphere overlaps.
+    
+    Returns list of (r_idx, l_idx, penetration) tuples, where penetration is negative for actual collisions.
+    
+    Synchronizes shared torso joints so both arms compute spheres in consistent coordinates.
+    
+    Set env COLLISION_DEBUG=1 to enable debug visualization data saving.
+    Set env COLLISION_DEBUG_PATH to specify save path (default: /tmp/collision_debug.pkl).
+    """
     if joint_path_r.numel() == 0 or joint_path_l.numel() == 0:
         return []
 
@@ -95,11 +179,99 @@ def _compute_collision_pairs(
     if Nr == 0 or Nl == 0:
         return []
 
+    # Get link info for debug
+    def get_link_info(kin):
+        kin_config = kin.kinematics_config
+        link_sphere_idx_map = kin_config.link_sphere_idx_map.cpu().numpy()
+        link_name_to_idx = kin_config.link_name_to_idx_map
+        idx_to_name = {v: k for k, v in link_name_to_idx.items()}
+        return link_sphere_idx_map, idx_to_name
+
+    link_idx_map_r, idx_to_name_r = get_link_info(kin_right)
+    link_idx_map_l, idx_to_name_l = get_link_info(kin_left)
+
     q_r = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)
     q_l = pos_l_dense.repeat(Nr, 1)
     total_rows = q_r.shape[0]
 
-    colliding_rows: list[int] = []
+    # CRITICAL: Synchronize shared joints so both arms use the same torso configuration
+    if n_shared_joints > 0:
+        q_l = q_l.clone()
+        q_l[:, :n_shared_joints] = q_r[:, :n_shared_joints]
+    
+    print(f"[Collision] Synchronized {n_shared_joints} shared joints, checking {total_rows} pairs")
+
+    # Debug: Print sample joint values and resulting sphere positions
+    if _COLLISION_DEBUG_ENABLED:
+        print("[Collision Debug] Verifying joint->sphere mapping...")
+        # Get expected device/dtype from kinematics (tensor_args is on CudaRobotModel, not kinematics_config)
+        kin_device = kin_right.tensor_args.device
+        kin_dtype = kin_right.tensor_args.dtype
+        print(f"  Kinematics device: {kin_device}, dtype: {kin_dtype}")
+        print(f"  Input tensor device: {pos_r_dense.device}, dtype: {pos_r_dense.dtype}")
+
+        # Check first and last positions - use batch of 2 to avoid cuRobo buffer reuse
+        for name, q_path, kin in [("Right", pos_r_dense, kin_right), ("Left", pos_l_dense, kin_left)]:
+            k_device = kin.tensor_args.device
+            k_dtype = kin.tensor_args.dtype
+            # Batch first and last together to get correct FK for both
+            q_batch = torch.cat([q_path[:1], q_path[-1:]], dim=0).to(device=k_device, dtype=k_dtype)
+            state = kin.get_state(q_batch)
+            sph_batch = state.link_spheres_tensor.view(2, -1, 4)
+            sph_first = sph_batch[0]
+            sph_last = sph_batch[1]
+
+            valid_first = sph_first[:, 3] > 0
+            valid_last = sph_last[:, 3] > 0
+            if valid_first.any():
+                centers_first = sph_first[valid_first, :3]
+                mean_first = centers_first.mean(dim=0).cpu().numpy()
+                print(f"  {name} first: joints={q_batch[0, :3].cpu().numpy()}...{q_batch[0, -3:].cpu().numpy()}")
+                print(f"    spheres mean={mean_first}")
+            if valid_last.any():
+                centers_last = sph_last[valid_last, :3]
+                mean_last = centers_last.mean(dim=0).cpu().numpy()
+                print(f"  {name} last: joints={q_batch[1, :3].cpu().numpy()}...{q_batch[1, -3:].cpu().numpy()}")
+                print(f"    spheres mean={mean_last}")
+
+            # Check if spheres actually differ
+            if valid_first.any() and valid_last.any():
+                diff = (centers_first.mean(dim=0) - centers_last.mean(dim=0)).abs().max().item()
+                print(f"  {name} sphere mean change: {diff:.4f}m (should be > 0 if joints differ)")
+
+    colliding_rows: list[tuple[int, float]] = []  # (row_idx, min_penetration)
+    global_min_penetration = float('inf')  # Track min across all pairs
+    min_pen_pair: tuple[int, int] | None = None  # (r_idx, l_idx) at minimum
+    min_pen_spheres: tuple[torch.Tensor, torch.Tensor] | None = None  # Sphere data at minimum
+
+    # Debug data collection
+    debug_enabled = _COLLISION_DEBUG_ENABLED or debug_save_path is not None
+    debug_data = {
+        "sample_pairs": [],
+        "min_distances": [],
+        "collision_margin": collision_margin,
+        "densify_factor": densify_factor,
+        "Nr": Nr,
+        "Nl": Nl,
+        "link_idx_map_r": link_idx_map_r,
+        "link_idx_map_l": link_idx_map_l,
+        "idx_to_name_r": idx_to_name_r,
+        "idx_to_name_l": idx_to_name_l,
+    } if debug_enabled else None
+    
+    # Sample indices for debug visualization
+    # Sample a grid of (r_idx, l_idx) combinations, not just diagonal
+    debug_sample_indices: set[int] = set()
+    if debug_enabled and Nr > 0 and Nl > 0:
+        # Sample 5 points along each trajectory
+        r_samples = [int(i * (Nr - 1) / 4) for i in range(5)]
+        l_samples = [int(i * (Nl - 1) / 4) for i in range(5)]
+        for r_idx in r_samples:
+            for l_idx in l_samples:
+                row_idx = r_idx * Nl + l_idx
+                debug_sample_indices.add(row_idx)
+        print(f"[Collision Debug] Sampling {len(debug_sample_indices)} grid pairs")
+        print(f"[Collision Debug] R samples: {r_samples}, L samples: {l_samples}")
 
     for start in range(0, total_rows, pair_batch):
         end = min(total_rows, start + pair_batch)
@@ -117,94 +289,260 @@ def _compute_collision_pairs(
         c_l = sph_l[..., :3]
         r_l = sph_l[..., 3]
 
+        # Filter out spheres with radius <= 0 (disabled spheres)
+        valid_r = r_r > 0
+        valid_l = r_l > 0
+
         aa = (c_r * c_r).sum(dim=-1, keepdim=True)
         bb = (c_l * c_l).sum(dim=-1).unsqueeze(1)
         ab = torch.bmm(c_r, c_l.transpose(1, 2))
         dist2 = torch.clamp(aa + bb - 2.0 * ab, min=0.0)
 
         radii = r_r.unsqueeze(-1) + r_l.unsqueeze(-2) + collision_margin
-        thresh2 = radii * radii
-        collide = (dist2 <= thresh2).any(dim=(1, 2))
+        valid_pairs = valid_r.unsqueeze(-1) & valid_l.unsqueeze(-2)
+        
+        # Compute penetration for all pairs (negative = collision)
+        dist = torch.sqrt(dist2)
+        penetration = dist - radii
+        penetration_valid = torch.where(valid_pairs, penetration, torch.tensor(float('inf'), device=dev))
+        
+        # Find min penetration per batch item
+        batch_pen_flat = penetration_valid.view(batch_size, -1)
+        min_pen_per_item, _ = batch_pen_flat.min(dim=1)  # [batch_size]
+        
+        # Collect colliding rows with their penetration depths
+        collide = min_pen_per_item <= 0  # Collision if penetration <= 0
         rows = torch.nonzero(collide, as_tuple=False).flatten()
         if rows.numel() > 0:
-            colliding_rows.extend((start + int(idx.item())) for idx in rows)
+            for idx in rows:
+                local_idx = int(idx.item())
+                global_idx = start + local_idx
+                pen_value = float(min_pen_per_item[local_idx].item())
+                colliding_rows.append((global_idx, pen_value))
 
+        # Find global min penetration in this batch (reuse min_pen_per_item computed above)
+        overall_batch_min_idx = int(min_pen_per_item.argmin().item())
+        batch_min = float(min_pen_per_item[overall_batch_min_idx].item())
+
+        if batch_min < global_min_penetration:
+            global_min_penetration = batch_min
+            # Identify which (r_idx, l_idx) pair this is
+            global_row = start + overall_batch_min_idx
+            i_dense = global_row // Nl
+            j_dense = global_row % Nl
+            min_pen_pair = (int(map_r[i_dense].item()), int(map_l[j_dense].item()))
+            min_pen_spheres = (sph_r[overall_batch_min_idx].clone(), sph_l[overall_batch_min_idx].clone())
+
+        # Save debug samples
+        if debug_data is not None:
+            for local_idx in range(batch_size):
+                global_idx = start + local_idx
+                if global_idx in debug_sample_indices:
+                    i_dense = global_idx // Nl
+                    j_dense = global_idx % Nl
+
+                    # Get min distance for this pair
+                    d2 = dist2[local_idx]
+                    r_sum = radii[local_idx]
+                    valid = valid_pairs[local_idx]
+
+                    # Compute penetration depth (negative = collision)
+                    dist = torch.sqrt(d2)
+                    penetration = dist - r_sum
+                    penetration_masked = torch.where(valid, penetration, torch.tensor(float('inf'), device=dev))
+                    min_pen = penetration_masked.min().item()
+
+                    debug_data["sample_pairs"].append({
+                        "r_idx": int(map_r[i_dense].item()),
+                        "l_idx": int(map_l[j_dense].item()),
+                        "spheres_r": sph_r[local_idx].cpu().numpy(),
+                        "spheres_l": sph_l[local_idx].cpu().numpy(),
+                        "min_penetration": min_pen,
+                        "is_colliding": min_pen <= 0,
+                    })
+                    debug_data["min_distances"].append(min_pen)
+
+    print(f"[Collision] Found {len(colliding_rows)} colliding pairs out of {total_rows}")
+    print(f"[Collision] Global min penetration: {global_min_penetration:.4f}m (negative=collision, margin={collision_margin})")
+    if min_pen_pair is not None:
+        print(f"[Collision] Closest approach at R[{min_pen_pair[0]}] vs L[{min_pen_pair[1]}]")
+        if min_pen_spheres is not None:
+            sph_r_min, sph_l_min = min_pen_spheres
+            valid_r = sph_r_min[:, 3] > 0
+            valid_l = sph_l_min[:, 3] > 0
+            if valid_r.any() and valid_l.any():
+                c_r = sph_r_min[valid_r, :3]
+                c_l = sph_l_min[valid_l, :3]
+                print(f"[Collision] Right spheres center mean: {c_r.mean(dim=0).cpu().numpy()}")
+                print(f"[Collision] Left spheres center mean: {c_l.mean(dim=0).cpu().numpy()}")
+
+    # Add the minimum distance pair to debug data
+    if debug_data is not None and min_pen_pair is not None and min_pen_spheres is not None:
+        debug_data["min_pair"] = {
+            "r_idx": min_pen_pair[0],
+            "l_idx": min_pen_pair[1],
+            "spheres_r": min_pen_spheres[0].cpu().numpy(),
+            "spheres_l": min_pen_spheres[1].cpu().numpy(),
+            "min_penetration": global_min_penetration,
+            "is_colliding": global_min_penetration <= 0,
+        }
+        # Also add to sample_pairs so it's visualized
+        debug_data["sample_pairs"].append(debug_data["min_pair"])
+        debug_data["min_distances"].append(global_min_penetration)
+
+    # Save debug data
+    if debug_data is not None and debug_data["sample_pairs"]:
+        save_path = debug_save_path or _COLLISION_DEBUG_PATH
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+        with open(save_path, "wb") as f:
+            pickle.dump(debug_data, f)
+        print(f"[Collision Debug] Saved {len(debug_data['sample_pairs'])} samples to {save_path}")
+        print(f"[Collision Debug] Min penetration range: [{min(debug_data['min_distances']):.4f}, {max(debug_data['min_distances']):.4f}]")
+        print(f"[Collision Debug] Run: python -m isaaclab_mimic.datagen.visualize_collision_debug {save_path}")
+    
     if not colliding_rows:
         return []
 
-    pairs: list[tuple[int, int]] = []
-    for row in colliding_rows:
-        i_dense = row // Nl
-        j_dense = row % Nl
-        pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
+    pairs: list[tuple[int, int, float]] = []
+    for row_idx, pen_value in colliding_rows:
+        i_dense = row_idx // Nl
+        j_dense = row_idx % Nl
+        pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item()), pen_value))
     return pairs
 
 
-def _retime(len_r: int, len_l: int, pairs: list[tuple[int, int]], min_dt: float) -> tuple[list[float], list[float]] | None:
-    """Solve MILP retiming for both arms."""
+def _reduce_pairs_smart(
+    pairs: list[tuple[int, int, float]], 
+    top_k_worst: int = 20,
+) -> list[tuple[int, int]]:
+    """Reduce collision pairs to a tractable set for MILP.
+    
+    Strategy:
+    1. Keep boundary pairs (min and max j for each i) - these define collision windows
+    2. Keep top K pairs with worst (most negative) penetration - these are critical collisions
+    
+    Returns pairs without penetration values (just (i, j) tuples) for MILP.
+    """
+    if not pairs:
+        return []
+    
+    # Build boundary map: for each i, track min_j and max_j
+    boundary_map: dict[int, tuple[int, int]] = {}  # i -> (min_j, max_j)
+    for i, j, _ in pairs:
+        if i not in boundary_map:
+            boundary_map[i] = (j, j)
+        else:
+            cur_min, cur_max = boundary_map[i]
+            boundary_map[i] = (min(j, cur_min), max(j, cur_max))
+    
+    # Collect boundary pairs
+    reduced_set: set[tuple[int, int]] = set()
+    for i, (min_j, max_j) in boundary_map.items():
+        reduced_set.add((i, min_j))
+        if max_j != min_j:
+            reduced_set.add((i, max_j))
+    
+    # Sort by penetration (most negative first = worst collisions)
+    sorted_by_pen = sorted(pairs, key=lambda x: x[2])
+    
+    # Add top K worst penetration pairs
+    for i, j, pen in sorted_by_pen[:top_k_worst]:
+        reduced_set.add((i, j))
+    
+    result = list(reduced_set)
+    print(f"[Retime] Smart reduction: {len(pairs)} -> {len(result)} pairs")
+    print(f"  Boundary pairs: {len(boundary_map) * 2} (min/max j per i)")
+    print(f"  Worst penetration: {sorted_by_pen[0][2]:.4f}m at ({sorted_by_pen[0][0]}, {sorted_by_pen[0][1]})")
+    return result
+
+
+def _retime(
+    len_r: int, 
+    len_l: int, 
+    pairs: list[tuple[int, int, float]], 
+    min_dt: float,
+) -> tuple[list[float], list[float]] | None:
+    """Solve MILP retiming for both arms.
+    
+    Args:
+        pairs: List of (r_idx, l_idx, penetration) tuples. Penetration < 0 means collision.
+    """
     if len_r == 0 or len_l == 0:
+        return None
+    if not pairs:
         return None
 
     path_r = [None] * len_r
     path_l = [None] * len_l
-    # buffer > 0 enforces time separation between colliding waypoint pairs
-    # min_dt is the nominal time between waypoints, buffer ensures collision avoidance
-    buffer = min_dt * 0.5  # Half a timestep buffer between colliding pairs
-    print(f"[Retime] len_r={len_r}, len_l={len_l}, pairs={len(pairs)}, min_dt={min_dt:.4f}, buffer={buffer:.4f}")
+    
+    print(f"[Retime] len_r={len_r}, len_l={len_l}, pairs={len(pairs)}, min_dt={min_dt:.4f}")
+    
+    # Extract just (i, j) for MILP (strip penetration)
+    pairs_ij = [(i, j) for i, j, _ in pairs]
+    
     # Debug: show sample collision pairs
-    if pairs:
-        print(f"[Retime] Sample pairs (first 5): {pairs[:5]}")
-        print(f"[Retime] Sample pairs (last 5): {pairs[-5:]}")
-        # Check pair value ranges
-        r_indices = [p[0] for p in pairs]
-        l_indices = [p[1] for p in pairs]
-        print(f"[Retime] Right indices range: [{min(r_indices)}, {max(r_indices)}]")
-        print(f"[Retime] Left indices range: [{min(l_indices)}, {max(l_indices)}]")
-
-    # Reduce collision pairs to boundary pairs for MILP tractability
-    # For each right index i, keep only the min and max left indices j
-    # This captures the "earliest" and "latest" collision points
-    # boundary_map: dict[int, tuple[int, int]] = {}  # i -> (min_j, max_j)
-    # for i, j in pairs:
-    #     if i not in boundary_map:
-    #         boundary_map[i] = (j, j)
-    #     else:
-    #         cur_min, cur_max = boundary_map[i]
-    #         boundary_map[i] = (min(j, cur_min), max(j, cur_max))
-    # reduced_pairs = []
-    # for i, (min_j, max_j) in boundary_map.items():
-    #     reduced_pairs.append((i, min_j))
-    #     if max_j != min_j:
-    #         reduced_p airs.append((i, max_j))
-    reduced = {}
-    for i, j in pairs:
-        if (i not in reduced) or (j < reduced[i]):
-            reduced[i] = j
-    capped = list(reduced.items())
-    print(f"[Retime] Reduced {len(pairs)} pairs to {len(capped)} boundary pairs")
-
+    r_indices = [p[0] for p in pairs]
+    l_indices = [p[1] for p in pairs]
+    print(f"[Retime] Right indices range: [{min(r_indices)}, {max(r_indices)}]")
+    print(f"[Retime] Left indices range: [{min(l_indices)}, {max(l_indices)}]")
+    
+    # First try with all pairs (buffer=0 per plan_humanoid_both_arms.py)
+    # synchronize=False allows different trajectory lengths (e.g., with hold waypoints)
     try:
-        # linear=False uses binary variables to enforce mutual exclusion for collision pairs
-        # Must use reduced_pairs (not full pairs) to keep MILP tractable
-        return retime_paths(path_r, path_l, colliding=capped, linear=True, min_dt=min_dt, buffer=0.0, verbose=True)
-    except AssertionError:
-        try:
-            reduced = {}
-            for i, j in pairs:
-                if (i not in reduced) or (j < reduced[i]):
-                    reduced[i] = j
-            capped = list(reduced.items())
-            return retime_paths(
-                path_r,
-                path_l,
-                colliding=capped,
-                linear=True,
-                min_dt=max(min_dt * 2.0, 0.1),
-                buffer=0.02,
-                verbose=False,
-            )
-        except AssertionError:
-            return None
+        result = retime_paths(
+            path_r, path_l,
+            colliding=pairs_ij,
+            linear=True,
+            min_dt=min_dt,
+            buffer=0.05,
+            synchronize=False,
+            verbose=True,
+            max_time=10.0,
+        )
+        if result is not None:
+            return result
+        print("[Retime] Full pairs failed, trying smart reduction...")
+    except (TypeError, AssertionError, Exception) as e:
+        print(f"[Retime] Full pairs error: {e}")
+
+    # Second try with smart-reduced pairs (boundary + worst penetration)
+    reduced = _reduce_pairs_smart(pairs, top_k_worst=30)
+    try:
+        result = retime_paths(
+            path_r, path_l,
+            colliding=reduced,
+            linear=True,
+            min_dt=min_dt,
+            buffer=0.03,
+            synchronize=False,
+            verbose=True,
+            max_time=15.0,
+        )
+        if result is not None:
+            return result
+        print("[Retime] Smart reduction failed, trying with buffer...")
+    except (TypeError, AssertionError, Exception) as e:
+        print(f"[Retime] Smart reduction error: {e}")
+
+    # Third try with buffer (more relaxed constraints)
+    try:
+        result = retime_paths(
+            path_r, path_l,
+            colliding=reduced,
+            linear=True,
+            min_dt=min_dt * 0.5,
+            buffer=0.01,
+            synchronize=False,
+            verbose=True,
+            max_time=20.0,
+        )
+        if result is not None:
+            return result
+        print("[Retime] Relaxed attempt also failed")
+    except (TypeError, AssertionError, Exception) as e2:
+        print(f"[Retime] Relaxed attempt error: {e2}")
+
+    return None
 
 
 def _discretize(times: Sequence[float], total_time: float, step_dt: float, length: int, device: torch.device) -> torch.Tensor:

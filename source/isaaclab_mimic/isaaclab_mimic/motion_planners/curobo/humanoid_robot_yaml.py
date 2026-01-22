@@ -64,7 +64,7 @@ def build_humanoid_yaml_from_usd(
     )
 
     # Configure sphere generation
-    max_spheres = 400 - len(tool_links) * 50
+    max_spheres = 600 - len(tool_links) * 50
     load_spheres(robot_config, max_spheres=max_spheres, max_link_spheres=int(1e9))
     robot_cfg_dict = robot_config["robot_cfg"]
     _scale_collision_sphere_radii(robot_cfg_dict, radius_scale=radius_scale, per_link_scale=per_link_radius_scale)

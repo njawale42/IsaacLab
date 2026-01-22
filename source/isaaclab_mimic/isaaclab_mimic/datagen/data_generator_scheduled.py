@@ -1064,6 +1064,19 @@ class DataGeneratorScheduled:
         runtime_constraints: dict = {}
         for subtask_constraint in self.env_cfg.task_constraint_configs:
             runtime_constraints.update(subtask_constraint.generate_runtime_subtask_constraints())
+
+        # Debug: Print constraint setup
+        if runtime_constraints:
+            print(f"[Constraints] Built {len(runtime_constraints)} runtime constraints:")
+            for key, constraint in runtime_constraints.items():
+                print(f"  {key}: type={constraint.get('type')}, fulfilled={constraint.get('fulfilled', 'N/A')}")
+        else:
+            print("[Constraints] No runtime constraints configured")
+
+        # Validate constraint indices against actual subtask counts
+        for eef_name, subtask_configs in self.env_cfg.subtask_configs.items():
+            print(f"[Constraints] {eef_name} has {len(subtask_configs)} subtasks (indices 0-{len(subtask_configs)-1})")
+
         return runtime_constraints
 
     def _initialize_eef_states(self) -> dict[str, EEFGenerationState]:
@@ -1414,6 +1427,59 @@ class DataGeneratorScheduled:
                 return True
         return False
 
+    def _is_blocked_by_sequential_constraint(
+        self,
+        eef_name: str,
+        subtask_index: int,
+        runtime_constraints: dict,
+        eef_states: dict[str, EEFGenerationState],
+    ) -> bool:
+        """
+        Check if this subtask's trajectory generation should be blocked by a SEQUENTIAL constraint.
+
+        For offline path building, this is critical: we must NOT generate the "latter" subtask's
+        trajectory until the "former" subtask completes. Otherwise, object positions read during
+        trajectory generation will be stale (e.g., bowl hasn't been moved yet by right arm).
+
+        Args:
+            eef_name: End-effector name.
+            subtask_index: Current subtask index.
+            runtime_constraints: Runtime constraint dictionary.
+            eef_states: Current EEF states.
+
+        Returns:
+            True if trajectory generation should be skipped for now, False otherwise.
+        """
+        subtask_key = (eef_name, subtask_index)
+        if subtask_key not in runtime_constraints:
+            print(f"[Constraints] {eef_name} subtask {subtask_index}: no constraint found")
+            return False
+
+        task_constraint = runtime_constraints[subtask_key]
+        constraint_type = task_constraint.get("type")
+        print(f"[Constraints] {eef_name} subtask {subtask_index}: type={constraint_type}")
+
+        # Check if this is the "latter" part of a SEQUENTIAL constraint
+        if constraint_type == SubTaskConstraintType._SEQUENTIAL_LATTER:
+            fulfilled = task_constraint.get("fulfilled", False)
+            pre_cond_eef = task_constraint.get("pre_condition_task_spec_key")
+            pre_cond_idx = task_constraint.get("pre_condition_subtask_ind")
+            # Check FORMER's current state
+            if pre_cond_eef in eef_states:
+                former_state = eef_states[pre_cond_eef]
+                print(f"[Constraints] FORMER {pre_cond_eef} subtask {pre_cond_idx}: "
+                      f"current_idx={former_state.current_subtask_index}, done={former_state.subtasks_done}")
+            
+            if not fulfilled:
+                print(f"[Constraints] BLOCKING {eef_name} subtask {subtask_index} - "
+                      f"waiting for FORMER {pre_cond_eef}[{pre_cond_idx}] to complete (fulfilled={fulfilled})")
+                return True
+            else:
+                print(f"[Constraints] UNBLOCKING {eef_name} subtask {subtask_index} - "
+                      f"FORMER {pre_cond_eef}[{pre_cond_idx}] completed")
+
+        return False
+
     def _update_execution_buffers(self, exec_results: dict, buffers: GenerationBuffers) -> None:
         """
         Append simulator outputs from the latest control tick to the shared buffers.
@@ -1507,6 +1573,8 @@ class DataGeneratorScheduled:
                 constrained_task_spec_key = task_constraint["constrained_task_spec_key"]
                 constrained_subtask_ind = task_constraint["constrained_subtask_ind"]
                 runtime_constraints[(constrained_task_spec_key, constrained_subtask_ind)]["fulfilled"] = True
+                print(f"[Constraints] FORMER {eef_name} subtask {eef_state.current_subtask_index} completed -> "
+                      f"unblocking {constrained_task_spec_key} subtask {constrained_subtask_ind}")
             elif task_constraint["type"] == SubTaskConstraintType.COORDINATION:
                 concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
                 concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
@@ -1531,6 +1599,7 @@ class DataGeneratorScheduled:
         last_subtask_index = len(self.env_cfg.subtask_configs[eef_name]) - 1
         if eef_state.current_subtask_index == last_subtask_index:
             eef_state.subtasks_done = True
+            eef_state.subtask_step_index = None  # Prevent re-triggering completion
             eef_state.current_trajectory.append(eef_state.current_trajectory[-1])
             return
 
@@ -1866,6 +1935,20 @@ class DataGeneratorScheduled:
                     if eef_state.subtasks_done or eef_state.subtask_step_index is not None:
                         continue
 
+                    # Check if SEQUENTIAL constraint blocks this subtask's trajectory generation.
+                    # For offline path building, we must NOT generate the trajectory until the
+                    # constraining subtask completes - otherwise we read wrong object positions.
+                    is_blocked = self._is_blocked_by_sequential_constraint(
+                        eef_name=eef_name,
+                        subtask_index=eef_state.current_subtask_index,
+                        runtime_constraints=runtime_subtask_constraints,
+                        eef_states=eef_states,
+                    )
+                    if is_blocked:
+                        print(f"[Offline Build] SKIPPING {eef_name} subtask {eef_state.current_subtask_index} - blocked by SEQUENTIAL")
+                        continue
+                    print(f"[Offline Build] GENERATING trajectory for {eef_name} subtask {eef_state.current_subtask_index}")
+
                     # Generate subtask trajectory
                     eef_subtask_trajectory = self.generate_eef_subtask_trajectory(
                         env_id=env_id,
@@ -1902,14 +1985,12 @@ class DataGeneratorScheduled:
                                     arm_planner=arm_planner,
                                 )
 
-                                # For grasp subtasks, preemptively move object to EE to avoid
-                                # collision when other arm plans (simulates completed grasp)
-                                self._preemptively_attach_object_after_grasp_mp(
-                                    env_id=env_id,
-                                    eef_name=eef_name,
-                                    subtask_index=eef_state.current_subtask_index,
-                                    arm_planner=arm_planner,
-                                )
+                                # NOTE: Object pose updates are now deferred to subtask COMPLETION
+                                # (in _update_world_state_after_subtask_offline) to ensure correct
+                                # object positions for subtasks that reference the same object.
+                                # Previously, preemptive updates caused incorrect planning targets
+                                # when one arm's grasp updated the object position before another
+                                # arm's subtask could plan with the original position.
 
                             # Merge skill waypoints after MP
                             skill_waypoints = self.merge_eef_subtask_trajectory(
@@ -1995,6 +2076,14 @@ class DataGeneratorScheduled:
             waypoint_logs=waypoint_logs,
             motion_planner=motion_planner,
             env_id=env_id,
+        )
+
+        # Inject hold waypoints for SEQUENTIAL constraints
+        # The LATTER arm must wait at the start of its trajectory for sequential_min_time_diff
+        arm_paths = self._inject_sequential_hold_waypoints(
+            arm_paths=arm_paths,
+            runtime_constraints=runtime_subtask_constraints,
+            step_dt=self.env.step_dt,
         )
 
         return initial_state, arm_paths
@@ -2192,12 +2281,30 @@ class DataGeneratorScheduled:
         eef_name: str,
         subtask_index: int,
         arm_planner: Any,
+        runtime_constraints: dict | None = None,
     ) -> None:
         """
         After MP planning for a grasp subtask, preemptively move the target object
         to the EE position to simulate grasping. This prevents collision when the
         other arm plans.
+
+        IMPORTANT: If this arm/subtask is the FORMER in a SEQUENTIAL constraint,
+        we should NOT update the object pose. The LATTER arm (which executes first
+        at runtime) needs to plan with the ORIGINAL object position since the object
+        won't have been moved yet when the LATTER arm executes.
         """
+        # Check if this is the FORMER in a SEQUENTIAL constraint
+        if runtime_constraints is not None:
+            subtask_key = (eef_name, subtask_index)
+            if subtask_key in runtime_constraints:
+                constraint = runtime_constraints[subtask_key]
+                if constraint.get("type") == SubTaskConstraintType._SEQUENTIAL_FORMER:
+                    # This arm is FORMER - the LATTER arm executes first at runtime
+                    # Don't update object pose since LATTER needs original position
+                    print(f"[Offline] Skipping object pose update for {eef_name} subtask {subtask_index} "
+                          f"- FORMER in SEQUENTIAL constraint (LATTER executes first at runtime)")
+                    return
+
         subtask_cfg = self._get_subtask_config(eef_name, subtask_index)
         if subtask_cfg is None or not is_grasp_subtask(subtask_cfg):
             return
@@ -2473,7 +2580,12 @@ class DataGeneratorScheduled:
 
         This emulates what happens in online mode after executing a subtask:
         - Robot joint state is updated to the final trajectory position
-        - If the subtask was a "place" or "release", the object is moved to EE position
+        - If the subtask was a "grasp", the object is moved to the EE position
+        - If the subtask was a "place" or "release", the object is moved to final pose
+
+        Object pose updates are DEFERRED to this point (subtask completion) rather than
+        immediately after motion planning. This ensures that other subtasks referencing
+        the same object will plan with the correct (pre-grasp) object position.
 
         Args:
             env_id: Environment ID.
@@ -2489,13 +2601,25 @@ class DataGeneratorScheduled:
                 arm_planner = self._get_arm_planner(motion_planner, eef_name)
                 self._set_robot_joint_state(env_id, eef_state.last_commanded_joint_position, arm_planner, skip_sim_sync=True)
 
-            # If this was a place/release subtask, update object position
             subtask_cfg = self._get_subtask_config(eef_name, completed_subtask_idx)
-            if subtask_cfg is not None and is_place_subtask(subtask_cfg):
-                object_ref = get_subtask_object_ref(subtask_cfg)
-                if object_ref and eef_state.current_trajectory:
-                    final_pose = eef_state.current_trajectory[-1].pose
-                    self._update_object_position_after_place(env_id, object_ref, final_pose)
+            if subtask_cfg is None:
+                continue
+
+            object_ref = get_subtask_object_ref(subtask_cfg)
+            if not object_ref or not eef_state.current_trajectory:
+                continue
+
+            # Grasp subtask: move object to EE position (now robot is "holding" it)
+            if is_grasp_subtask(subtask_cfg):
+                final_pose = eef_state.current_trajectory[-1].pose
+                print(f"[Offline] Grasp complete: {eef_name} subtask {completed_subtask_idx} - moving {object_ref} to EE")
+                self._update_object_position_after_place(env_id, object_ref, final_pose)
+
+            # Place/release subtask: move object to final EE position (object is released there)
+            elif is_place_subtask(subtask_cfg):
+                final_pose = eef_state.current_trajectory[-1].pose
+                print(f"[Offline] Place complete: {eef_name} subtask {completed_subtask_idx} - moving {object_ref} to final pose")
+                self._update_object_position_after_place(env_id, object_ref, final_pose)
 
     def _update_object_position_after_place(
         self,
@@ -2542,6 +2666,104 @@ class DataGeneratorScheduled:
             missing = [k for k in ("left", "right") if k not in arm_paths]
             raise ValueError(f"Offline scheduling requires left/right trajectories; missing {missing}.")
 
+        return arm_paths
+
+    def _inject_sequential_hold_waypoints(
+        self,
+        arm_paths: dict[str, ArmPath],
+        runtime_constraints: dict,
+        step_dt: float,
+    ) -> dict[str, ArmPath]:
+        """
+        Inject hold waypoints into LATTER arm's trajectory to match online SEQUENTIAL behavior.
+        
+        In online mode, the LATTER arm:
+        1. Executes normally until (traj_len - min_time_diff)
+        2. HOLDS at that position until FORMER completes
+        3. Then finishes the last min_time_diff waypoints
+        
+        For offline scheduling, we insert hold waypoints at the hold position to create
+        a pause in the trajectory that allows FORMER to catch up.
+        
+        Args:
+            arm_paths: Dict of arm name -> ArmPath.
+            runtime_constraints: Runtime constraint dictionary.
+            step_dt: Time step for discretization.
+            
+        Returns:
+            Modified arm_paths with hold waypoints injected at the correct position.
+        """
+        for subtask_key, constraint in runtime_constraints.items():
+            if constraint.get("type") != SubTaskConstraintType._SEQUENTIAL_LATTER:
+                continue
+            
+            latter_eef, _ = subtask_key
+            former_eef = constraint.get("pre_condition_task_spec_key")
+            min_time_diff = constraint.get("min_time_diff", 0)
+            
+            if min_time_diff <= 0:
+                # -1 means "wait until former completes" - handled by blocking during trajectory generation
+                # 0 means no hold needed
+                continue
+            
+            if latter_eef not in arm_paths or former_eef not in arm_paths:
+                continue
+            
+            latter_path = arm_paths[latter_eef]
+            former_path = arm_paths[former_eef]
+            latter_len = latter_path.joint_positions.shape[0]
+            former_len = former_path.joint_positions.shape[0]
+            
+            # Online behavior: LATTER holds when step_index >= traj_len - min_time_diff
+            # The hold position is at waypoint (traj_len - min_time_diff)
+            hold_idx = max(0, latter_len - min_time_diff)
+            
+            # Calculate how many hold waypoints we need:
+            # FORMER needs to complete, then LATTER can finish its last min_time_diff waypoints
+            # If FORMER is longer than LATTER's pre-hold portion, we need to wait
+            n_hold = max(0, former_len - hold_idx)
+            
+            if n_hold <= 0:
+                print(f"[Sequential Hold] No hold needed for {latter_eef} (FORMER completes in time)")
+                continue
+            
+            print(f"[Sequential Hold] {latter_eef}: hold at waypoint {hold_idx} for {n_hold} steps")
+            print(f"  FORMER {former_eef} length: {former_len}, LATTER pre-hold: {hold_idx}")
+            
+            # Get the waypoint to hold at
+            hold_pose = latter_path.poses[hold_idx:hold_idx + 1]
+            hold_gripper = latter_path.gripper_actions[hold_idx:hold_idx + 1]
+            hold_joint = latter_path.joint_positions[hold_idx:hold_idx + 1]
+            
+            # Create hold waypoints
+            hold_poses = hold_pose.repeat(n_hold, 1, 1)
+            hold_gripper_actions = hold_gripper.repeat(n_hold, 1)
+            hold_joints = hold_joint.repeat(n_hold, 1)
+            
+            # Split trajectory at hold position and insert hold waypoints
+            # [0...hold_idx-1] + [hold_idx repeated n_hold times] + [hold_idx...end]
+            pre_hold_poses = latter_path.poses[:hold_idx]
+            post_hold_poses = latter_path.poses[hold_idx:]
+            new_poses = torch.cat([pre_hold_poses, hold_poses, post_hold_poses], dim=0)
+            
+            pre_hold_gripper = latter_path.gripper_actions[:hold_idx]
+            post_hold_gripper = latter_path.gripper_actions[hold_idx:]
+            new_gripper = torch.cat([pre_hold_gripper, hold_gripper_actions, post_hold_gripper], dim=0)
+            
+            pre_hold_joints = latter_path.joint_positions[:hold_idx]
+            post_hold_joints = latter_path.joint_positions[hold_idx:]
+            new_joints = torch.cat([pre_hold_joints, hold_joints, post_hold_joints], dim=0)
+            
+            arm_paths[latter_eef] = ArmPath(
+                name=latter_path.name,
+                poses=new_poses,
+                gripper_actions=new_gripper,
+                joint_positions=new_joints,
+            )
+            
+            print(f"[Sequential Hold] {latter_eef} trajectory: {latter_len} -> {new_joints.shape[0]} waypoints")
+            print(f"  Structure: [{hold_idx} pre-hold] + [{n_hold} hold] + [{latter_len - hold_idx} post-hold]")
+        
         return arm_paths
 
     def _extract_joint_history_from_logs(

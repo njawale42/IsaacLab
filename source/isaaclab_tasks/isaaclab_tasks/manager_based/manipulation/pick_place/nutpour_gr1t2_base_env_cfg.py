@@ -94,7 +94,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
 
     sorting_beaker = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/SortingBeaker",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.03, 0.43007, 0.9860], rot=[1, 0, 0, 0]), # [-0.13739, 0.45793, 0.9861]
+        init_state=RigidObjectCfg.InitialStateCfg(pos=[0.02, 0.43007, 0.9860], rot=[1, 0, 0, 0]), # [-0.13739, 0.45793, 0.9861]
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_beaker_red.usd",
             scale=(0.45, 0.45, 1.3),
@@ -104,7 +104,8 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
 
     factory_nut = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/FactoryNut",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9995], rot=[1, 0, 0, 0]),
+        # init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9995], rot=[1, 0, 0, 0]),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=[0.06, 0.43007, 0.9995], rot=[1, 0, 0, 0]),  # matches beaker xy
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/factory_m16_nut_green.usd",
             scale=(0.5, 0.5, 0.5),
