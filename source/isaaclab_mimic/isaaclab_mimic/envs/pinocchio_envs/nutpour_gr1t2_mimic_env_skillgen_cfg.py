@@ -47,7 +47,7 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         # Scheduling parameters for bimanual collision avoidance
         self.datagen_config.schedule_densify_factor = 1
         self.datagen_config.schedule_pair_batch = 4096
-        self.datagen_config.schedule_collision_margin = 0.01  # 1cm margin (was 0.12 - too conservative)
+        self.datagen_config.schedule_collision_margin = 0.15  # 15cm margin to catch close approaches
         # self.datagen_config.schedule_min_dt = 0.05  # Match step_dt for consistency
         self.datagen_config.schedule_all_offline = True
         # self.datagen_config.final_hold_steps = 10
@@ -179,6 +179,6 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
             SubTaskConstraintConfig(
                 eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
                 constraint_type=SubTaskConstraintType.SEQUENTIAL,
-                sequential_min_time_diff=80,
+                sequential_min_time_diff=50,
             )
         )

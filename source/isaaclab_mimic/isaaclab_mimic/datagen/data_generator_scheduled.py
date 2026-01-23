@@ -2904,6 +2904,79 @@ class DataGeneratorScheduled:
             )
         return result
 
+    def _compute_tracking_correction_steps(
+        self,
+        env_id: int,
+        target_waypoints: dict[str, Waypoint],
+        max_pose_error: float = 0.05,
+    ) -> int:
+        """
+        Compute interpolation steps needed to correct tracking error.
+
+        Reads the actual robot EE pose and compares to the target waypoint.
+        If the error exceeds the threshold, returns the number of interpolation
+        steps needed to smoothly reach the target.
+
+        Args:
+            env_id: Environment ID.
+            target_waypoints: Target waypoints for each arm.
+            max_pose_error: Maximum allowed position error (meters) before correction.
+
+        Returns:
+            Number of interpolation steps needed (0 if no correction needed).
+        """
+        max_error = 0.0
+        for eef_name, waypoint in target_waypoints.items():
+            actual_pose = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])
+            if actual_pose is None or actual_pose.numel() == 0:
+                continue
+            actual_pos = actual_pose[0, :3, 3]
+            target_pos = waypoint.pose[:3, 3].to(device=actual_pos.device)
+            error = (actual_pos - target_pos).norm().item()
+            max_error = max(max_error, error)
+
+        if max_error <= max_pose_error:
+            return 0
+
+        # More steps for larger errors (1 step per 2cm of error beyond threshold)
+        extra_steps = int((max_error - max_pose_error) / 0.02)
+        return min(extra_steps + 1, 10)  # Cap at 10 interpolation steps
+
+    def _interpolate_from_actual(
+        self,
+        env_id: int,
+        target_waypoints: dict[str, Waypoint],
+        alpha: float,
+    ) -> dict[str, Waypoint]:
+        """
+        Interpolate from actual robot pose to target waypoint.
+
+        Args:
+            env_id: Environment ID.
+            target_waypoints: Target waypoints for each arm.
+            alpha: Interpolation factor (0 = actual, 1 = target).
+
+        Returns:
+            Interpolated waypoints from actual to target.
+        """
+        result = {}
+        for eef_name, waypoint in target_waypoints.items():
+            actual_pose = self.env.get_robot_eef_pose(eef_name, env_ids=[env_id])
+            if actual_pose is None or actual_pose.numel() == 0:
+                result[eef_name] = waypoint
+                continue
+
+            actual_pose_4x4 = actual_pose[0].to(device=self.env.device, dtype=torch.float32)
+            target_pose = waypoint.pose.to(device=self.env.device, dtype=torch.float32)
+
+            interp_pose = interpolate_pose(actual_pose_4x4, target_pose, alpha)
+            result[eef_name] = Waypoint(
+                pose=interp_pose,
+                gripper_action=waypoint.gripper_action,
+                noise=0.0,
+            )
+        return result
+
     async def _replay_discrete_schedule(
         self,
         env_id: int,
@@ -2989,8 +3062,7 @@ class DataGeneratorScheduled:
                 )
                 self._update_execution_buffers(exec_results, buffers)
 
-            # Execute the actual scheduled waypoint
-            # Ensure tensors are float32 for controller compatibility
+            # Build the target waypoint
             waypoint_dict = {
                 "left": Waypoint(
                     pose=arm_paths["left"].poses[left_idx].to(device=self.env.device, dtype=torch.float32),
@@ -3004,6 +3076,32 @@ class DataGeneratorScheduled:
                 ),
             }
 
+            # Check if we need tracking correction interpolation from ACTUAL pose to target
+            # This handles controller tracking error by smoothing large jumps
+            tracking_interp_steps = self._compute_tracking_correction_steps(
+                env_id=env_id,
+                target_waypoints=waypoint_dict,
+                max_pose_error=0.05,  # 5cm threshold for correction
+            )
+
+            if tracking_interp_steps > 0:
+                for step in range(tracking_interp_steps):
+                    alpha = float(step + 1) / float(tracking_interp_steps + 1)
+                    corrected_waypoints = self._interpolate_from_actual(
+                        env_id=env_id,
+                        target_waypoints=waypoint_dict,
+                        alpha=alpha,
+                    )
+                    correction_multi = MultiWaypoint(corrected_waypoints)
+                    exec_results = await correction_multi.execute(
+                        env=self.env,
+                        success_term=success_term,
+                        env_id=env_id,
+                        env_action_queue=env_action_queue,
+                    )
+                    self._update_execution_buffers(exec_results, buffers)
+
+            # Execute the actual scheduled waypoint
             multi_waypoint = MultiWaypoint(waypoint_dict)
             exec_results = await multi_waypoint.execute(
                 env=self.env,
