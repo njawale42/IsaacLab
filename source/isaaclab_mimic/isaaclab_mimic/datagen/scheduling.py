@@ -493,8 +493,8 @@ def _retime(
             path_r, path_l,
             colliding=pairs_ij,
             linear=True,
-            # min_dt=min_dt,
-            buffer=0.02,
+            min_dt=min_dt,
+            buffer=0.01,
             synchronize=False,
             verbose=True,
             max_time=10.0,
@@ -545,8 +545,21 @@ def _retime(
     return None
 
 
-def _discretize(times: Sequence[float], total_time: float, step_dt: float, length: int, device: torch.device) -> torch.Tensor:
-    """Map monotonic times to per-tick indices using searchsorted."""
+def _discretize(
+    times: Sequence[float],
+    total_time: float,
+    step_dt: float,
+    length: int,
+    device: torch.device,
+    gripper_actions: torch.Tensor | None = None,
+    gripper_change_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Map monotonic times to per-tick indices, preserving gripper transitions.
+
+    Basic discretization uses searchsorted to map sim ticks to waypoint indices.
+    If gripper_actions is provided, ensures indices with significant gripper
+    changes are never skipped (critical for grasp/release commands).
+    """
     if length == 0:
         return torch.zeros(0, dtype=torch.long, device=device)
 
@@ -557,6 +570,32 @@ def _discretize(times: Sequence[float], total_time: float, step_dt: float, lengt
     tick_times = torch.arange(0.0, (tick_count + 1) * step_dt, step_dt, device=device)
     idx = torch.searchsorted(times_tensor, tick_times, right=True) - 1
     idx = idx.clamp(min=0, max=length - 1)
+
+    # Post-process: ensure no gripper transitions are skipped
+    if gripper_actions is not None and gripper_actions.numel() > 0:
+        gripper = gripper_actions.to(device=device, dtype=torch.float32)
+        # Compute gripper change magnitude at each waypoint
+        gripper_delta = torch.zeros(length, device=device)
+        if length > 1:
+            for i in range(1, length):
+                gripper_delta[i] = (gripper[i] - gripper[i - 1]).abs().max()
+
+        # Find indices with significant gripper changes
+        critical_indices = (gripper_delta > gripper_change_threshold).nonzero(as_tuple=True)[0]
+
+        # Ensure each critical index appears in the output
+        for crit_idx in critical_indices:
+            crit_idx_val = int(crit_idx.item())
+            # Check if this index is present in the discretized output
+            if not (idx == crit_idx_val).any():
+                # Find the tick where we should insert this index
+                # (the tick just before we would have skipped past it)
+                for tick in range(len(idx) - 1):
+                    if idx[tick] < crit_idx_val <= idx[tick + 1]:
+                        # Insert the critical index at this tick
+                        idx[tick + 1] = crit_idx_val
+                        break
+
     return idx
 
 
@@ -645,8 +684,18 @@ def build_collision_aware_schedule(
 
     total_time = max(times_r[-1], times_l[-1]) if times_r and times_l else max(len_r, len_l) * base_dt
     print(f"[Scheduling] Total time: {total_time:.3f}, step_dt: {step_dt:.4f}")
-    idx_r = _discretize(times_r, total_time, step_dt, len_r, device=arm_right.joint_positions.device)
-    idx_l = _discretize(times_l, total_time, step_dt, len_l, device=arm_left.joint_positions.device)
+
+    # Pass gripper actions to ensure transitions are preserved during discretization
+    idx_r = _discretize(
+        times_r, total_time, step_dt, len_r,
+        device=arm_right.joint_positions.device,
+        gripper_actions=arm_right.gripper_actions,
+    )
+    idx_l = _discretize(
+        times_l, total_time, step_dt, len_l,
+        device=arm_left.joint_positions.device,
+        gripper_actions=arm_left.gripper_actions,
+    )
     print(f"[Scheduling] Discretized: idx_r[:10]={idx_r[:10].tolist()}, idx_l[:10]={idx_l[:10].tolist()}")
 
     return DiscreteSchedule(left_indices=idx_l, right_indices=idx_r, total_time=total_time, step_dt=step_dt)

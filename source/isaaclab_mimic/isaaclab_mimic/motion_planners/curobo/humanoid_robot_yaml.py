@@ -43,7 +43,7 @@ def build_humanoid_yaml_from_usd(
     usd_path: str,
     arm: str,
     inactive_joints: list[str] | None = None,
-    radius_scale: float = 0.8,
+    radius_scale: float = 1.0,
     per_link_radius_scale: dict[str, float] | None = None,
 ) -> str:
     """Build cuRobo robot configuration YAML from USD file."""

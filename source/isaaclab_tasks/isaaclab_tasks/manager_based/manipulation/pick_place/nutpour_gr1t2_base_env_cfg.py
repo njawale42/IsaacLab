@@ -105,7 +105,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
     factory_nut = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/FactoryNut",
         # init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.13739, 0.45793, 0.9995], rot=[1, 0, 0, 0]),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=[0.06, 0.43007, 0.9995], rot=[1, 0, 0, 0]),  # matches beaker xy
+        init_state=RigidObjectCfg.InitialStateCfg(pos=[0.04, 0.39007, 0.9995], rot=[1, 0, 0, 0]),  # matches beaker xy
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/factory_m16_nut_green.usd",
             scale=(0.5, 0.5, 0.5),

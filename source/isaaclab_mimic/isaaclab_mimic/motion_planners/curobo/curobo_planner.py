@@ -650,13 +650,21 @@ class CuroboPlanner(MotionPlannerBase):
         self.logger.info(f"Getting object pose for {object_name}")
         obj_pose = self.get_object_pose(object_name)
 
-        # Compute relative pose
+        # Compute relative pose (object in wrist local frame)
         attach_pose = link_pose.inverse().multiply(obj_pose)
 
         self.logger.debug(f"Creating attachment for {object_name} to {link_name}")
         self.logger.debug(f"Link pose: {link_pose.position}")
+        self.logger.debug(f"Link quat: {link_pose.quaternion}")
         self.logger.debug(f"Object pose (ACTUAL): {obj_pose.position}")
-        self.logger.debug(f"Computed relative pose: {attach_pose.position}")
+        self.logger.debug(f"Computed relative pose (LOCAL FRAME): {attach_pose.position}")
+
+        # Debug: compute offset in world frame for comparison
+        offset_world = obj_pose.position.squeeze() - link_pose.position.squeeze()
+        self.logger.info(f"[PALM OFFSET DEBUG] Offset in WORLD frame: {offset_world.cpu().tolist()}")
+        self.logger.info(f"[PALM OFFSET DEBUG] Offset in LOCAL frame: {attach_pose.position.squeeze().cpu().tolist()}")
+        palm_cfg = getattr(self.config, 'palm_offset_from_ee', None)
+        self.logger.info(f"[PALM OFFSET DEBUG] Config palm_offset_from_ee: {palm_cfg}")
 
         return Attachment(attach_pose, link_name)
 
@@ -786,6 +794,9 @@ class CuroboPlanner(MotionPlannerBase):
             obj_pos_w = obj.data.root_pos_w[self.env_id]
             obj_quat_w = obj.data.root_quat_w[self.env_id]  # (w, x, y, z)
 
+            # DEBUG: Print object position in world frame
+            print(f"[SYNC DEBUG] {object_name}: Isaac Lab pos (world) = {obj_pos_w.cpu().tolist()}")
+
             # Transform to robot base frame: p_robot = R_robot^-1 * (p_obj - p_robot)
             rel_pos = obj_pos_w - robot_pos_w
             current_pos_raw = quat_apply(robot_quat_inv, rel_pos)
@@ -808,9 +819,15 @@ class CuroboPlanner(MotionPlannerBase):
                 float(current_quat[3].item()),
             ]
 
+            # DEBUG: Print transformed position
+            print(f"[SYNC DEBUG] {object_name}: CuRobo pos (base) = {pose_list[:3]}")
+
             # Update object pose in cuRobo's world model
             if self._update_object_in_world_model(world_model, object_name, object_path, pose_list):
                 updated_count += 1
+                print(f"[SYNC DEBUG] {object_name}: Updated in world model")
+            else:
+                print(f"[SYNC DEBUG] {object_name}: NOT found in world model!")
 
         self.logger.debug(f"SYNC: Updated {updated_count} object poses in cuRobo world model")
 
@@ -1595,21 +1612,24 @@ class CuroboPlanner(MotionPlannerBase):
         target_poses: list[Pose] = []
         contacts: list[bool] = []
 
+        # Approach direction in EE frame (from config)
+        approach_dir = self.config.approach_direction
+
         if retreat_distance is not None and retreat_distance > 0:
             ee_pose: Pose = self.get_ee_pose(start_state)
+            # Retreat is opposite of approach direction
+            retreat_offset = [d * retreat_distance for d in approach_dir]
             retreat_pose: Pose = ee_pose.multiply(
-                self._make_pose(
-                    position=[0.0, 0.0, -retreat_distance],
-                )
+                self._make_pose(position=retreat_offset)
             )
             target_poses.append(retreat_pose)
             contacts.append(True)
         contacts.append(contact)
         if approach_distance is not None and approach_distance > 0:
+            # Approach from the configured direction
+            approach_offset = [d * approach_distance for d in approach_dir]
             approach_pose: Pose = goal_pose.multiply(
-                self._make_pose(
-                    position=[0.0, 0.0, -approach_distance],
-                )
+                self._make_pose(position=approach_offset)
             )
             target_poses.append(approach_pose)
             contacts.append(True)

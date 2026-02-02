@@ -30,7 +30,7 @@ from isaaclab_mimic.datagen.offline_scheduling_helpers import (
     OfflineObjectHelper,
     compute_interpolation_steps,
     force_grasp_check,
-    get_ee_position_from_fk,
+    get_ee_pose_from_fk,
     get_world_to_base_transform,
     interpolate_pose,
     is_grasp_subtask,
@@ -1617,11 +1617,101 @@ class DataGeneratorScheduled:
         """
         return all(state.subtasks_done for state in eef_states.values())
 
+    def _get_initial_gripper_from_articulation(self, env_id: int, eef_name: str) -> torch.Tensor:
+        """Get initial gripper state from robot articulation (matches physics reset state).
+
+        After reset, the articulation contains joint positions from robot config's init_state.
+        This is what cuRobo should use as initial gripper state for planning.
+
+        Args:
+            env_id: Environment ID.
+            eef_name: "left" or "right" arm.
+
+        Returns:
+            Gripper action tensor for the specified arm.
+        """
+        actions_cfg = getattr(getattr(self.env, "cfg", None), "actions", None)
+        pink_cfg = getattr(actions_cfg, "pink_ik_cfg", None) if actions_cfg else None
+        hand_names = getattr(pink_cfg, "hand_joint_names", None) if pink_cfg else None
+
+        if not hand_names:
+            return torch.zeros(11, device=self.env.device, dtype=torch.float32)
+
+        robot_joint_names = list(self._robot_articulation.data.joint_names)
+        robot_joint_pos = self._robot_articulation.data.joint_pos[env_id]
+        name_to_idx = {n: i for i, n in enumerate(robot_joint_names)}
+
+        prefix = "L_" if eef_name == "left" else "R_"
+        arm_hand_names = [n for n in hand_names if n.startswith(prefix)]
+
+        result = []
+        for name in arm_hand_names:
+            if name in name_to_idx:
+                result.append(robot_joint_pos[name_to_idx[name]])
+            else:
+                result.append(torch.tensor(0.0, device=self.env.device))
+
+        return torch.stack(result).to(dtype=torch.float32) if result else torch.zeros(11, device=self.env.device)
+
+    def _extract_gripper_from_joints(
+        self,
+        joint_positions: torch.Tensor,
+        motion_planner: Any,
+        eef_name: str,
+        env_id: int = 0,
+    ) -> torch.Tensor:
+        """Extract finger joint positions from cuRobo's planned joint state.
+
+        Similar to plan_humanoid_single_call.py: uses cuRobo's planned joints if available,
+        falls back to articulation's current state for missing joints.
+
+        Args:
+            joint_positions: Full joint vector from cuRobo (planner ordering).
+            motion_planner: Planner instance for joint name lookup.
+            eef_name: "left" or "right" to determine finger prefix.
+            env_id: Environment ID for fallback values.
+
+        Returns:
+            Gripper action tensor for the specified arm.
+        """
+        # Get fallback values from articulation (matches physics reset state)
+        fallback = self._get_initial_gripper_from_articulation(env_id, eef_name)
+
+        actions_cfg = getattr(getattr(self.env, "cfg", None), "actions", None)
+        pink_cfg = getattr(actions_cfg, "pink_ik_cfg", None) if actions_cfg else None
+        hand_names = getattr(pink_cfg, "hand_joint_names", None) if pink_cfg else None
+
+        if not hand_names or not hasattr(motion_planner, "motion_gen"):
+            return fallback
+
+        cu_names = list(motion_planner.motion_gen.kinematics.joint_names)
+        name_to_cu_idx = {n: i for i, n in enumerate(cu_names)}
+
+        prefix = "L_" if eef_name == "left" else "R_"
+        arm_hand_names = [n for n in hand_names if n.startswith(prefix)]
+        if not arm_hand_names:
+            return fallback
+
+        jpos = joint_positions.view(-1).to(device=self.env.device, dtype=torch.float32)
+
+        # Like plan_humanoid_single_call.py: use cuRobo joint if available, else fallback
+        result = []
+        for i, name in enumerate(arm_hand_names):
+            if name in name_to_cu_idx and name_to_cu_idx[name] < jpos.shape[0]:
+                result.append(jpos[name_to_cu_idx[name]])
+            elif i < fallback.shape[0]:
+                result.append(fallback[i])
+            else:
+                result.append(torch.tensor(0.0, device=self.env.device))
+
+        return torch.stack(result).to(dtype=torch.float32)
+
     def _convert_planned_trajectory_to_waypoints(
         self,
         motion_planner: Any,
         gripper_action: torch.Tensor,
         include_joints: bool = False,
+        use_planned_gripper: bool = False,
     ) -> list[Waypoint] | tuple[list[Waypoint], list[torch.Tensor]]:
         """
         Convert the planner's raw pose sequence into executable `Waypoint` objects.
@@ -1632,8 +1722,9 @@ class DataGeneratorScheduled:
 
         Args:
             motion_planner: Planner instance exposing `get_planned_poses()`.
-            gripper_action: Gripper tensor to attach to every waypoint.
+            gripper_action: Gripper tensor fallback for each waypoint.
             include_joints: If True, also return joint positions from the plan.
+            use_planned_gripper: If True, extract gripper from cuRobo's planned joints.
 
         Returns:
             List of Waypoint objects, or tuple of (waypoints, joints) if include_joints=True.
@@ -1688,9 +1779,14 @@ class DataGeneratorScheduled:
             if planned_joints is not None and idx < planned_joints.shape[0]:
                 joint_vec = planned_joints[idx].clone()
 
+            # Use gripper from cuRobo's planned joints if requested (first MP)
+            wp_gripper = gripper_action
+            if use_planned_gripper and joint_vec is not None:
+                wp_gripper = self._extract_gripper_from_joints(joint_vec, motion_planner, eef_name, env_id)
+
             waypoints.append(Waypoint(
                 pose=T_world_site,
-                gripper_action=gripper_action.clone() if include_joints else gripper_action,
+                gripper_action=wp_gripper.clone() if include_joints else wp_gripper,
                 noise=motion_noise_scale,
                 joint_seed=joint_vec,
             ))
@@ -2127,16 +2223,16 @@ class DataGeneratorScheduled:
         target_pose = eef_subtask_trajectory[0].pose
 
         # Determine gripper action for MP phase
+        # For first MP (no prior skill), use articulation's initial state (matches physics reset)
         if eef_state.last_commanded_gripper_action is not None:
             base_gripper_action = eef_state.last_commanded_gripper_action
         elif eef_state.current_subtask_index == 0:
-            first_demo = self.src_demo_datagen_info_pool.datagen_infos[0]
-            base_gripper_action = first_demo.gripper_action[eef_name][0]
+            # Use initial gripper from robot articulation (what physics produces after reset)
+            base_gripper_action = self._get_initial_gripper_from_articulation(env_id, eef_name)
         elif len(eef_subtask_trajectory) > 0:
             base_gripper_action = eef_subtask_trajectory[0].gripper_action
         else:
-            first_demo = self.src_demo_datagen_info_pool.datagen_infos[0]
-            base_gripper_action = first_demo.gripper_action[eef_name][0]
+            base_gripper_action = self._get_initial_gripper_from_articulation(env_id, eef_name)
 
         expected_attached_object = None
         if hasattr(self.env, "get_expected_attached_object"):
@@ -2200,9 +2296,12 @@ class DataGeneratorScheduled:
             print(f"Motion planning failed for {eef_name}")
             return {"success": False}
 
+        # For first MP (no prior skill), use gripper from cuRobo's collision-free plan
+        is_first_mp = eef_state.last_commanded_gripper_action is None
+
         # Extract planned poses and joint positions
         result = self._convert_planned_trajectory_to_waypoints(
-            arm_planner, base_gripper_action, include_joints=True
+            arm_planner, base_gripper_action, include_joints=True, use_planned_gripper=is_first_mp
         )
         mp_waypoints: list[Waypoint] = result[0] if isinstance(result, tuple) else result
         mp_joints: list[torch.Tensor] = result[1] if isinstance(result, tuple) else []
@@ -2215,6 +2314,10 @@ class DataGeneratorScheduled:
             eef_state.last_commanded_joint_position = mp_joints[-1].clone()
             self._set_robot_joint_state(env_id, mp_joints[-1], arm_planner, skip_sim_sync=True)
 
+        # Update last gripper action from plan for subsequent segments
+        if is_first_mp and mp_waypoints:
+            eef_state.last_commanded_gripper_action = mp_waypoints[-1].gripper_action.clone()
+
         return mp_waypoints, mp_joints
 
     def _move_object_to_ee_for_offline(
@@ -2223,11 +2326,35 @@ class DataGeneratorScheduled:
         object_name: str,
         arm_planner: Any,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Move an object to the EE position for offline planning."""
-        ee_pos = get_ee_position_from_fk(self._robot_articulation, arm_planner, env_id)
-        if ee_pos is None:
+        """Move an object to the EE position for offline planning.
+
+        Only POSITION is changed:
+        - Position: palm/grasp center (wrist + palm_offset)
+        - Orientation: kept as original (how object naturally sits when grasped)
+
+        The orientation is preserved because the object's mesh orientation relative to
+        the hand is what gets captured by CuRobo's attachment mechanism.
+        """
+        # Get original pose for debugging
+        orig = self._object_helper.get_object_pose(env_id, object_name)
+        if orig:
+            print(f"[MOVE OBJECT] {object_name}: Original pos (world) = {orig[0].cpu().tolist()}")
+
+        ee_pose = get_ee_pose_from_fk(self._robot_articulation, arm_planner, env_id)
+        if ee_pose is None:
             return None
-        return self._object_helper.move_to_ee_position(env_id, object_name, ee_pos)
+        ee_pos, _ = ee_pose  # Only use position
+
+        print(f"[MOVE OBJECT] {object_name}: Target EE/palm pos (world) = {ee_pos.cpu().tolist()}")
+
+        result = self._object_helper.move_to_ee_position(env_id, object_name, ee_pos)
+
+        # Verify the move happened
+        new = self._object_helper.get_object_pose(env_id, object_name)
+        if new:
+            print(f"[MOVE OBJECT] {object_name}: After move pos (world) = {new[0].cpu().tolist()}")
+
+        return result
 
     def _restore_object_pose_for_offline(
         self,
@@ -2488,7 +2615,21 @@ class DataGeneratorScheduled:
         if isinstance(joint_vec, torch.Tensor) and joint_vec.ndim > 1:
             joint_vec = joint_vec[0]
 
-        return torch.as_tensor(joint_vec, dtype=torch.float32, device=self.env.device).view(-1)
+        result = torch.as_tensor(joint_vec, dtype=torch.float32, device=self.env.device).view(-1)
+
+        # Clamp IK solution to joint limits to prevent controller jerking
+        if hasattr(planner, "motion_gen") and hasattr(planner.motion_gen, "kinematics"):
+            try:
+                limits = planner.motion_gen.kinematics.get_joint_limits().position
+                low = limits[0].to(device=result.device, dtype=result.dtype)
+                high = limits[1].to(device=result.device, dtype=result.dtype)
+                # Apply clamping with small margin to avoid boundary issues
+                margin = 1e-3
+                result = torch.clamp(result, low + margin, high - margin)
+            except Exception:
+                pass  # If limit retrieval fails, use unclamped result
+
+        return result
 
     def _convert_world_pose_to_planner_frame(self, pose: torch.Tensor, env_id: int) -> torch.Tensor:
         """Convert a world-frame pose to the planner's base frame."""
@@ -2631,6 +2772,75 @@ class DataGeneratorScheduled:
         new_pos = final_ee_pose[:3, 3].clone()
         self._object_helper.set_object_position(env_id, object_name, new_pos)
 
+    def _apply_gripper_delay_and_interpolation(
+        self,
+        gripper_actions: torch.Tensor,
+        delay_steps: int,
+        interp_steps: int,
+        change_threshold: float = 0.5,
+        eef_name: str = "",
+    ) -> torch.Tensor:
+        """
+        Delay and interpolate major gripper transitions for smooth grasping.
+
+        When a major gripper change is detected (delta > threshold), this function:
+        1. Extends the PREVIOUS gripper state for `delay_steps` waypoints (arm settles)
+        2. Linearly interpolates to the TARGET gripper over `interp_steps` (smooth close)
+
+        This prevents premature finger curl and ensures smooth gripper motion.
+
+        Args:
+            gripper_actions: [N, D] tensor of gripper actions.
+            delay_steps: Number of steps to delay after detecting a major change.
+            interp_steps: Number of steps to interpolate from previous to target gripper.
+            change_threshold: Minimum delta to consider as a major gripper transition.
+            eef_name: Name of the end-effector for debug logging.
+
+        Returns:
+            Modified gripper_actions tensor with delayed and interpolated transitions.
+        """
+        if (delay_steps <= 0 and interp_steps <= 0) or gripper_actions.shape[0] < 2:
+            return gripper_actions
+
+        modified = gripper_actions.clone()
+        n_waypoints = gripper_actions.shape[0]
+        debug = getattr(self.env_cfg.datagen_config, "debug_gripper_detail", False)
+
+        i = 1
+        while i < n_waypoints:
+            delta = (gripper_actions[i] - gripper_actions[i - 1]).abs().max().item()
+            if delta > change_threshold:
+                # Major gripper change detected at index i
+                prev_gripper = gripper_actions[i - 1].clone()
+                target_gripper = gripper_actions[i].clone()
+
+                # Phase 1: Delay - keep previous gripper for delay_steps
+                delay_end = min(i + delay_steps, n_waypoints)
+                for j in range(i, delay_end):
+                    modified[j] = prev_gripper
+
+                # Phase 2: Interpolate - smoothly transition to target gripper
+                interp_start = delay_end
+                interp_end = min(interp_start + interp_steps, n_waypoints)
+                actual_interp_steps = interp_end - interp_start
+
+                if actual_interp_steps > 0:
+                    for step, j in enumerate(range(interp_start, interp_end)):
+                        alpha = (step + 1) / (actual_interp_steps + 1)
+                        modified[j] = prev_gripper * (1.0 - alpha) + target_gripper * alpha
+
+                if debug:
+                    print(f"[GRIPPER DELAY+INTERP] {eef_name}: waypoint {i}, "
+                          f"delay={delay_end - i} steps, interp={actual_interp_steps} steps "
+                          f"(delta={delta:.3f})")
+
+                # Skip past the processed region
+                i = interp_end if interp_end > i else i + 1
+            else:
+                i += 1
+
+        return modified
+
     def _build_arm_paths_from_logs(
         self,
         waypoint_logs: dict[str, list[dict[str, Any]]],
@@ -2640,12 +2850,26 @@ class DataGeneratorScheduled:
         """Convert collected waypoint logs into ArmPath objects for scheduling."""
         arm_paths: dict[str, ArmPath] = {}
 
+        # Get gripper delay config (number of steps to delay gripper at skill start)
+        gripper_delay_steps = int(getattr(self.env_cfg.datagen_config, "skill_gripper_delay_steps", 0))
+
         for eef_name, entries in waypoint_logs.items():
             if not entries:
                 continue
 
             poses = torch.stack([e["waypoint"].pose.clone() for e in entries], dim=0)
             gripper_actions = torch.stack([e["waypoint"].gripper_action.clone() for e in entries], dim=0)
+
+            # Apply gripper delay and interpolation if configured
+            gripper_interp_steps = int(getattr(self.env_cfg.datagen_config, "skill_gripper_interp_steps", 20))
+            if gripper_delay_steps > 0 or gripper_interp_steps > 0:
+                gripper_actions = self._apply_gripper_delay_and_interpolation(
+                    gripper_actions,
+                    delay_steps=gripper_delay_steps,
+                    interp_steps=gripper_interp_steps,
+                    change_threshold=0.5,  # Threshold for major gripper change
+                    eef_name=eef_name,
+                )
 
             # Build joint position tensor, solving IK for missing entries
             joint_positions = self._extract_joint_history_from_logs(
@@ -2854,6 +3078,46 @@ class DataGeneratorScheduled:
             planner = planner_map.get(arm_name)
             self._set_robot_joint_state(env_id, joint_vec, planner)
 
+    def _apply_initial_gripper_state(
+        self,
+        env_id: int,
+        arm_paths: dict[str, ArmPath],
+        left_idx: int,
+        right_idx: int,
+    ) -> None:
+        """Apply gripper joint state from first waypoints to match cuRobo's planned start.
+
+        Ensures the physical gripper matches what cuRobo assumed when planning
+        collision-free trajectories. This prevents mismatch after env reset.
+        """
+        actions_cfg = getattr(getattr(self.env, "cfg", None), "actions", None)
+        pink_cfg = getattr(actions_cfg, "pink_ik_cfg", None) if actions_cfg else None
+        hand_names = getattr(pink_cfg, "hand_joint_names", None) if pink_cfg else None
+        if not hand_names:
+            return
+
+        robot_joint_names = list(self._robot_articulation.data.joint_names)
+        name_to_idx = {n: i for i, n in enumerate(robot_joint_names)}
+
+        for arm_name, idx in [("left", left_idx), ("right", right_idx)]:
+            arm_path = arm_paths.get(arm_name)
+            if arm_path is None or arm_path.gripper_actions is None:
+                continue
+            if idx >= arm_path.gripper_actions.shape[0]:
+                continue
+
+            gripper = arm_path.gripper_actions[idx].to(device=self.env.device, dtype=torch.float32)
+            prefix = "L_" if arm_name == "left" else "R_"
+            arm_hand_names = [n for n in hand_names if n.startswith(prefix)]
+
+            for i, hand_name in enumerate(arm_hand_names):
+                if hand_name in name_to_idx and i < gripper.shape[0]:
+                    self._robot_articulation.data.joint_pos[env_id, name_to_idx[hand_name]] = gripper[i]
+                    self._robot_articulation.data.joint_pos_target[env_id, name_to_idx[hand_name]] = gripper[i]
+
+        self._robot_articulation.write_data_to_sim()
+        self._robot_articulation.update(0.0)
+
     def _compute_interpolation_steps(
         self,
         arm_paths: dict[str, ArmPath],
@@ -2888,18 +3152,24 @@ class DataGeneratorScheduled:
         curr_right_idx: int,
         alpha: float,
     ) -> dict[str, Waypoint]:
-        """Create interpolated waypoints between previous and current indices."""
+        """Create interpolated waypoints between previous and current indices.
+        
+        IMPORTANT: Gripper actions are NOT interpolated. We keep the previous
+        gripper state during interpolation to prevent premature gripper closing/opening.
+        The gripper only changes when we reach the actual target waypoint.
+        """
         result = {}
         for arm_name, prev_idx, curr_idx in [("left", prev_left_idx, curr_left_idx), ("right", prev_right_idx, curr_right_idx)]:
             arm_path = arm_paths[arm_name]
             p0 = arm_path.poses[prev_idx].to(device=self.env.device, dtype=torch.float32)
             p1 = arm_path.poses[curr_idx].to(device=self.env.device, dtype=torch.float32)
             g0 = arm_path.gripper_actions[prev_idx].to(device=self.env.device, dtype=torch.float32)
-            g1 = arm_path.gripper_actions[curr_idx].to(device=self.env.device, dtype=torch.float32)
 
             result[arm_name] = Waypoint(
                 pose=interpolate_pose(p0, p1, alpha),
-                gripper_action=g0 * (1.0 - alpha) + g1 * alpha,
+                # Keep previous gripper state during interpolation to prevent
+                # premature grasp/release before arm reaches target position
+                gripper_action=g0,
                 noise=0.0,
             )
         return result
@@ -2947,6 +3217,7 @@ class DataGeneratorScheduled:
         env_id: int,
         target_waypoints: dict[str, Waypoint],
         alpha: float,
+        prev_gripper_actions: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Waypoint]:
         """
         Interpolate from actual robot pose to target waypoint.
@@ -2955,6 +3226,8 @@ class DataGeneratorScheduled:
             env_id: Environment ID.
             target_waypoints: Target waypoints for each arm.
             alpha: Interpolation factor (0 = actual, 1 = target).
+            prev_gripper_actions: Previous gripper actions to maintain during correction.
+                If None, uses target gripper action (legacy behavior).
 
         Returns:
             Interpolated waypoints from actual to target.
@@ -2970,9 +3243,17 @@ class DataGeneratorScheduled:
             target_pose = waypoint.pose.to(device=self.env.device, dtype=torch.float32)
 
             interp_pose = interpolate_pose(actual_pose_4x4, target_pose, alpha)
+            
+            # Use previous gripper state during tracking correction to prevent
+            # premature gripper changes before arm reaches position
+            if prev_gripper_actions is not None and eef_name in prev_gripper_actions:
+                gripper = prev_gripper_actions[eef_name]
+            else:
+                gripper = waypoint.gripper_action
+            
             result[eef_name] = Waypoint(
                 pose=interp_pose,
-                gripper_action=waypoint.gripper_action,
+                gripper_action=gripper,
                 noise=0.0,
             )
         return result
@@ -3021,16 +3302,89 @@ class DataGeneratorScheduled:
                 right_idx=right_idx_0,
                 planner_map=planner_map,
             )
+            # Apply gripper state from first waypoints to match cuRobo's planned start
+            self._apply_initial_gripper_state(
+                env_id=env_id,
+                arm_paths=arm_paths,
+                left_idx=left_idx_0,
+                right_idx=right_idx_0,
+            )
 
         # Configurable smoothing: max joint change per tick (radians)
         max_joint_step_rad = float(getattr(self.env_cfg.datagen_config, "max_joint_step_rad", 0.1))
         prev_left_idx = -1
         prev_right_idx = -1
 
+        # Debug: track gripper changes
+        prev_gripper_left: torch.Tensor | None = None
+        prev_gripper_right: torch.Tensor | None = None
+        # Track last COMMANDED gripper (what we actually sent to the robot)
+        last_commanded_gripper: dict[str, torch.Tensor] = {}
+        debug_schedule = getattr(self.env_cfg.datagen_config, "debug_schedule_replay", False)
+        debug_gripper_detail = getattr(self.env_cfg.datagen_config, "debug_gripper_detail", False)
+
+        # Analyze and print gripper transition points in the original trajectory
+        if debug_schedule:
+            print("\n[GRIPPER ANALYSIS] Analyzing original trajectory gripper transitions...")
+            for arm_name in ["left", "right"]:
+                arm_path = arm_paths[arm_name]
+                g_actions = arm_path.gripper_actions
+                print(f"  {arm_name.upper()} arm: {len(g_actions)} waypoints")
+                
+                # Find all significant gripper change points
+                change_points = []
+                for i in range(1, len(g_actions)):
+                    delta = (g_actions[i] - g_actions[i - 1]).abs().max().item()
+                    if delta > 0.05:  # Any notable change
+                        change_points.append((i, delta, g_actions[i - 1].tolist(), g_actions[i].tolist()))
+                
+                if change_points:
+                    print("    Gripper change points:")
+                    for idx, delta, before, after in change_points:
+                        pos = arm_path.poses[idx][:3, 3].tolist()
+                        print(f"      waypoint {idx}: delta={delta:.3f}, {before} → {after}")
+                        print(f"        EE pos: {[f'{p:.3f}' for p in pos]}")
+                else:
+                    print("    No significant gripper changes found in trajectory")
+            print()
+
         num_ticks = schedule.left_indices.shape[0]
         for tick in range(num_ticks):
             left_idx = int(schedule.left_indices[tick].item())
             right_idx = int(schedule.right_indices[tick].item())
+
+            # DEBUG: Detect large index jumps (potential cause of jerks)
+            if debug_schedule and prev_left_idx >= 0:
+                left_jump = left_idx - prev_left_idx
+                right_jump = right_idx - prev_right_idx
+                if abs(left_jump) > 3 or abs(right_jump) > 3:
+                    print(f"[DEBUG] Tick {tick}: Large index jump! L:{prev_left_idx}→{left_idx} (+{left_jump}), R:{prev_right_idx}→{right_idx} (+{right_jump})")
+
+            # DEBUG: Detect gripper changes in trajectory
+            if debug_schedule:
+                g_left = arm_paths["left"].gripper_actions[left_idx]
+                g_right = arm_paths["right"].gripper_actions[right_idx]
+                if prev_gripper_left is not None and prev_gripper_right is not None:
+                    delta_left = (g_left - prev_gripper_left).abs().max().item()
+                    delta_right = (g_right - prev_gripper_right).abs().max().item()
+                    if delta_left > 0.1 or delta_right > 0.1:
+                        # Get current EE pose for context
+                        left_pose = arm_paths["left"].poses[left_idx]
+                        right_pose = arm_paths["right"].poses[right_idx]
+                        print(f"[DEBUG] Tick {tick}: Gripper TRAJECTORY change! L_delta={delta_left:.3f} R_delta={delta_right:.3f}")
+                        print(f"        L_idx={left_idx}, R_idx={right_idx}")
+                        print(f"        L_gripper: {prev_gripper_left.tolist()} → {g_left.tolist()}")
+                        print(f"        R_gripper: {prev_gripper_right.tolist()} → {g_right.tolist()}")
+                        print(f"        L_pos={left_pose[:3,3].tolist()}, R_pos={right_pose[:3,3].tolist()}")
+                        # Also show gripper values at surrounding waypoints
+                        if left_idx > 0:
+                            g_left_prev = arm_paths["left"].gripper_actions[left_idx - 1]
+                            print(f"        L_gripper[{left_idx-1}]={g_left_prev.tolist()}")
+                        if left_idx + 1 < len(arm_paths["left"].gripper_actions):
+                            g_left_next = arm_paths["left"].gripper_actions[left_idx + 1]
+                            print(f"        L_gripper[{left_idx+1}]={g_left_next.tolist()}")
+                prev_gripper_left = g_left.clone()
+                prev_gripper_right = g_right.clone()
 
             # Check if we need interpolation steps for smooth motion
             interp_steps = self._compute_interpolation_steps(
@@ -3043,6 +3397,9 @@ class DataGeneratorScheduled:
             )
 
             # Execute interpolation steps if needed
+            if debug_schedule and interp_steps > 0:
+                print(f"[DEBUG] Tick {tick}: Adding {interp_steps} interpolation steps (L:{prev_left_idx}→{left_idx}, R:{prev_right_idx}→{right_idx})")
+
             for step in range(interp_steps):
                 alpha = float(step + 1) / float(interp_steps + 1)
                 interp_waypoints = self._interpolate_waypoints(
@@ -3053,6 +3410,9 @@ class DataGeneratorScheduled:
                     curr_right_idx=right_idx,
                     alpha=alpha,
                 )
+                if debug_gripper_detail:
+                    for eef_name, wp in interp_waypoints.items():
+                        print(f"  [GRIPPER] Tick {tick} interp step {step}/{interp_steps}: {eef_name} = {wp.gripper_action.tolist()}")
                 interp_multi = MultiWaypoint(interp_waypoints)
                 exec_results = await interp_multi.execute(
                     env=self.env,
@@ -3085,13 +3445,19 @@ class DataGeneratorScheduled:
             )
 
             if tracking_interp_steps > 0:
+                if debug_schedule:
+                    print(f"[DEBUG] Tick {tick}: Tracking correction {tracking_interp_steps} steps (controller lag)")
                 for step in range(tracking_interp_steps):
                     alpha = float(step + 1) / float(tracking_interp_steps + 1)
                     corrected_waypoints = self._interpolate_from_actual(
                         env_id=env_id,
                         target_waypoints=waypoint_dict,
                         alpha=alpha,
+                        prev_gripper_actions=last_commanded_gripper if last_commanded_gripper else None,
                     )
+                    if debug_gripper_detail:
+                        for eef_name, wp in corrected_waypoints.items():
+                            print(f"  [GRIPPER] Tick {tick} tracking step {step}: {eef_name} = {wp.gripper_action.tolist()}")
                     correction_multi = MultiWaypoint(corrected_waypoints)
                     exec_results = await correction_multi.execute(
                         env=self.env,
@@ -3102,6 +3468,9 @@ class DataGeneratorScheduled:
                     self._update_execution_buffers(exec_results, buffers)
 
             # Execute the actual scheduled waypoint
+            if debug_gripper_detail:
+                for eef_name, wp in waypoint_dict.items():
+                    print(f"  [GRIPPER] Tick {tick} TARGET: {eef_name} = {wp.gripper_action.tolist()}")
             multi_waypoint = MultiWaypoint(waypoint_dict)
             exec_results = await multi_waypoint.execute(
                 env=self.env,
@@ -3110,6 +3479,12 @@ class DataGeneratorScheduled:
                 env_action_queue=env_action_queue,
             )
             self._update_execution_buffers(exec_results, buffers)
+
+            # Update last commanded gripper for next iteration
+            last_commanded_gripper = {
+                eef_name: wp.gripper_action.clone()
+                for eef_name, wp in waypoint_dict.items()
+            }
 
             prev_left_idx = left_idx
             prev_right_idx = right_idx

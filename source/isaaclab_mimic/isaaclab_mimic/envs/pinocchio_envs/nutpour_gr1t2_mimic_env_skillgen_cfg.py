@@ -45,11 +45,21 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         self.datagen_config.num_fail_demo_to_render = 25
         self.datagen_config.seed = 10
         # Scheduling parameters for bimanual collision avoidance
+        # Higher densify_factor = more waypoints = less skipping during discretization
         self.datagen_config.schedule_densify_factor = 1
         self.datagen_config.schedule_pair_batch = 4096
-        self.datagen_config.schedule_collision_margin = 0.15  # 15cm margin to catch close approaches
+        self.datagen_config.schedule_collision_margin = 0.05  # 15cm margin to catch close approaches
+        self.datagen_config.debug_schedule_replay = True  # Enable debug prints for schedule replay
+        self.datagen_config.debug_gripper_detail = True  # Show every gripper command (verbose)
+        # Gripper delay: keep gripper at previous state for N steps after major gripper transition
+        # This gives the arm time to settle at the grasp position before closing fingers
+        self.datagen_config.skill_gripper_delay_steps = 5 #18 #18  # ~1.5 seconds delay at 50Hz
+        # Gripper interpolation: smoothly close gripper over N steps (after delay)
+        # This prevents fingers from snapping closed instantly
+        self.datagen_config.skill_gripper_interp_steps = 0  # ~1 second smooth close at 50Hz
         # self.datagen_config.schedule_min_dt = 0.05  # Match step_dt for consistency
         self.datagen_config.schedule_all_offline = True
+        self.datagen_config.max_joint_step_rad = 0.05  # Smoother wrist motion (2.9 degrees max per tick)
         # self.datagen_config.final_hold_steps = 10
 
         # The following are the subtask configurations for the stack task.
@@ -179,6 +189,6 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
             SubTaskConstraintConfig(
                 eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
                 constraint_type=SubTaskConstraintType.SEQUENTIAL,
-                sequential_min_time_diff=50,
+                sequential_min_time_diff=40,
             )
         )

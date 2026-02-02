@@ -236,7 +236,7 @@ class OfflineObjectHelper:
         self, env_id: int, object_name: str, ee_position: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """
-        Move an object to the EE position and return its original pose.
+        Move an object to the EE position (keeps orientation) and return original pose.
 
         Args:
             env_id: Environment ID.
@@ -251,6 +251,30 @@ class OfflineObjectHelper:
             return None
 
         self.set_object_position(env_id, object_name, ee_position)
+        return original_pose
+
+    def move_to_ee_pose(
+        self, env_id: int, object_name: str, ee_position: torch.Tensor, ee_quaternion: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """
+        Move an object to the EE pose (position AND orientation) and return original pose.
+
+        This ensures the attached object spheres are oriented correctly with the hand.
+
+        Args:
+            env_id: Environment ID.
+            object_name: Name of the object to move.
+            ee_position: EE position to move object to.
+            ee_quaternion: EE orientation to apply (quaternion [w,x,y,z]).
+
+        Returns:
+            Tuple of (original_pos, original_quat) to restore later, or None if failed.
+        """
+        original_pose = self.get_object_pose(env_id, object_name)
+        if original_pose is None:
+            return None
+
+        self.set_object_pose(env_id, object_name, ee_position, ee_quaternion)
         return original_pose
 
     def restore_pose(
@@ -296,21 +320,29 @@ def force_grasp_check(planner: Any, expected_object: str):
         planner._check_object_grasped = original_method
 
 
-def get_ee_position_from_fk(
+def get_ee_pose_from_fk(
     robot_articulation: Any,
     arm_planner: Any,
     env_id: int,
-) -> torch.Tensor | None:
+    apply_palm_offset: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
-    Get the EE position using FK from the arm planner's current joint state.
+    Get the grasp pose (position and orientation) using FK from the arm planner.
+
+    Since CuRobo's FK only computes up to the tool_link (wrist), this function
+    optionally applies a palm_offset to get the actual grasp/palm position.
+    The orientation is the wrist orientation (grasp orientation).
 
     Args:
         robot_articulation: Robot articulation for reading joint state.
         arm_planner: Arm-specific planner with FK capability.
         env_id: Environment ID.
+        apply_palm_offset: If True, apply palm_offset_from_ee config to get
+            the palm/grasp position. If False, return wrist position directly.
 
     Returns:
-        EE position in world frame, or None if computation fails.
+        Tuple of (position, quaternion) in world frame, or None if computation fails.
+        Quaternion is in [w, x, y, z] format.
     """
     if arm_planner is None:
         return None
@@ -319,6 +351,7 @@ def get_ee_position_from_fk(
     if joint_state is None:
         return None
 
+    # Use attached_object_link_name (wrist) for FK - this is in CuRobo's kinematic chain
     link_name = getattr(arm_planner.config, "attached_object_link_name", None)
     if link_name is None:
         return None
@@ -330,13 +363,52 @@ def get_ee_position_from_fk(
     if link_pose is None:
         return None
 
+    # Get wrist position and orientation in robot base frame
+    device = robot_articulation.data.root_pos_w.device
+    wrist_pos_base = link_pose.position.squeeze().to(device=device)
+    wrist_quat_base = link_pose.quaternion.squeeze().to(device=device)  # [w, x, y, z]
+
+    original_wrist_pos = wrist_pos_base.clone()
+
+    # Apply palm offset if configured (offset from wrist to palm in wrist local frame)
+    if apply_palm_offset:
+        palm_offset = getattr(arm_planner.config, "palm_offset_from_ee", None)
+        if palm_offset is not None:
+            offset_tensor = torch.tensor(palm_offset, device=device, dtype=wrist_pos_base.dtype)
+            # Transform offset from wrist local frame to base frame
+            offset_in_base = PoseUtils.quat_apply(wrist_quat_base, offset_tensor)
+            wrist_pos_base = wrist_pos_base + offset_in_base
+            print(f"[PALM OFFSET] Config offset (local): {palm_offset}")
+            print(f"[PALM OFFSET] Wrist quat: {wrist_quat_base.cpu().tolist()}")
+            print(f"[PALM OFFSET] Offset in BASE frame: {offset_in_base.cpu().tolist()}")
+            print(f"[PALM OFFSET] Wrist pos (base): {original_wrist_pos.cpu().tolist()} -> Palm pos: {wrist_pos_base.cpu().tolist()}")
+
     # Convert from robot base frame to world frame
     base_pos = robot_articulation.data.root_pos_w[env_id]
     base_quat = robot_articulation.data.root_quat_w[env_id]
-    link_pos_base = link_pose.position.squeeze().to(device=base_pos.device)
+    pos_rotated = PoseUtils.quat_apply(base_quat, wrist_pos_base)
+    final_pos = base_pos + pos_rotated
 
-    link_pos_rotated = PoseUtils.quat_apply(base_quat, link_pos_base)
-    return base_pos + link_pos_rotated
+    # Transform orientation from base frame to world frame
+    # quat_mul: q_world = q_base * q_wrist_in_base
+    final_quat = PoseUtils.quat_mul(base_quat, wrist_quat_base)
+
+    print(f"[PALM OFFSET] Final EE position (world): {final_pos.cpu().tolist()}")
+    print(f"[PALM OFFSET] Final EE orientation (world): {final_quat.cpu().tolist()}")
+    return final_pos, final_quat
+
+
+def get_ee_position_from_fk(
+    robot_articulation: Any,
+    arm_planner: Any,
+    env_id: int,
+    apply_palm_offset: bool = True,
+) -> torch.Tensor | None:
+    """Backward-compatible wrapper that returns only position."""
+    result = get_ee_pose_from_fk(robot_articulation, arm_planner, env_id, apply_palm_offset)
+    if result is None:
+        return None
+    return result[0]
 
 
 def interpolate_pose(p0: torch.Tensor, p1: torch.Tensor, alpha: float) -> torch.Tensor:

@@ -62,7 +62,24 @@ class CuroboPlannerCfg:
 
     # Attachment configuration
     attached_object_link_name: str = "attached_object"
-    """Name of the link used for attaching objects."""
+    """Name of the link used for attaching objects (CuRobo internal)."""
+
+    palm_link_name: str | None = None
+    """Palm link name for object attachment pose calculation (deprecated, use palm_offset_from_ee).
+
+    When set, this link is used to calculate where to place objects during
+    offline trajectory synthesis. This should be the palm/hand link where
+    the object is actually held, which may differ from the wrist ee_link.
+    If None, falls back to attached_object_link_name."""
+
+    palm_offset_from_ee: tuple[float, float, float] | None = None
+    """Offset from EE link (wrist) to palm/grasp center in EE local frame.
+
+    Since CuRobo's FK only computes up to the tool_link (wrist), we apply
+    this offset to get the palm/grasp position where objects are held.
+    Format: (x, y, z) in meters, in the EE link's local coordinate frame.
+    Typical values for humanoid hands: (0.0, 0.0, 0.08) to (0.0, 0.0, 0.12).
+    If None, no offset is applied (uses wrist position directly)."""
 
     # World configuration
     world_config_file: str = "collision_table.yml"
@@ -106,6 +123,18 @@ class CuroboPlannerCfg:
 
     retreat_distance: float = 0.05
     """Distance to retreat at the start of the plan."""
+
+    approach_direction: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    """Direction vector for approach/retreat in EE frame.
+
+    The approach pose is computed as: goal_pose * translate(approach_direction * approach_distance)
+    The retreat pose is computed as: current_pose * translate(approach_direction * retreat_distance)
+
+    Default (-Z) means approach from "behind" the target along the EE's forward axis.
+    For GR1T2 hands, -Z points from wrist toward fingers.
+
+    For mirrored arms (left/right), you can set arm-specific directions via separate configs.
+    """
 
     grasp_gripper_open_val: float = 0.04
     """Gripper joint value when considered open for grasp detection (parallel grippers)."""
