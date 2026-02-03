@@ -457,10 +457,12 @@ class CuroboPlanner(MotionPlannerBase):
         link_poses = {}
         if link_state.links_position is not None and link_state.links_quaternion is not None:
             for i, link in enumerate(link_state.link_names):
+                # cuRobo kinematics returns quaternions in (w, x, y, z) format
                 link_poses[link] = self._make_pose(
                     position=link_state.links_position[..., i, :],
                     quaternion=link_state.links_quaternion[..., i, :],
                     name=link,
+                    quat_is_xyzw=False,
                 )
 
         # For attached object link, use ee_link from robot config as parent
@@ -625,22 +627,23 @@ class CuroboPlanner(MotionPlannerBase):
             # Get current pose from Lab (may be on CPU or CUDA depending on --device flag)
             obj = rigid_objects[object_name]
             env_origin = self.env.scene.env_origins[self.env_id]
-            current_pos_raw = obj.data.root_pos_w[self.env_id] - env_origin
-            current_quat_raw = obj.data.root_quat_w[self.env_id]  # (w, x, y, z)
+            current_pos_raw = obj.data.root_link_pos_w[self.env_id] - env_origin
+            current_quat_raw = obj.data.root_link_quat_w[self.env_id]  # (x, y, z, w)
 
             # Convert to cuRobo device and extract float values for pose list
             current_pos = self._to_curobo_device(current_pos_raw)
             current_quat = self._to_curobo_device(current_quat_raw)
 
-            # Convert to cuRobo pose format [x, y, z, w, x, y, z]
+            # Convert to cuRobo pose format [pos_x, pos_y, pos_z, qw, qx, qy, qz]
+            # Isaac Lab quaternion format: (x, y, z, w) -> cuRobo format: (w, x, y, z)
             pose_list = [
                 float(current_pos[0].item()),
                 float(current_pos[1].item()),
                 float(current_pos[2].item()),
-                float(current_quat[0].item()),
-                float(current_quat[1].item()),
-                float(current_quat[2].item()),
-                float(current_quat[3].item()),
+                float(current_quat[3].item()),  # w
+                float(current_quat[0].item()),  # x
+                float(current_quat[1].item()),  # y
+                float(current_quat[2].item()),  # z
             ]
 
             # Update object pose in cuRobo's world model
@@ -997,41 +1000,53 @@ class CuroboPlanner(MotionPlannerBase):
         *,
         name: str | None = None,
         normalize_rotation: bool = False,
+        quat_is_xyzw: bool = True,
     ) -> Pose:
         """Create a cuRobo Pose with sensible defaults and device/dtype alignment.
 
         Auto-populates missing fields with identity values and ensures tensors are
-        on the cuRobo device with the correct dtype.
+        on the cuRobo device with the correct dtype. Handles quaternion format conversion
+        from Isaac Lab's (x, y, z, w) to cuRobo's (w, x, y, z) format when needed.
 
         Args:
             position: Optional position as Tensor/ndarray/list. Defaults to [0, 0, 0].
-            quaternion: Optional quaternion as Tensor/ndarray/list (w, x, y, z). Defaults to [1, 0, 0, 0].
+            quaternion: Optional quaternion as Tensor/ndarray/list. Defaults to identity quaternion.
             name: Optional name of the link that this pose represents.
             normalize_rotation: Whether to normalize the quaternion inside Pose.
+            quat_is_xyzw: If True, quaternion is in Isaac Lab format (x, y, z, w) and will be
+                converted to cuRobo format. If False, quaternion is already in cuRobo (w, x, y, z) format.
 
         Returns:
             Pose: A cuRobo Pose on the configured cuRobo device and dtype.
         """
-        # Defaults
+        # Defaults - identity quaternion in cuRobo's (w, x, y, z) format
         if position is None:
             position = torch.tensor([0.0, 0.0, 0.0], dtype=self.tensor_args.dtype, device=self.tensor_args.device)
         if quaternion is None:
-            quaternion = torch.tensor(
-                [0.0, 0.0, 0.0, 1.0], dtype=self.tensor_args.dtype, device=self.tensor_args.device
+            # Identity quaternion in cuRobo format (w, x, y, z)
+            quaternion_wxyz = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0], dtype=self.tensor_args.dtype, device=self.tensor_args.device
             )
+        else:
+            # Convert to tensor if needed
+            if not isinstance(quaternion, torch.Tensor):
+                quaternion = torch.tensor(quaternion, dtype=self.tensor_args.dtype, device=self.tensor_args.device)
+            else:
+                quaternion = self._to_curobo_device(quaternion)
 
-        # Convert to tensors if needed
+            # Convert from Isaac Lab (x, y, z, w) to cuRobo (w, x, y, z) if needed
+            if quat_is_xyzw:
+                quaternion_wxyz = torch.roll(quaternion, shifts=1, dims=-1)
+            else:
+                quaternion_wxyz = quaternion
+
+        # Convert position to tensor if needed
         if not isinstance(position, torch.Tensor):
             position = torch.tensor(position, dtype=self.tensor_args.dtype, device=self.tensor_args.device)
         else:
             position = self._to_curobo_device(position)
 
-        if not isinstance(quaternion, torch.Tensor):
-            quaternion = torch.tensor(quaternion, dtype=self.tensor_args.dtype, device=self.tensor_args.device)
-        else:
-            quaternion = self._to_curobo_device(quaternion)
-
-        return Pose(position=position, quaternion=quaternion, name=name, normalize_rotation=normalize_rotation)
+        return Pose(position=position, quaternion=quaternion_wxyz, name=name, normalize_rotation=normalize_rotation)
 
     def _set_active_links(self, links: list[str], active: bool) -> None:
         """Configure collision checking for specific robot links.
