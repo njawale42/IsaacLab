@@ -16,6 +16,10 @@ inputs:
   isaacsim-version:
     description: 'IsaacSim version'
     required: true
+  base-dockerfile-path:
+    description: 'Path to base Dockerfile (built first before the main dockerfile)'
+    default: 'docker/Dockerfile.base'
+    required: false
   dockerfile-path:
     description: 'Path to Dockerfile'
     default: 'docker/Dockerfile.curobo'
@@ -41,38 +45,45 @@ runs:
           echo "This is normal for PRs from forks or when secrets are not configured"
         fi
 
-    - name: Build Docker Image
+    - name: Build Base Docker Image
       shell: sh
       run: |
-        # Function to build Docker image
-        build_docker_image() {
-          local image_tag="$1"
-          local isaacsim_base_image="$2"
-          local isaacsim_version="$3"
-          local dockerfile_path="$4"
-          local context_path="$5"
+        # Build the base Isaac Lab image first
+        # This is required because Dockerfile.curobo extends from isaac-lab-base
+        echo "Building base Docker image: isaac-lab-base"
+        echo "Using Dockerfile: ${{ inputs.base-dockerfile-path }}"
+        echo "Build context: ${{ inputs.context-path }}"
 
-          echo "Building Docker image: $image_tag"
-          echo "Using Dockerfile: $dockerfile_path"
-          echo "Build context: $context_path"
+        docker buildx build --progress=plain --platform linux/amd64 \
+          -t isaac-lab-base \
+          --build-arg ISAACSIM_BASE_IMAGE_ARG="${{ inputs.isaacsim-base-image }}" \
+          --build-arg ISAACSIM_VERSION_ARG="${{ inputs.isaacsim-version }}" \
+          --build-arg ISAACSIM_ROOT_PATH_ARG=/isaac-sim \
+          --build-arg ISAACLAB_PATH_ARG=/workspace/isaaclab \
+          --build-arg DOCKER_USER_HOME_ARG=/root \
+          --cache-from type=gha,scope=base \
+          --cache-to type=gha,mode=max,scope=base \
+          -f ${{ inputs.base-dockerfile-path }} \
+          --load ${{ inputs.context-path }}
 
-          # Build Docker image
-          docker buildx build --progress=plain --platform linux/amd64 \
-            -t isaac-lab-dev \
-            -t $image_tag \
-            --build-arg ISAACSIM_BASE_IMAGE_ARG="$isaacsim_base_image" \
-            --build-arg ISAACSIM_VERSION_ARG="$isaacsim_version" \
-            --build-arg ISAACSIM_ROOT_PATH_ARG=/isaac-sim \
-            --build-arg ISAACLAB_PATH_ARG=/workspace/isaaclab \
-            --build-arg DOCKER_USER_HOME_ARG=/root \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
-            -f $dockerfile_path \
-            --load $context_path
+        echo "Base Docker image built successfully: isaac-lab-base"
 
-          echo "✅ Docker image built successfully: $image_tag"
-          docker images | grep isaac-lab-dev
-        }
+    - name: Build cuRobo Docker Image
+      shell: sh
+      run: |
+        # Build the cuRobo image on top of the base image
+        echo "Building Docker image: ${{ inputs.image-tag }}"
+        echo "Using Dockerfile: ${{ inputs.dockerfile-path }}"
+        echo "Build context: ${{ inputs.context-path }}"
 
-        # Call the function with provided parameters
-        build_docker_image "${{ inputs.image-tag }}" "${{ inputs.isaacsim-base-image }}" "${{ inputs.isaacsim-version }}" "${{ inputs.dockerfile-path }}" "${{ inputs.context-path }}"
+        docker buildx build --progress=plain --platform linux/amd64 \
+          -t isaac-lab-dev \
+          -t ${{ inputs.image-tag }} \
+          --build-arg DOCKER_NAME_SUFFIX="" \
+          --cache-from type=gha,scope=curobo \
+          --cache-to type=gha,mode=max,scope=curobo \
+          -f ${{ inputs.dockerfile-path }} \
+          --load ${{ inputs.context-path }}
+
+        echo "✅ Docker image built successfully: ${{ inputs.image-tag }}"
+        docker images | grep isaac-lab
