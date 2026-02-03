@@ -136,6 +136,27 @@ services:
     stdin_open: true
     tty: true
 
+  # This service adds cuRobo motion planning
+  # support on top of the base image
+  isaac-lab-curobo:
+    profiles: [ "curobo" ]
+    env_file:
+      - .env.base
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.curobo
+      args:
+        - DOCKER_NAME_SUFFIX=${DOCKER_NAME_SUFFIX-}
+    image: isaac-lab-curobo${DOCKER_NAME_SUFFIX-}
+    container_name: isaac-lab-curobo${DOCKER_NAME_SUFFIX-}
+    environment: *default-isaac-lab-environment
+    volumes: *default-isaac-lab-volumes
+    network_mode: host
+    deploy: *default-isaac-lab-deploy
+    entrypoint: bash
+    stdin_open: true
+    tty: true
+
 volumes:
   # isaac-sim
   isaac-cache-kit:
