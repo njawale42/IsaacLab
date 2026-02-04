@@ -3339,11 +3339,11 @@ class DataGeneratorScheduled:
                         change_points.append((i, delta, g_actions[i - 1].tolist(), g_actions[i].tolist()))
                 
                 if change_points:
-                    print("    Gripper change points:")
+                    print("Gripper change points:")
                     for idx, delta, before, after in change_points:
                         pos = arm_path.poses[idx][:3, 3].tolist()
-                        print(f"      waypoint {idx}: delta={delta:.3f}, {before} → {after}")
-                        print(f"        EE pos: {[f'{p:.3f}' for p in pos]}")
+                        print(f"waypoint {idx}: delta={delta:.3f}, {before} → {after}")
+                        print(f"EE pos: {[f'{p:.3f}' for p in pos]}")
                 else:
                     print("    No significant gripper changes found in trajectory")
             print()
@@ -3372,17 +3372,17 @@ class DataGeneratorScheduled:
                         left_pose = arm_paths["left"].poses[left_idx]
                         right_pose = arm_paths["right"].poses[right_idx]
                         print(f"[DEBUG] Tick {tick}: Gripper TRAJECTORY change! L_delta={delta_left:.3f} R_delta={delta_right:.3f}")
-                        print(f"        L_idx={left_idx}, R_idx={right_idx}")
-                        print(f"        L_gripper: {prev_gripper_left.tolist()} → {g_left.tolist()}")
-                        print(f"        R_gripper: {prev_gripper_right.tolist()} → {g_right.tolist()}")
-                        print(f"        L_pos={left_pose[:3,3].tolist()}, R_pos={right_pose[:3,3].tolist()}")
+                        print(f"L_idx={left_idx}, R_idx={right_idx}")
+                        print(f"L_gripper: {prev_gripper_left.tolist()} → {g_left.tolist()}")
+                        print(f"R_gripper: {prev_gripper_right.tolist()} → {g_right.tolist()}")
+                        print(f"L_pos={left_pose[:3,3].tolist()}, R_pos={right_pose[:3,3].tolist()}")
                         # Also show gripper values at surrounding waypoints
                         if left_idx > 0:
                             g_left_prev = arm_paths["left"].gripper_actions[left_idx - 1]
-                            print(f"        L_gripper[{left_idx-1}]={g_left_prev.tolist()}")
+                            print(f"L_gripper[{left_idx-1}]={g_left_prev.tolist()}")
                         if left_idx + 1 < len(arm_paths["left"].gripper_actions):
                             g_left_next = arm_paths["left"].gripper_actions[left_idx + 1]
-                            print(f"        L_gripper[{left_idx+1}]={g_left_next.tolist()}")
+                            print(f"L_gripper[{left_idx+1}]={g_left_next.tolist()}")
                 prev_gripper_left = g_left.clone()
                 prev_gripper_right = g_right.clone()
 
