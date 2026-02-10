@@ -6,6 +6,7 @@
 import os
 import tempfile
 import yaml
+from typing import Literal
 
 from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.geom.types import WorldConfig
@@ -115,6 +116,10 @@ class CuroboPlannerCfg:
     trajopt_tsteps: int = 32
     """Number of trajectory optimization time steps."""
 
+    maximum_trajectory_dt: float | None = None
+    """Max time step (s) between waypoints. None uses cuRobo default (0.15).
+    Increase (e.g. 0.2, 0.3) if you get MotionGenStatus.DT_EXCEPTION (dt exceeded maximum)."""
+
     collision_activation_distance: float = 0.0
     """Distance at which collision constraints are activated."""
 
@@ -124,16 +129,26 @@ class CuroboPlannerCfg:
     retreat_distance: float = 0.05
     """Distance to retreat at the start of the plan."""
 
+    approach_retreat_frame: Literal["world", "eef"] = "eef"
+    """Frame for approach_direction and approach/retreat distances.
+
+    - 'eef': direction and translation are in end-effector frame (pose * translate).
+    - 'world': direction is in world frame; Z is world up/down. Translation applied in world.
+    """
+
     approach_direction: tuple[float, float, float] = (0.0, 0.0, -1.0)
-    """Direction vector for approach/retreat in EE frame.
+    """Direction vector for approach/retreat. Interpretation depends on approach_retreat_frame.
 
-    The approach pose is computed as: goal_pose * translate(approach_direction * approach_distance)
-    The retreat pose is computed as: current_pose * translate(approach_direction * retreat_distance)
+    When approach_retreat_frame is 'eef':
+      approach_pose = goal_pose * translate(approach_direction * approach_distance)
+      retreat_pose = current_pose * translate(approach_direction * retreat_distance)
+    Default (-Z) is along EE forward (e.g. wrist to fingers for GR1T2).
 
-    Default (-Z) means approach from "behind" the target along the EE's forward axis.
-    For GR1T2 hands, -Z points from wrist toward fingers.
-
-    For mirrored arms (left/right), you can set arm-specific directions via separate configs.
+    When approach_retreat_frame is 'world':
+      Same semantic as EEF: (0, 0, -1) = retreat up, approach from above (negated so world Z
+      matches Franka behavior). retreat_pose.position = ee_pose.position - approach_direction * retreat_distance;
+      approach_pose.position = goal_pose.position - approach_direction * approach_distance.
+    E.g. (0, 0, -1) in world = retreat +Z (up), approach from above.
     """
 
     grasp_gripper_open_val: float = 0.04

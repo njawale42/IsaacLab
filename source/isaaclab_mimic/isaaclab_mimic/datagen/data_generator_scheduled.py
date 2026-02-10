@@ -39,7 +39,7 @@ from isaaclab_mimic.datagen.offline_scheduling_helpers import (
     resolve_eef_name_from_planner,
     transform_base_to_world,
 )
-from isaaclab_mimic.datagen.scheduling import ArmPath, DiscreteSchedule, build_collision_aware_schedule
+from isaaclab_mimic.datagen.scheduling import ArmPath, DiscreteSchedule, HoldConstraint, build_collision_aware_schedule
 from isaaclab_mimic.datagen.selection_strategy import make_selection_strategy
 from isaaclab_mimic.datagen.waypoint import MultiWaypoint, Waypoint, WaypointSequence, WaypointTrajectory
 
@@ -1457,26 +1457,26 @@ class DataGeneratorScheduled:
 
         task_constraint = runtime_constraints[subtask_key]
         constraint_type = task_constraint.get("type")
-        print(f"[Constraints] {eef_name} subtask {subtask_index}: type={constraint_type}")
+        # print(f"[Constraints] {eef_name} subtask {subtask_index}: type={constraint_type}")
 
         # Check if this is the "latter" part of a SEQUENTIAL constraint
         if constraint_type == SubTaskConstraintType._SEQUENTIAL_LATTER:
             fulfilled = task_constraint.get("fulfilled", False)
-            pre_cond_eef = task_constraint.get("pre_condition_task_spec_key")
-            pre_cond_idx = task_constraint.get("pre_condition_subtask_ind")
+            # pre_cond_eef = task_constraint.get("pre_condition_task_spec_key")
+            # pre_cond_idx = task_constraint.get("pre_condition_subtask_ind")
             # Check FORMER's current state
-            if pre_cond_eef in eef_states:
-                former_state = eef_states[pre_cond_eef]
-                print(f"[Constraints] FORMER {pre_cond_eef} subtask {pre_cond_idx}: "
-                      f"current_idx={former_state.current_subtask_index}, done={former_state.subtasks_done}")
+            # if pre_cond_eef in eef_states:
+            #     former_state = eef_states[pre_cond_eef]
+                # print(f"[Constraints] FORMER {pre_cond_eef} subtask {pre_cond_idx}: "
+                #       f"current_idx={former_state.current_subtask_index}, done={former_state.subtasks_done}")
             
             if not fulfilled:
-                print(f"[Constraints] BLOCKING {eef_name} subtask {subtask_index} - "
-                      f"waiting for FORMER {pre_cond_eef}[{pre_cond_idx}] to complete (fulfilled={fulfilled})")
+                # print(f"[Constraints] BLOCKING {eef_name} subtask {subtask_index} - "
+                #       f"waiting for FORMER {pre_cond_eef}[{pre_cond_idx}] to complete (fulfilled={fulfilled})")
                 return True
-            else:
-                print(f"[Constraints] UNBLOCKING {eef_name} subtask {subtask_index} - "
-                      f"FORMER {pre_cond_eef}[{pre_cond_idx}] completed")
+            # else:
+                # print(f"[Constraints] UNBLOCKING {eef_name} subtask {subtask_index} - "
+                #       f"FORMER {pre_cond_eef}[{pre_cond_idx}] completed")
 
         return False
 
@@ -1842,7 +1842,8 @@ class DataGeneratorScheduled:
             self._goal_visualizers[key] = VisualizationMarkers(marker_cfg)
         return self._goal_visualizers[key]
 
-    # ==================== Offline Scheduling Methods ====================
+# ====================================================================================
+# ========================= Offline Scheduling Methods ===============================
 
     async def _generate_with_offline_scheduling(
         self,
@@ -1889,9 +1890,10 @@ class DataGeneratorScheduled:
             # Early failure (e.g., motion planning failed)
             return build_result
 
-        initial_state, arm_paths = build_result
+        initial_state, arm_paths, hold_constraints = build_result
 
         # Stage 2: Build collision-aware schedule
+        # Have to add try except or else I cannot see the logs without setting verbose which is annoying
         try:
             schedule = build_collision_aware_schedule(
                 arm_right=arm_paths["right"],
@@ -1903,6 +1905,7 @@ class DataGeneratorScheduled:
                 pair_batch=int(getattr(self.env_cfg.datagen_config, "schedule_pair_batch", 4096)),
                 collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
                 min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
+                hold_constraints=hold_constraints,
             )
         except Exception as e:
             print(f"Scheduling failed: {e}")
@@ -1960,7 +1963,7 @@ class DataGeneratorScheduled:
         env_reset_queue: asyncio.Queue | None,
         pause_subtask: bool,
         motion_planner: Any | None,
-    ) -> tuple[dict, dict[str, ArmPath]] | dict:
+    ) -> tuple[dict, dict[str, ArmPath], list[HoldConstraint]] | dict:
         """
         Run the generator state machine to collect all waypoints and joint positions
         without stepping the simulator.
@@ -2032,7 +2035,7 @@ class DataGeneratorScheduled:
                         continue
 
                     # Check if SEQUENTIAL constraint blocks this subtask's trajectory generation.
-                    # For offline path building, we must NOT generate the trajectory until the
+                    # For offline path building, we must not generate the trajectory until the
                     # constraining subtask completes - otherwise we read wrong object positions.
                     is_blocked = self._is_blocked_by_sequential_constraint(
                         eef_name=eef_name,
@@ -2041,7 +2044,7 @@ class DataGeneratorScheduled:
                         eef_states=eef_states,
                     )
                     if is_blocked:
-                        print(f"[Offline Build] SKIPPING {eef_name} subtask {eef_state.current_subtask_index} - blocked by SEQUENTIAL")
+                        # print(f"[Offline Build] SKIPPING {eef_name} subtask {eef_state.current_subtask_index} - blocked by SEQUENTIAL")
                         continue
                     print(f"[Offline Build] GENERATING trajectory for {eef_name} subtask {eef_state.current_subtask_index}")
 
@@ -2104,7 +2107,7 @@ class DataGeneratorScheduled:
                             eef_state.subtask_started = True
                             continue
 
-                    # Non-SkillGen or no motion plan needed
+                    # Non SkillGen or no motion plan needed
                     eef_state.current_trajectory = self.merge_eef_subtask_trajectory(
                         env_id=env_id,
                         eef_name=eef_name,
@@ -2135,6 +2138,7 @@ class DataGeneratorScheduled:
                 waypoint_logs[eef_name].append({
                     "waypoint": deepcopy(waypoint),
                     "joint": joint_vec.clone() if joint_vec is not None else None,
+                    "subtask_index": eef_state.current_subtask_index,
                 })
 
             # Track which subtasks are about to complete (for world state updates)
@@ -2176,13 +2180,13 @@ class DataGeneratorScheduled:
 
         # Inject hold waypoints for SEQUENTIAL constraints
         # The LATTER arm must wait at the start of its trajectory for sequential_min_time_diff
-        arm_paths = self._inject_sequential_hold_waypoints(
+        arm_paths, hold_constraints = self._inject_sequential_hold_waypoints(
             arm_paths=arm_paths,
             runtime_constraints=runtime_subtask_constraints,
             step_dt=self.env.step_dt,
         )
 
-        return initial_state, arm_paths
+        return initial_state, arm_paths, hold_constraints
 
     def _plan_motion_offline(
         self,
@@ -2402,44 +2406,6 @@ class DataGeneratorScheduled:
 
         return planning_success
 
-    def _preemptively_attach_object_after_grasp_mp(
-        self,
-        env_id: int,
-        eef_name: str,
-        subtask_index: int,
-        arm_planner: Any,
-        runtime_constraints: dict | None = None,
-    ) -> None:
-        """
-        After MP planning for a grasp subtask, preemptively move the target object
-        to the EE position to simulate grasping. This prevents collision when the
-        other arm plans.
-
-        IMPORTANT: If this arm/subtask is the FORMER in a SEQUENTIAL constraint,
-        we should NOT update the object pose. The LATTER arm (which executes first
-        at runtime) needs to plan with the ORIGINAL object position since the object
-        won't have been moved yet when the LATTER arm executes.
-        """
-        # Check if this is the FORMER in a SEQUENTIAL constraint
-        if runtime_constraints is not None:
-            subtask_key = (eef_name, subtask_index)
-            if subtask_key in runtime_constraints:
-                constraint = runtime_constraints[subtask_key]
-                if constraint.get("type") == SubTaskConstraintType._SEQUENTIAL_FORMER:
-                    # This arm is FORMER - the LATTER arm executes first at runtime
-                    # Don't update object pose since LATTER needs original position
-                    print(f"[Offline] Skipping object pose update for {eef_name} subtask {subtask_index} "
-                          f"- FORMER in SEQUENTIAL constraint (LATTER executes first at runtime)")
-                    return
-
-        subtask_cfg = self._get_subtask_config(eef_name, subtask_index)
-        if subtask_cfg is None or not is_grasp_subtask(subtask_cfg):
-            return
-
-        object_ref = get_subtask_object_ref(subtask_cfg)
-        if object_ref:
-            self._move_object_to_ee_for_offline(env_id, object_ref, arm_planner)
-
     def _get_subtask_config(self, eef_name: str, subtask_index: int) -> Any | None:
         """Get subtask configuration for the given EEF and index."""
         if eef_name not in self.env_cfg.subtask_configs:
@@ -2482,6 +2448,9 @@ class DataGeneratorScheduled:
             if eef_state.subtask_step_index is None:
                 continue
 
+            # Cache arm planner for this EEF (used for IK and joint merging)
+            arm_planner = self._get_arm_planner(motion_planner, eef_name) if motion_planner else None
+
             is_paused = self._apply_constraint_progression_rules(
                 eef_name=eef_name,
                 eef_state=eef_state,
@@ -2514,9 +2483,8 @@ class DataGeneratorScheduled:
             if joint_vec is None and waypoint.joint_seed is not None:
                 joint_vec = waypoint.joint_seed
 
-            if joint_vec is None and motion_planner is not None:
+            if joint_vec is None and arm_planner is not None:
                 # Solve IK for this waypoint
-                arm_planner = self._get_arm_planner(motion_planner, eef_name)
                 joint_vec = self._solve_ik_for_waypoint(
                     waypoint.pose,
                     arm_planner,
@@ -2526,8 +2494,7 @@ class DataGeneratorScheduled:
             if joint_vec is not None:
                 eef_state.last_commanded_joint_position = joint_vec.clone()
                 # Merge this arm's joints into the global state for consistency
-                if motion_planner is not None:
-                    arm_planner = self._get_arm_planner(motion_planner, eef_name)
+                if arm_planner is not None:
                     global_robot_joint_state = self._merge_arm_joints_to_global(
                         global_state=global_robot_joint_state,
                         arm_joints=joint_vec,
@@ -2567,14 +2534,9 @@ class DataGeneratorScheduled:
             planner_device = planner.motion_gen.tensor_args.device
 
         # Convert pose to planner frame, ensuring correct device
-        pose_bt = self._convert_world_pose_to_planner_frame(pose, env_id=0)
-        pose_bt = pose_bt.to(device=planner_device, dtype=torch.float32)
+        pose_bt = self._convert_world_pose_to_planner_frame(pose, env_id=0).to(device=planner_device, dtype=torch.float32)
         pos_bt, rot_bt = PoseUtils.unmake_pose(pose_bt.unsqueeze(0))
         quat_bt = PoseUtils.quat_from_matrix(rot_bt)[0]
-
-        # Ensure position and quaternion are on planner device
-        pos_bt = pos_bt.to(device=planner_device, dtype=torch.float32)
-        quat_bt = quat_bt.to(device=planner_device, dtype=torch.float32)
 
         pose_obj = planner._make_pose(position=pos_bt[0], quaternion=quat_bt)
 
@@ -2585,23 +2547,11 @@ class DataGeneratorScheduled:
             retract_config = seed_vec.reshape(1, -1)
             seed_config = seed_vec.reshape(1, 1, -1)
 
-        try:
-            ik_result = planner.motion_gen.ik_solver.solve_single(
-                pose_obj,
-                retract_config=retract_config,
-                seed_config=seed_config,
-            )
-        except AttributeError:
-            try:
-                ik_result = planner.motion_gen.ik_solver.solve(
-                    pose_obj,
-                    retract_config=retract_config,
-                    seed_config=seed_config,
-                )
-            except Exception:
-                return seed_joint
-        except Exception:
-            return seed_joint
+        ik_result = planner.motion_gen.ik_solver.solve_single(
+            pose_obj,
+            retract_config=retract_config,
+            seed_config=seed_config,
+        )
 
         js_solution = getattr(ik_result, "js_solution", None)
         if js_solution is not None:
@@ -2860,6 +2810,23 @@ class DataGeneratorScheduled:
             poses = torch.stack([e["waypoint"].pose.clone() for e in entries], dim=0)
             gripper_actions = torch.stack([e["waypoint"].gripper_action.clone() for e in entries], dim=0)
 
+            # Compute subtask boundaries: subtask_index -> (start_idx, end_idx)
+            # Each subtask includes both MP transition and skill waypoints.
+            subtask_boundaries: dict[int, tuple[int, int]] = {}
+            current_subtask: int | None = None
+            subtask_start = 0
+            for i, entry in enumerate(entries):
+                si = entry.get("subtask_index")
+                if si != current_subtask:
+                    if current_subtask is not None:
+                        subtask_boundaries[current_subtask] = (subtask_start, i)
+                    current_subtask = si
+                    subtask_start = i
+            if current_subtask is not None:
+                subtask_boundaries[current_subtask] = (subtask_start, len(entries))
+
+            print(f"[ArmPath] {eef_name} subtask boundaries (MP+skill): {subtask_boundaries}")
+
             # Apply gripper delay and interpolation if configured
             gripper_interp_steps = int(getattr(self.env_cfg.datagen_config, "skill_gripper_interp_steps", 20))
             if gripper_delay_steps > 0 or gripper_interp_steps > 0:
@@ -2884,6 +2851,7 @@ class DataGeneratorScheduled:
                 poses=poses,
                 gripper_actions=gripper_actions,
                 joint_positions=joint_positions,
+                subtask_boundaries=subtask_boundaries,
             )
 
         if "left" not in arm_paths or "right" not in arm_paths:
@@ -2897,98 +2865,132 @@ class DataGeneratorScheduled:
         arm_paths: dict[str, ArmPath],
         runtime_constraints: dict,
         step_dt: float,
-    ) -> dict[str, ArmPath]:
+    ) -> tuple[dict[str, ArmPath], list[HoldConstraint]]:
         """
         Inject hold waypoints into LATTER arm's trajectory to match online SEQUENTIAL behavior.
-        
-        In online mode, the LATTER arm:
-        1. Executes normally until (traj_len - min_time_diff)
-        2. HOLDS at that position until FORMER completes
-        3. Then finishes the last min_time_diff waypoints
-        
-        For offline scheduling, we insert hold waypoints at the hold position to create
-        a pause in the trajectory that allows FORMER to catch up.
-        
+
+        In online mode, the LATTER arm holds within its *constrained subtask*:
+          hold when step_index >= subtask_traj_len - min_time_diff
+
+        The offline code must replicate this by computing hold_idx relative to the
+        constrained subtask's boundaries (MP + skill) within the concatenated trajectory,
+        NOT relative to the full trajectory length.
+
         Args:
-            arm_paths: Dict of arm name -> ArmPath.
+            arm_paths: Dict of arm name -> ArmPath (with subtask_boundaries populated).
             runtime_constraints: Runtime constraint dictionary.
             step_dt: Time step for discretization.
-            
+
         Returns:
-            Modified arm_paths with hold waypoints injected at the correct position.
+            Tuple of (modified arm_paths, list of HoldConstraints for scheduler).
         """
+        hold_constraints: list[HoldConstraint] = []
+
         for subtask_key, constraint in runtime_constraints.items():
             if constraint.get("type") != SubTaskConstraintType._SEQUENTIAL_LATTER:
                 continue
-            
-            latter_eef, _ = subtask_key
+
+            latter_eef, latter_subtask_idx = subtask_key
             former_eef = constraint.get("pre_condition_task_spec_key")
+            former_subtask_idx = constraint.get("pre_condition_subtask_ind")
             min_time_diff = constraint.get("min_time_diff", 0)
-            
+
             if min_time_diff <= 0:
-                # -1 means "wait until former completes" - handled by blocking during trajectory generation
-                # 0 means no hold needed
                 continue
-            
+
             if latter_eef not in arm_paths or former_eef not in arm_paths:
                 continue
-            
+
             latter_path = arm_paths[latter_eef]
             former_path = arm_paths[former_eef]
             latter_len = latter_path.joint_positions.shape[0]
-            former_len = former_path.joint_positions.shape[0]
-            
-            # Online behavior: LATTER holds when step_index >= traj_len - min_time_diff
-            # The hold position is at waypoint (traj_len - min_time_diff)
-            hold_idx = max(0, latter_len - min_time_diff)
-            
-            # Calculate how many hold waypoints we need:
-            # FORMER needs to complete, then LATTER can finish its last min_time_diff waypoints
-            # If FORMER is longer than LATTER's pre-hold portion, we need to wait
+
+            # FORMER length: use FORMER subtask's end boundary (MP+skill), not full trajectory.
+            # Online, hold releases when that specific FORMER subtask completes.
+            former_boundaries = former_path.subtask_boundaries
+            if former_boundaries is not None and former_subtask_idx in former_boundaries:
+                _, former_subtask_end = former_boundaries[former_subtask_idx]
+                former_len = former_subtask_end
+            else:
+                former_len = former_path.joint_positions.shape[0]
+                print(f"[Sequential Hold] WARNING: No subtask boundary for FORMER {former_eef} "
+                      f"subtask {former_subtask_idx}, using full trajectory length {former_len}")
+
+            # LATTER: look up the constrained subtask's boundaries (MP+skill)
+            latter_boundaries = latter_path.subtask_boundaries
+            if latter_boundaries is None or latter_subtask_idx not in latter_boundaries:
+                print(f"[Sequential Hold] WARNING: No subtask boundary for {latter_eef} "
+                      f"subtask {latter_subtask_idx}, falling back to full trajectory")
+                subtask_start = 0
+                subtask_end = latter_len
+            else:
+                subtask_start, subtask_end = latter_boundaries[latter_subtask_idx]
+
+            subtask_len = subtask_end - subtask_start
+
+            # Online behavior: hold when step_index >= subtask_traj_len - min_time_diff
+            # hold_idx is in the concatenated trajectory space
+            hold_idx = subtask_start + max(0, subtask_len - min_time_diff)
+
+            # How many hold waypoints: FORMER subtask must complete, then LATTER resumes.
+            # Both arms start at time 0, so hold count = former_len - hold_idx.
             n_hold = max(0, former_len - hold_idx)
-            
+
             if n_hold <= 0:
-                print(f"[Sequential Hold] No hold needed for {latter_eef} (FORMER completes in time)")
+                print(f"[Sequential Hold] No hold needed for {latter_eef} subtask {latter_subtask_idx} "
+                      f"(FORMER completes in time)")
                 continue
-            
-            print(f"[Sequential Hold] {latter_eef}: hold at waypoint {hold_idx} for {n_hold} steps")
-            print(f"  FORMER {former_eef} length: {former_len}, LATTER pre-hold: {hold_idx}")
-            
+
+            print(f"[Sequential Hold] {latter_eef} subtask {latter_subtask_idx}: "
+                  f"subtask range [{subtask_start}:{subtask_end}] (len={subtask_len}), "
+                  f"hold at global idx {hold_idx} for {n_hold} steps")
+            print(f"  FORMER {former_eef} subtask {former_subtask_idx} ends at idx {former_len}, "
+                  f"LATTER subtask pre-hold: {hold_idx - subtask_start}, "
+                  f"LATTER subtask post-hold: {subtask_end - hold_idx}")
+
             # Get the waypoint to hold at
             hold_pose = latter_path.poses[hold_idx:hold_idx + 1]
             hold_gripper = latter_path.gripper_actions[hold_idx:hold_idx + 1]
             hold_joint = latter_path.joint_positions[hold_idx:hold_idx + 1]
-            
+
             # Create hold waypoints
             hold_poses = hold_pose.repeat(n_hold, 1, 1)
             hold_gripper_actions = hold_gripper.repeat(n_hold, 1)
             hold_joints = hold_joint.repeat(n_hold, 1)
-            
+
             # Split trajectory at hold position and insert hold waypoints
             # [0...hold_idx-1] + [hold_idx repeated n_hold times] + [hold_idx...end]
-            pre_hold_poses = latter_path.poses[:hold_idx]
-            post_hold_poses = latter_path.poses[hold_idx:]
-            new_poses = torch.cat([pre_hold_poses, hold_poses, post_hold_poses], dim=0)
-            
-            pre_hold_gripper = latter_path.gripper_actions[:hold_idx]
-            post_hold_gripper = latter_path.gripper_actions[hold_idx:]
-            new_gripper = torch.cat([pre_hold_gripper, hold_gripper_actions, post_hold_gripper], dim=0)
-            
-            pre_hold_joints = latter_path.joint_positions[:hold_idx]
-            post_hold_joints = latter_path.joint_positions[hold_idx:]
-            new_joints = torch.cat([pre_hold_joints, hold_joints, post_hold_joints], dim=0)
-            
+            new_poses = torch.cat([
+                latter_path.poses[:hold_idx], hold_poses, latter_path.poses[hold_idx:]
+            ], dim=0)
+            new_gripper = torch.cat([
+                latter_path.gripper_actions[:hold_idx], hold_gripper_actions, latter_path.gripper_actions[hold_idx:]
+            ], dim=0)
+            new_joints = torch.cat([
+                latter_path.joint_positions[:hold_idx], hold_joints, latter_path.joint_positions[hold_idx:]
+            ], dim=0)
+
             arm_paths[latter_eef] = ArmPath(
                 name=latter_path.name,
                 poses=new_poses,
                 gripper_actions=new_gripper,
                 joint_positions=new_joints,
             )
-            
+
             print(f"[Sequential Hold] {latter_eef} trajectory: {latter_len} -> {new_joints.shape[0]} waypoints")
-            print(f"  Structure: [{hold_idx} pre-hold] + [{n_hold} hold] + [{latter_len - hold_idx} post-hold]")
+            print(f"  Structure: [{hold_idx} pre-hold] + [{n_hold} hold] + "
+                  f"[{latter_len - hold_idx} post-hold]")
+
+            # Create hold constraint for the scheduler
+            hold_constraints.append(HoldConstraint(
+                holding_arm=latter_eef,
+                other_arm=former_eef,
+                hold_start_idx=hold_idx,
+                hold_duration=n_hold,
+                other_arm_len=former_len,
+            ))
         
-        return arm_paths
+        return arm_paths, hold_constraints
 
     def _extract_joint_history_from_logs(
         self,

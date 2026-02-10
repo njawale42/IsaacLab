@@ -27,6 +27,32 @@ class ArmPath:
     poses: torch.Tensor
     gripper_actions: torch.Tensor
     joint_positions: torch.Tensor
+    subtask_boundaries: dict[int, tuple[int, int]] | None = None
+    """Maps subtask_index -> (start_idx, end_idx) within the concatenated trajectory.
+    Includes both MP transition and skill waypoints for each subtask."""
+
+
+@dataclass
+class HoldConstraint:
+    """
+    Describes a sequential hold constraint for one arm.
+    
+    The holding arm must wait at `hold_start_idx` until the other arm
+    completes at least `wait_for_steps` waypoints, then continues.
+    
+    Attributes:
+        holding_arm: Name of the arm that holds ("left" or "right").
+        other_arm: Name of the arm being waited on.
+        hold_start_idx: Waypoint index where hold begins (pre-hold length).
+        hold_duration: Number of hold waypoints inserted.
+        other_arm_len: Total length of the other arm's trajectory.
+    """
+    
+    holding_arm: str
+    other_arm: str
+    hold_start_idx: int
+    hold_duration: int
+    other_arm_len: int
 
 
 @dataclass
@@ -486,15 +512,15 @@ def _retime(
     print(f"[Retime] Right indices range: [{min(r_indices)}, {max(r_indices)}]")
     print(f"[Retime] Left indices range: [{min(l_indices)}, {max(l_indices)}]")
     
-    # First try with all pairs (buffer=0 per plan_humanoid_both_arms.py)
-    # synchronize=False allows different trajectory lengths (e.g., with hold waypoints)
+    # First try with all pairs
+    # synchronize=False allows different trajectory lengths
     try:
         result = retime_paths(
             path_r, path_l,
             colliding=pairs_ij,
             linear=True,
             min_dt=min_dt,
-            buffer=0.01,
+            buffer=0.03,
             synchronize=False,
             verbose=True,
             max_time=10.0,
@@ -513,14 +539,13 @@ def _retime(
             colliding=reduced,
             linear=True,
             min_dt=min_dt,
-            buffer=0.03,
+            buffer=0.01,
             synchronize=False,
             verbose=True,
             max_time=15.0,
         )
         if result is not None:
             return result
-        print("[Retime] Smart reduction failed, trying with buffer...")
     except (TypeError, AssertionError, Exception) as e:
         print(f"[Retime] Smart reduction error: {e}")
 
@@ -531,7 +556,7 @@ def _retime(
             colliding=reduced,
             linear=True,
             min_dt=min_dt * 0.5,
-            buffer=0.05,
+            buffer=0.01,
             synchronize=False,
             verbose=True,
             max_time=20.0,
@@ -599,6 +624,103 @@ def _discretize(
     return idx
 
 
+def _apply_hold_constraint_timing(
+    hold: HoldConstraint,
+    len_r: int,
+    len_l: int,
+    base_dt: float,
+) -> tuple[list[float], list[float]]:
+    """
+    Compute timing that respects a sequential hold constraint.
+    
+    Online behavior (which we replicate):
+    1. Both arms START simultaneously at time 0
+    2. LATTER plays waypoints 0 to (hold_start_idx - 1) at normal speed
+    3. When LATTER reaches hold_start_idx, it HOLDS until FORMER completes
+    4. Then LATTER finishes remaining waypoints (post-hold)
+    
+    The hold waypoints represent the time LATTER stays in place while FORMER catches up.
+    
+    Returns (times_r, times_l) with proper hold timing.
+    """
+    hold_end_idx = hold.hold_start_idx + hold.hold_duration
+    post_hold_count = len_r - hold_end_idx if hold.holding_arm == "right" else len_l - hold_end_idx
+    
+    # FORMER end time
+    former_end_time = (hold.other_arm_len - 1) * base_dt
+    
+    print(f"[Hold Timing] LATTER ({hold.holding_arm}) holds at idx {hold.hold_start_idx}, FORMER ends at {former_end_time:.2f}s")
+    print(f"[Hold Timing] hold_duration: {hold.hold_duration}, post_hold_count: {post_hold_count}")
+    
+    if hold.holding_arm == "right":
+        # Left (FORMER) plays continuously from time 0
+        times_l = [i * base_dt for i in range(len_l)]
+        
+        times_r = []
+        
+        # Pre-hold (0 to hold_start_idx-1): Right plays at normal speed, starting at time 0
+        for i in range(hold.hold_start_idx):
+            times_r.append(i * base_dt)
+        
+        # Right reaches hold position at this time:
+        pre_hold_end_time = hold.hold_start_idx * base_dt
+        
+        # Hold phase: Right stays at hold_start_idx until left completes
+        # The hold waypoints span from pre_hold_end_time to former_end_time
+        if pre_hold_end_time >= former_end_time:
+            # Left already done when right reaches hold position - no waiting needed
+            # Compress hold waypoints (but still need to play them at increasing times)
+            for i in range(hold.hold_duration):
+                times_r.append(pre_hold_end_time + i * base_dt)
+            actual_hold_end_time = pre_hold_end_time + (hold.hold_duration - 1) * base_dt if hold.hold_duration > 0 else pre_hold_end_time
+        else:
+            # Right holds while left catches up
+            # Spread hold waypoints from pre_hold_end_time to former_end_time
+            hold_time_span = former_end_time - pre_hold_end_time
+            if hold.hold_duration > 1:
+                hold_dt = hold_time_span / (hold.hold_duration - 1)
+            else:
+                hold_dt = 0.0
+            for i in range(hold.hold_duration):
+                times_r.append(pre_hold_end_time + i * hold_dt)
+            actual_hold_end_time = former_end_time
+        
+        # Post-hold: Right resumes after left finishes
+        for i in range(post_hold_count):
+            times_r.append(actual_hold_end_time + (i + 1) * base_dt)
+            
+    else:
+        # Right (FORMER) plays continuously from time 0
+        times_r = [i * base_dt for i in range(len_r)]
+        
+        times_l = []
+        
+        # Pre-hold: Left plays at normal speed, starting at time 0
+        for i in range(hold.hold_start_idx):
+            times_l.append(i * base_dt)
+        
+        pre_hold_end_time = hold.hold_start_idx * base_dt
+        
+        if pre_hold_end_time >= former_end_time:
+            for i in range(hold.hold_duration):
+                times_l.append(pre_hold_end_time + i * base_dt)
+            actual_hold_end_time = pre_hold_end_time + (hold.hold_duration - 1) * base_dt if hold.hold_duration > 0 else pre_hold_end_time
+        else:
+            hold_time_span = former_end_time - pre_hold_end_time
+            if hold.hold_duration > 1:
+                hold_dt = hold_time_span / (hold.hold_duration - 1)
+            else:
+                hold_dt = 0.0
+            for i in range(hold.hold_duration):
+                times_l.append(pre_hold_end_time + i * hold_dt)
+            actual_hold_end_time = former_end_time
+        
+        for i in range(post_hold_count):
+            times_l.append(actual_hold_end_time + (i + 1) * base_dt)
+    
+    return times_r, times_l
+
+
 def build_collision_aware_schedule(
     arm_right: ArmPath,
     arm_left: ArmPath,
@@ -610,8 +732,22 @@ def build_collision_aware_schedule(
     pair_batch: int = 4096,
     collision_margin: float = 0.01,
     min_dt: float | None = None,
+    hold_constraints: list[HoldConstraint] | None = None,
 ) -> DiscreteSchedule:
-    """Build a discrete collision-aware schedule for both arm trajectories."""
+    """Build a discrete collision-aware schedule for both arm trajectories.
+    
+    Args:
+        arm_right: Right arm trajectory.
+        arm_left: Left arm trajectory.
+        planner_right: Right arm motion planner (for kinematics).
+        planner_left: Left arm motion planner (for kinematics).
+        step_dt: Simulation step duration.
+        densify_factor: Factor for densifying paths during collision checking.
+        pair_batch: Batch size for collision checking.
+        collision_margin: Collision margin in meters.
+        min_dt: Minimum time delta between waypoints.
+        hold_constraints: List of hold constraints from sequential subtask ordering.
+    """
     print("[Scheduling] Computing collision pairs...")
     print(f"  Right joints: {arm_right.joint_positions.shape}, device: {arm_right.joint_positions.device}")
     print(f"  Left joints: {arm_left.joint_positions.shape}, device: {arm_left.joint_positions.device}")
@@ -674,10 +810,36 @@ def build_collision_aware_schedule(
             l_deltas = [times_l[i + 1] - times_l[i] for i in range(n_check)]
             print(f"  Right time deltas (first 10): {r_deltas}")
             print(f"  Left time deltas (first 10): {l_deltas}")
+            # Show hold phase timing if hold constraints exist
+            if hold_constraints:
+                hold = hold_constraints[0]
+                hold_end_idx = hold.hold_start_idx + hold.hold_duration
+                print(f"[Scheduling] MILP scheduled hold phase (hold waypoints {hold.hold_start_idx} to {hold_end_idx-1}):")
+                print(f"  times_r around hold start: {times_r[max(0, hold.hold_start_idx-2):hold.hold_start_idx+5]}")
+                print(f"  times_r around hold end: {times_r[max(0, hold_end_idx-5):min(len_r, hold_end_idx+3)]}")
+        elif hold_constraints:
+            # MILP failed but we have hold constraints - apply hold timing as fallback
+            print("[Scheduling] WARNING: Retiming returned None, applying hold constraints")
+            hold = hold_constraints[0]
+            times_r, times_l = _apply_hold_constraint_timing(hold, len_r, len_l, base_dt)
         else:
             print("[Scheduling] WARNING: Retiming returned None, using sequential times")
             times_r = [i * base_dt for i in range(len_r)]
             times_l = [i * base_dt for i in range(len_l)]
+    elif hold_constraints:
+        # No collisions but we have hold constraints - apply hold timing
+        print(f"[Scheduling] No collisions, applying {len(hold_constraints)} hold constraint(s)")
+        # Use the first hold constraint (typically only one for sequential tasks)
+        hold = hold_constraints[0]
+        print(f"  Hold: {hold.holding_arm} holds at idx {hold.hold_start_idx} for {hold.hold_duration} steps")
+        print(f"  Other arm ({hold.other_arm}) length: {hold.other_arm_len}")
+        times_r, times_l = _apply_hold_constraint_timing(hold, len_r, len_l, base_dt)
+        print(f"[Scheduling] Hold timing applied:")
+        print(f"  times_r first 5: {times_r[:5]}")
+        print(f"  times_l first 5: {times_l[:5]}")
+        print(f"  times_r around hold: {times_r[max(0, hold.hold_start_idx-2):hold.hold_start_idx+hold.hold_duration+2]}")
+        print(f"  times_r last 5: {times_r[-5:]}")
+        print(f"  times_l last 5: {times_l[-5:]}")
     else:
         times_r = [i * base_dt for i in range(len_r)]
         times_l = [i * base_dt for i in range(len_l)]
@@ -697,5 +859,9 @@ def build_collision_aware_schedule(
         gripper_actions=arm_left.gripper_actions,
     )
     print(f"[Scheduling] Discretized: idx_r[:10]={idx_r[:10].tolist()}, idx_l[:10]={idx_l[:10].tolist()}")
+    # Show more of right arm to verify delayed start
+    if len(idx_r) > 300:
+        print(f"[Scheduling] idx_r[280:300]={idx_r[280:300].tolist()} (checking for delayed start)")
+    print(f"[Scheduling] idx_r[-10:]={idx_r[-10:].tolist()}, idx_l[-10:]={idx_l[-10:].tolist()}")
 
     return DiscreteSchedule(left_indices=idx_l, right_indices=idx_r, total_time=total_time, step_dt=step_dt)

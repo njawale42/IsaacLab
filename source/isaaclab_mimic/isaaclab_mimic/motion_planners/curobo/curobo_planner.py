@@ -249,6 +249,7 @@ class CuroboPlanner(MotionPlannerBase):
             interpolation_dt=self.config.interpolation_dt,
             collision_cache=self.config.collision_cache_size,
             trajopt_tsteps=self.config.trajopt_tsteps,
+            maximum_trajectory_dt=self.config.maximum_trajectory_dt,
             collision_activation_distance=self.config.collision_activation_distance,
             position_threshold=self.config.position_threshold,
             rotation_threshold=self.config.rotation_threshold,
@@ -1611,26 +1612,51 @@ class CuroboPlanner(MotionPlannerBase):
 
         target_poses: list[Pose] = []
         contacts: list[bool] = []
-
-        # Approach direction in EE frame (from config)
         approach_dir = self.config.approach_direction
+        in_world_frame = self.config.approach_retreat_frame == "world"
+
+        # In EEF frame: pose * translate(dir * d) moves pose along EE's dir. For Franka (0,0,-1) = up.
+        # In world frame we negate so the same config (0,0,-1) gives retreat up, approach from above.
+        world_sign = -1.0 if in_world_frame else 1.0
 
         if retreat_distance is not None and retreat_distance > 0:
             ee_pose: Pose = self.get_ee_pose(start_state)
-            # Retreat is opposite of approach direction
-            retreat_offset = [d * retreat_distance for d in approach_dir]
-            retreat_pose: Pose = ee_pose.multiply(
-                self._make_pose(position=retreat_offset)
-            )
+            if in_world_frame:
+                pos = ee_pose.position.squeeze()
+                offset = torch.tensor(
+                    [world_sign * d * retreat_distance for d in approach_dir],
+                    dtype=pos.dtype,
+                    device=pos.device,
+                )
+                retreat_pose = self._make_pose(
+                    position=pos + offset,
+                    quaternion=ee_pose.quaternion,
+                )
+            else:
+                retreat_offset = [d * retreat_distance for d in approach_dir]
+                retreat_pose = ee_pose.multiply(
+                    self._make_pose(position=retreat_offset)
+                )
             target_poses.append(retreat_pose)
             contacts.append(True)
         contacts.append(contact)
         if approach_distance is not None and approach_distance > 0:
-            # Approach from the configured direction
-            approach_offset = [d * approach_distance for d in approach_dir]
-            approach_pose: Pose = goal_pose.multiply(
-                self._make_pose(position=approach_offset)
-            )
+            if in_world_frame:
+                pos = goal_pose.position.squeeze()
+                offset = torch.tensor(
+                    [world_sign * d * approach_distance for d in approach_dir],
+                    dtype=pos.dtype,
+                    device=pos.device,
+                )
+                approach_pose = self._make_pose(
+                    position=pos + offset,
+                    quaternion=goal_pose.quaternion,
+                )
+            else:
+                approach_offset = [d * approach_distance for d in approach_dir]
+                approach_pose = goal_pose.multiply(
+                    self._make_pose(position=approach_offset)
+                )
             target_poses.append(approach_pose)
             contacts.append(True)
 

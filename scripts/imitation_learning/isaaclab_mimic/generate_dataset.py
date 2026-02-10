@@ -165,16 +165,18 @@ def main():
                 ],
                 approach_distance=0.0,
                 retreat_distance=0.0,
+                approach_retreat_frame="world",  # "eef" = direction in EE frame; "world" = Z is world up/down
                 time_dilation_factor=0.5,
+                maximum_trajectory_dt=None, #0.50,  # Increase (e.g. 0.25) if MotionGenStatus.DT_EXCEPTION
                 enable_finetune_trajopt=True,
-                collision_activation_distance=0.03,
+                collision_activation_distance=0.04,
                 motion_step_size=None,
                 visualize_spheres=False,
                 visualize_plan=True,
                 debug_planner=True,
                 approach_direction=(0.0, 0.0, -1.0),
                 surface_sphere_radius=0.005,
-                extra_collision_spheres={"attached_object": 50},
+                extra_collision_spheres={"attached_object": 100},
                 # palm_offset_from_ee=(0.0, -0.07, -0.10),
                 # Dexterous hand grasp detection using finger joints + XY distance
                 # Works for cylindrical objects (beakers) grasped at any height
