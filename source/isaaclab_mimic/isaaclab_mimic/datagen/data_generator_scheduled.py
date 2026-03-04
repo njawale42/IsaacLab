@@ -1893,22 +1893,39 @@ class DataGeneratorScheduled:
         initial_state, arm_paths, hold_constraints = build_result
 
         # Stage 2: Build collision-aware schedule
-        # Have to add try except or else I cannot see the logs without setting verbose which is annoying
+        schedule_strategy = getattr(self.env_cfg.datagen_config, "schedule_strategy", "retiming")
+        print(f"[Scheduling] Using strategy: {schedule_strategy}")
         try:
-            schedule = build_collision_aware_schedule(
-                arm_right=arm_paths["right"],
-                arm_left=arm_paths["left"],
-                planner_right=planner_right,
-                planner_left=planner_left,
-                step_dt=self.env.step_dt,
-                densify_factor=int(getattr(self.env_cfg.datagen_config, "schedule_densify_factor", 4)),
-                pair_batch=int(getattr(self.env_cfg.datagen_config, "schedule_pair_batch", 4096)),
-                collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
-                min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
-                hold_constraints=hold_constraints,
-            )
+            if schedule_strategy == "dag":
+                from isaaclab_mimic.datagen.scheduling_dag import build_dag_schedule
+
+                schedule = build_dag_schedule(
+                    arm_right=arm_paths["right"],
+                    arm_left=arm_paths["left"],
+                    planner_right=planner_right,
+                    planner_left=planner_left,
+                    step_dt=self.env.step_dt,
+                    hold_constraints=hold_constraints,
+                    collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
+                    pair_batch=int(getattr(self.env_cfg.datagen_config, "schedule_pair_batch", 4096)),
+                    min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
+                    milp_max_time=float(getattr(self.env_cfg.datagen_config, "schedule_milp_max_time", 5.0)),
+                )
+            else:
+                schedule = build_collision_aware_schedule(
+                    arm_right=arm_paths["right"],
+                    arm_left=arm_paths["left"],
+                    planner_right=planner_right,
+                    planner_left=planner_left,
+                    step_dt=self.env.step_dt,
+                    densify_factor=int(getattr(self.env_cfg.datagen_config, "schedule_densify_factor", 4)),
+                    pair_batch=int(getattr(self.env_cfg.datagen_config, "schedule_pair_batch", 4096)),
+                    collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
+                    min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
+                    hold_constraints=hold_constraints,
+                )
         except Exception as e:
-            print(f"Scheduling failed: {e}")
+            print(f"Scheduling failed ({schedule_strategy}): {e}")
             return {"success": False}
 
         schedule.append_hold(int(getattr(self.env_cfg.datagen_config, "final_hold_steps", 0)))
@@ -2178,13 +2195,21 @@ class DataGeneratorScheduled:
             env_id=env_id,
         )
 
-        # Inject hold waypoints for SEQUENTIAL constraints
-        # The LATTER arm must wait at the start of its trajectory for sequential_min_time_diff
-        arm_paths, hold_constraints = self._inject_sequential_hold_waypoints(
-            arm_paths=arm_paths,
-            runtime_constraints=runtime_subtask_constraints,
-            step_dt=self.env.step_dt,
-        )
+        schedule_strategy = getattr(self.env_cfg.datagen_config, "schedule_strategy", "retiming")
+
+        if schedule_strategy == "dag":
+            # DAG scheduler operates on original trajectories with subtask_boundaries intact
+            hold_constraints = self._compute_hold_constraints(
+                arm_paths=arm_paths,
+                runtime_constraints=runtime_subtask_constraints,
+            )
+        else:
+            # Retiming scheduler needs hold waypoints physically injected
+            arm_paths, hold_constraints = self._inject_sequential_hold_waypoints(
+                arm_paths=arm_paths,
+                runtime_constraints=runtime_subtask_constraints,
+                step_dt=self.env.step_dt,
+            )
 
         return initial_state, arm_paths, hold_constraints
 
@@ -2860,6 +2885,66 @@ class DataGeneratorScheduled:
 
         return arm_paths
 
+    def _compute_hold_constraints(
+        self,
+        arm_paths: dict[str, ArmPath],
+        runtime_constraints: dict,
+    ) -> list[HoldConstraint]:
+        """Compute hold constraints from runtime constraints without modifying trajectories.
+
+        Used by the DAG scheduler which encodes holds as ordering edges between
+        subtask blocks rather than injecting physical waypoints.
+        """
+        hold_constraints: list[HoldConstraint] = []
+
+        for subtask_key, constraint in runtime_constraints.items():
+            if constraint.get("type") != SubTaskConstraintType._SEQUENTIAL_LATTER:
+                continue
+
+            latter_eef, latter_subtask_idx = subtask_key
+            former_eef = constraint.get("pre_condition_task_spec_key")
+            former_subtask_idx = constraint.get("pre_condition_subtask_ind")
+            min_time_diff = constraint.get("min_time_diff", 0)
+
+            if min_time_diff <= 0:
+                continue
+            if latter_eef not in arm_paths or former_eef not in arm_paths:
+                continue
+
+            latter_path = arm_paths[latter_eef]
+            former_path = arm_paths[former_eef]
+
+            former_boundaries = former_path.subtask_boundaries
+            if former_boundaries is not None and former_subtask_idx in former_boundaries:
+                _, former_subtask_end = former_boundaries[former_subtask_idx]
+                former_len = former_subtask_end
+            else:
+                former_len = former_path.joint_positions.shape[0]
+
+            latter_boundaries = latter_path.subtask_boundaries
+            if latter_boundaries is None or latter_subtask_idx not in latter_boundaries:
+                subtask_start = 0
+                subtask_end = latter_path.joint_positions.shape[0]
+            else:
+                subtask_start, subtask_end = latter_boundaries[latter_subtask_idx]
+
+            subtask_len = subtask_end - subtask_start
+            hold_idx = subtask_start + max(0, subtask_len - min_time_diff)
+            n_hold = max(0, former_len - hold_idx)
+
+            if n_hold <= 0:
+                continue
+
+            hold_constraints.append(HoldConstraint(
+                holding_arm=latter_eef,
+                other_arm=former_eef,
+                hold_start_idx=hold_idx,
+                hold_duration=n_hold,
+                other_arm_len=former_len,
+            ))
+
+        return hold_constraints
+
     def _inject_sequential_hold_waypoints(
         self,
         arm_paths: dict[str, ArmPath],
@@ -3440,34 +3525,34 @@ class DataGeneratorScheduled:
 
             # Check if we need tracking correction interpolation from ACTUAL pose to target
             # This handles controller tracking error by smoothing large jumps
-            tracking_interp_steps = self._compute_tracking_correction_steps(
-                env_id=env_id,
-                target_waypoints=waypoint_dict,
-                max_pose_error=0.05,  # 5cm threshold for correction
-            )
+            # tracking_interp_steps = self._compute_tracking_correction_steps(
+            #     env_id=env_id,
+            #     target_waypoints=waypoint_dict,
+            #     max_pose_error=0.05,  # 5cm threshold for correction
+            # )
 
-            if tracking_interp_steps > 0:
-                if debug_schedule:
-                    print(f"[DEBUG] Tick {tick}: Tracking correction {tracking_interp_steps} steps (controller lag)")
-                for step in range(tracking_interp_steps):
-                    alpha = float(step + 1) / float(tracking_interp_steps + 1)
-                    corrected_waypoints = self._interpolate_from_actual(
-                        env_id=env_id,
-                        target_waypoints=waypoint_dict,
-                        alpha=alpha,
-                        prev_gripper_actions=last_commanded_gripper if last_commanded_gripper else None,
-                    )
-                    if debug_gripper_detail:
-                        for eef_name, wp in corrected_waypoints.items():
-                            print(f"  [GRIPPER] Tick {tick} tracking step {step}: {eef_name} = {wp.gripper_action.tolist()}")
-                    correction_multi = MultiWaypoint(corrected_waypoints)
-                    exec_results = await correction_multi.execute(
-                        env=self.env,
-                        success_term=success_term,
-                        env_id=env_id,
-                        env_action_queue=env_action_queue,
-                    )
-                    self._update_execution_buffers(exec_results, buffers)
+            # if tracking_interp_steps > 0:
+            #     if debug_schedule:
+            #         print(f"[DEBUG] Tick {tick}: Tracking correction {tracking_interp_steps} steps (controller lag)")
+            #     for step in range(tracking_interp_steps):
+            #         alpha = float(step + 1) / float(tracking_interp_steps + 1)
+            #         corrected_waypoints = self._interpolate_from_actual(
+            #             env_id=env_id,
+            #             target_waypoints=waypoint_dict,
+            #             alpha=alpha,
+            #             prev_gripper_actions=last_commanded_gripper if last_commanded_gripper else None,
+            #         )
+            #         if debug_gripper_detail:
+            #             for eef_name, wp in corrected_waypoints.items():
+            #                 print(f"  [GRIPPER] Tick {tick} tracking step {step}: {eef_name} = {wp.gripper_action.tolist()}")
+            #         correction_multi = MultiWaypoint(corrected_waypoints)
+            #         exec_results = await correction_multi.execute(
+            #             env=self.env,
+            #             success_term=success_term,
+            #             env_id=env_id,
+            #             env_action_queue=env_action_queue,
+            #         )
+            #         self._update_execution_buffers(exec_results, buffers)
 
             # Execute the actual scheduled waypoint
             if debug_gripper_detail:

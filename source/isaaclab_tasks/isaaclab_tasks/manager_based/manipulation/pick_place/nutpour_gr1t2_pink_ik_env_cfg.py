@@ -330,16 +330,16 @@ class NutPourGR1T2PinkIKEnvCfg(NutPourGR1T2BaseEnvCfg):
                 variable_input_tasks=[
                     FrameTask(
                         "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
-                        position_cost=5.0,  # [cost] / [m]
-                        orientation_cost=0.8,  # [cost] / [rad]
-                        lm_damping=60,  # dampening for solver for step jumps
+                        position_cost=20.0,  # [cost] / [m]
+                        orientation_cost=2.0,  # [cost] / [rad]
+                        lm_damping=75,  # dampening for solver for step jumps
                         gain=0.1,
                     ),
                     FrameTask(
                         "GR1T2_fourier_hand_6dof_right_hand_pitch_link",
-                        position_cost=5.0,  # [cost] / [m]
-                        orientation_cost=0.8,  # [cost] / [rad]
-                        lm_damping=60,  # dampening for solver for step jumps
+                        position_cost=20.0,  # [cost] / [m]
+                        orientation_cost=2.0,  # [cost] / [rad]
+                        lm_damping=75,  # dampening for solver for step jumps
                         gain=0.1,
                     ),
                     DampingTask(
@@ -347,7 +347,7 @@ class NutPourGR1T2PinkIKEnvCfg(NutPourGR1T2BaseEnvCfg):
                     ),
                     NullSpacePostureTask(
                         cost=0.1,
-                        lm_damping=50,
+                        lm_damping=75,
                         controlled_frames=[
                             "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
                             "GR1T2_fourier_hand_6dof_right_hand_pitch_link",

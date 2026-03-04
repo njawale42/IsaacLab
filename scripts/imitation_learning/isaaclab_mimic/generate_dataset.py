@@ -52,6 +52,14 @@ parser.add_argument(
     default="single_arm",
     help="SkillGen mode: single_arm (default, Franka-style) or bimanual (humanoid).",
 )
+parser.add_argument(
+    "--schedule_strategy",
+    type=str,
+    choices=["retiming", "dag"],
+    default=None,
+    help="Scheduling strategy for bimanual collision avoidance: "
+         "'retiming' (waypoint-level MILP, default) or 'dag' (segment-level MILP).",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -116,78 +124,20 @@ def main():
     except Exception:
         pass
 
+    if args_cli.schedule_strategy is not None:
+        try:
+            env_cfg.datagen_config.schedule_strategy = args_cli.schedule_strategy
+        except Exception:
+            pass
+
     # Precompute humanoid planner configs BEFORE creating the env (ordering matters)
     prebuilt_humanoid_cfgs = None
     if args_cli.use_skillgen and args_cli.skillgen_type == "bimanual" and "nutpour-gr1t2" in env_name.lower():
         from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
-        from isaaclab_mimic.motion_planners.curobo.humanoid_robot_yaml import build_humanoid_yaml_from_usd
 
-        # USD path and inactive joints from env_cfg
         usd_path = env_cfg.scene.robot.spawn.usd_path
         inactive_joint_names = list(env_cfg.actions.gr1_action.ik_urdf_fixed_joint_names)
-        
-        # TODO: (Neel) This is not working as expected (spheres are still being generated for hand links)
-        # add hand joints to inactive joints
-        inactive_joint_names_left = inactive_joint_names + [j for j in env_cfg.actions.gr1_action.hand_joint_names if "L_" in j]
-        inactive_joint_names_right = inactive_joint_names + [j for j in env_cfg.actions.gr1_action.hand_joint_names if "R_" in j]
-        print(f"Inactive joints left: {inactive_joint_names_left}")
-        print(f"Inactive joints right: {inactive_joint_names_right}")
-
-        # Build per-arm YAML once
-        yaml_right = build_humanoid_yaml_from_usd(usd_path, arm="right", inactive_joints=inactive_joint_names_right)
-        yaml_left = build_humanoid_yaml_from_usd(usd_path, arm="left", inactive_joints=inactive_joint_names_left)
-
-        def _mk_cfg(yaml_path: str, arm: str) -> CuroboPlannerCfg:
-            # Set arm-specific attachment link (the hand pitch link for each arm)
-            attached_link = f"GR1T2_fourier_hand_6dof_{arm}_hand_pitch_link"
-            return CuroboPlannerCfg(
-                robot_config_file=yaml_path,
-                robot_name="gr1",
-                hand_link_names=[
-                    "GR1T2_fourier_hand_6dof_right_hand_pitch_link",
-                    "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
-                ],
-                # Use actual EE link for object attachment (not virtual "attached_object" link)
-                attached_object_link_name=attached_link,
-                ee_link_name=attached_link,
-                static_objects=["table", "scale", "bin"],
-                # Ignore specific USD prims; remove items one-by-one to debug collisions
-                world_ignore_substrings=[
-                    "/World/envs/env_0/Table",
-                    # "/World/envs/env_0/SortingScale",
-                    # "/World/envs/env_0/SortingBowl",
-                    # "/World/envs/env_0/SortingBeaker",
-                    "/World/envs/env_0/FactoryNut",
-                    # "/World/envs/env_0/BlackSortingBin",
-                    "/World/envs/env_0/RobotPOVCam",
-                    "/World/envs/env_0/Robot",
-                    "/World/GroundPlane",
-                ],
-                approach_distance=0.0,
-                retreat_distance=0.0,
-                approach_retreat_frame="world",  # "eef" = direction in EE frame; "world" = Z is world up/down
-                time_dilation_factor=0.5,
-                maximum_trajectory_dt=None, #0.50,  # Increase (e.g. 0.25) if MotionGenStatus.DT_EXCEPTION
-                enable_finetune_trajopt=True,
-                collision_activation_distance=0.04,
-                motion_step_size=None,
-                visualize_spheres=False,
-                visualize_plan=True,
-                debug_planner=True,
-                approach_direction=(0.0, 0.0, -1.0),
-                surface_sphere_radius=0.005,
-                extra_collision_spheres={"attached_object": 100},
-                # palm_offset_from_ee=(0.0, -0.07, -0.10),
-                # Dexterous hand grasp detection using finger joints + XY distance
-                # Works for cylindrical objects (beakers) grasped at any height
-                grasp_detection_mode="dexterous",
-                grasp_xy_distance_threshold=0.18,  # XY distance from EE (wrist) to object center
-                dexterous_finger_closed_threshold=0.2,  # Finger joint threshold (radians)
-            )
-
-        cfg_right = _mk_cfg(yaml_right, "right")
-        cfg_left = _mk_cfg(yaml_left, "left")
-        prebuilt_humanoid_cfgs = (cfg_left, cfg_right)
+        prebuilt_humanoid_cfgs = CuroboPlannerCfg.gr1t2_nutpour_bimanual_configs(usd_path, inactive_joint_names)
 
     # Create environment AFTER prebuilding robot YAML/configs
     env = gym.make(env_name, cfg=env_cfg).unwrapped

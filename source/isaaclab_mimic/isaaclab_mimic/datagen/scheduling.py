@@ -104,74 +104,6 @@ def _densify_path(path: torch.Tensor, factor: int) -> tuple[torch.Tensor, torch.
     mapping.append(segments)
     return torch.stack(dense, dim=0), torch.tensor(mapping, device=path.device, dtype=torch.long)
 
-
-# def _compute_collision_pairs(
-#     joint_path_r: torch.Tensor,
-#     joint_path_l: torch.Tensor,
-#     kin_right,
-#     kin_left,
-#     *,
-#     densify_factor: int = 4,
-#     pair_batch: int = 4096,
-#     collision_margin: float = 0.0,
-# ) -> list[tuple[int, int]]:
-#     """Find colliding waypoint pairs using sphere overlaps produced by cuRobo kinematics."""
-#     if joint_path_r.numel() == 0 or joint_path_l.numel() == 0:
-#         return []
-
-#     dev = joint_path_r.device
-#     pos_r_dense, map_r = _densify_path(joint_path_r, densify_factor)
-#     pos_l_dense, map_l = _densify_path(joint_path_l, densify_factor)
-
-#     Nr = int(pos_r_dense.shape[0])
-#     Nl = int(pos_l_dense.shape[0])
-#     if Nr == 0 or Nl == 0:
-#         return []
-
-#     q_r = torch.repeat_interleave(pos_r_dense, repeats=Nl, dim=0)
-#     q_l = pos_l_dense.repeat(Nr, 1)
-#     total_rows = q_r.shape[0]
-
-#     colliding_rows: list[int] = []
-
-#     for start in range(0, total_rows, pair_batch):
-#         end = min(total_rows, start + pair_batch)
-#         q_r_b = q_r[start:end]
-#         q_l_b = q_l[start:end]
-#         batch_size = q_r_b.shape[0]
-
-#         state_r = kin_right.get_state(q_r_b)
-#         state_l = kin_left.get_state(q_l_b)
-#         sph_r = state_r.link_spheres_tensor.view(batch_size, -1, 4)
-#         sph_l = state_l.link_spheres_tensor.view(batch_size, -1, 4)
-
-#         c_r = sph_r[..., :3]
-#         r_r = sph_r[..., 3]
-#         c_l = sph_l[..., :3]
-#         r_l = sph_l[..., 3]
-
-#         aa = (c_r * c_r).sum(dim=-1, keepdim=True)
-#         bb = (c_l * c_l).sum(dim=-1).unsqueeze(1)
-#         ab = torch.bmm(c_r, c_l.transpose(1, 2))
-#         dist2 = torch.clamp(aa + bb - 2.0 * ab, min=0.0)
-
-#         radii = r_r.unsqueeze(-1) + r_l.unsqueeze(-2) + collision_margin
-#         thresh2 = radii * radii
-#         collide = (dist2 <= thresh2).any(dim=(1, 2))
-#         rows = torch.nonzero(collide, as_tuple=False).flatten()
-#         if rows.numel() > 0:
-#             colliding_rows.extend((start + int(idx.item())) for idx in rows)
-
-#     if not colliding_rows:
-#         return []
-
-#     pairs: list[tuple[int, int]] = []
-#     for row in colliding_rows:
-#         i_dense = row // Nl
-#         j_dense = row % Nl
-#         pairs.append((int(map_r[i_dense].item()), int(map_l[j_dense].item())))
-#     return pairs
-
 def _compute_collision_pairs(
     joint_path_r: torch.Tensor,
     joint_path_l: torch.Tensor,
@@ -655,14 +587,12 @@ def _apply_hold_constraint_timing(
     if hold.holding_arm == "right":
         # Left (FORMER) plays continuously from time 0
         times_l = [i * base_dt for i in range(len_l)]
-        
         times_r = []
         
         # Pre-hold (0 to hold_start_idx-1): Right plays at normal speed, starting at time 0
         for i in range(hold.hold_start_idx):
             times_r.append(i * base_dt)
         
-        # Right reaches hold position at this time:
         pre_hold_end_time = hold.hold_start_idx * base_dt
         
         # Hold phase: Right stays at hold_start_idx until left completes
@@ -692,7 +622,6 @@ def _apply_hold_constraint_timing(
     else:
         # Right (FORMER) plays continuously from time 0
         times_r = [i * base_dt for i in range(len_r)]
-        
         times_l = []
         
         # Pre-hold: Left plays at normal speed, starting at time 0
