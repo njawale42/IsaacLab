@@ -1968,6 +1968,12 @@ class DataGeneratorScheduled:
                     hold_former_part=str(
                         getattr(self.env_cfg.datagen_config, "schedule_hold_former_part", "skill")
                     ),
+                    debug_collision_links=bool(
+                        getattr(self.env_cfg.datagen_config, "schedule_debug_collision_links", False)
+                    ),
+                    use_shared_torso=bool(
+                        getattr(self.env_cfg.datagen_config, "schedule_collision_use_shared_torso", True)
+                    ),
                 )
             else:
                 schedule = build_collision_aware_schedule(
@@ -1981,6 +1987,9 @@ class DataGeneratorScheduled:
                     collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
                     min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
                     hold_constraints=hold_constraints,
+                    use_shared_torso=bool(
+                        getattr(self.env_cfg.datagen_config, "schedule_collision_use_shared_torso", True)
+                    ),
                 )
         except Exception as e:
             print(f"Scheduling failed ({schedule_strategy}): {e}")
@@ -2580,9 +2589,10 @@ class DataGeneratorScheduled:
 
             if joint_vec is not None:
                 # Overwrite hand DOFs so collision uses same finger config as execution
-                self._inject_gripper_into_planner_joints(
-                    joint_vec, waypoint.gripper_action, arm_planner, eef_name, env_id
-                )
+                if not getattr(self.env_cfg.datagen_config, "schedule_debug_disable_gripper_injection", False):
+                    self._inject_gripper_into_planner_joints(
+                        joint_vec, waypoint.gripper_action, arm_planner, eef_name, env_id
+                    )
                 eef_state.last_commanded_joint_position = joint_vec.clone()
                 # Merge this arm's joints into the global state for consistency
                 if arm_planner is not None:
@@ -3027,12 +3037,20 @@ class DataGeneratorScheduled:
         """
         Inject hold waypoints into LATTER arm's trajectory to match online SEQUENTIAL behavior.
 
+        Only used when schedule_strategy != "dag". DAG does not inject; it encodes ordering in
+        the schedule. DexMimicGen/skill_interface at runtime do not inject waypoints either:
+        the latter policy simply does not activate until the former completes (dependency DAG).
+
         In online mode, the LATTER arm holds within its *constrained subtask*:
           hold when step_index >= subtask_traj_len - min_time_diff
 
         The offline code must replicate this by computing hold_idx relative to the
         constrained subtask's boundaries (MP + skill) within the concatenated trajectory,
         NOT relative to the full trajectory length.
+
+        schedule_max_hold_waypoints (default 0 = no cap) limits how many waypoints are
+        injected; e.g. 1 keeps a minimal hold. Hold duration is still enforced when
+        _apply_hold_constraint_timing is used (no collisions or MILP fallback).
 
         Args:
             arm_paths: Dict of arm name -> ArmPath (with subtask_boundaries populated).
@@ -3092,7 +3110,13 @@ class DataGeneratorScheduled:
 
             # How many hold waypoints: FORMER subtask must complete, then LATTER resumes.
             # Both arms start at time 0, so hold count = former_len - hold_idx.
+            # Cap with schedule_max_hold_waypoints (0 = no cap) to avoid huge injection;
+            # timing will still span until former ends when _apply_hold_constraint_timing is used.
             n_hold = max(0, former_len - hold_idx)
+            max_hold = int(getattr(self.env_cfg.datagen_config, "schedule_max_hold_waypoints", 0))
+            if max_hold > 0 and n_hold > max_hold:
+                n_hold = max_hold
+                print(f"[Sequential Hold] Capped to {n_hold} waypoints (schedule_max_hold_waypoints={max_hold})")
 
             if n_hold <= 0:
                 print(f"[Sequential Hold] No hold needed for {latter_eef} subtask {latter_subtask_idx} "
@@ -3181,9 +3205,10 @@ class DataGeneratorScheduled:
                 # Use recorded joint position (already in planner space, just ensure device/dtype)
                 projected = self._project_joint_to_planner(joint_vec, arm_planner)
                 projected = projected.to(device=planner_device, dtype=planner_dtype)
-                self._inject_gripper_into_planner_joints(
-                    projected, waypoint.gripper_action, arm_planner, eef_name, env_id
-                )
+                if not getattr(self.env_cfg.datagen_config, "schedule_debug_disable_gripper_injection", False):
+                    self._inject_gripper_into_planner_joints(
+                        projected, waypoint.gripper_action, arm_planner, eef_name, env_id
+                    )
                 joints.append(projected)
                 last_valid = projected
             else:
@@ -3192,9 +3217,10 @@ class DataGeneratorScheduled:
                 if solved is not None:
                     projected = self._project_joint_to_planner(solved, arm_planner)
                     projected = projected.to(device=planner_device, dtype=planner_dtype)
-                    self._inject_gripper_into_planner_joints(
-                        projected, waypoint.gripper_action, arm_planner, eef_name, env_id
-                    )
+                    if not getattr(self.env_cfg.datagen_config, "schedule_debug_disable_gripper_injection", False):
+                        self._inject_gripper_into_planner_joints(
+                            projected, waypoint.gripper_action, arm_planner, eef_name, env_id
+                        )
                     joints.append(projected)
                     last_valid = projected
                 elif last_valid is not None:

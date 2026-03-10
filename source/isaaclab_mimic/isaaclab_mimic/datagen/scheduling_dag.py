@@ -166,7 +166,7 @@ def _process_hold_constraints(
 
     for hold in hold_constraints:
         latter_blocks = blocks_r if hold.holding_arm == "right" else blocks_l
-        latter_path = arm_right if hold.holding_arm == "right" else arm_left
+        # latter_path = arm_right if hold.holding_arm == "right" else arm_left
         former_blocks = blocks_l if hold.other_arm == "left" else blocks_r
 
         # Always emit a task ordering so collision mutexes are directed
@@ -306,6 +306,28 @@ class BlockCollisionResult:
     min_penetration: float  # most negative = deepest collision
     closest_r_idx: int  # waypoint index within block (local)
     closest_l_idx: int
+    closest_r_link: str | None = None  # link name on right arm at worst penetration
+    closest_l_link: str | None = None  # link name on left arm at worst penetration
+
+
+def _sphere_index_to_link_name(kin, sphere_idx: int) -> str | None:
+    """Resolve a single sphere index to link name using kinematics_config."""
+    if not hasattr(kin, "kinematics_config"):
+        return None
+    kc = kin.kinematics_config
+    if not hasattr(kc, "link_sphere_idx_map") or not hasattr(kc, "link_name_to_idx_map"):
+        return None
+    link_sphere_idx_map = kc.link_sphere_idx_map
+    link_name_to_idx = getattr(kc, "link_name_to_idx_map", None)
+    if link_name_to_idx is None:
+        return None
+    if hasattr(link_sphere_idx_map, "cpu"):
+        link_sphere_idx_map = link_sphere_idx_map.cpu().numpy()
+    idx_to_name = {v: k for k, v in link_name_to_idx.items()}
+    if sphere_idx >= link_sphere_idx_map.size:
+        return None
+    link_idx = int(link_sphere_idx_map.flat[sphere_idx])
+    return idx_to_name.get(link_idx)
 
 
 def _blocks_collide(
@@ -317,6 +339,8 @@ def _blocks_collide(
     n_shared_joints: int = 6,
     batch_size: int = 4096,
     densify_factor: int = 4,
+    debug_links: bool = False,
+    use_shared_torso: bool = True,
 ) -> BlockCollisionResult:
     """Check collisions between two joint-position arrays and return diagnostics.
 
@@ -324,6 +348,11 @@ def _blocks_collide(
     intermediate configurations between waypoints are also tested.  Reported
     indices (closest_r_idx, closest_l_idx) are mapped back to the original
     (non-densified) waypoint indices.
+
+    When ``use_shared_torso`` is True (default), left's first ``n_shared_joints``
+    are overwritten with right's so both arms are evaluated in the same base frame.
+    When False, each arm uses its own torso from its own waypoint (tests whether
+    shared-torso causes false collisions when torso differs between waypoints).
     """
     Nr_orig = int(joints_r.shape[0])
     Nl_orig = int(joints_l.shape[0])
@@ -341,7 +370,7 @@ def _blocks_collide(
     q_l = dense_l.repeat(Nr, 1)
     total = q_r.shape[0]
 
-    if n_shared_joints > 0:
+    if n_shared_joints > 0 and use_shared_torso:
         q_l = q_l.clone()
         q_l[:, :n_shared_joints] = q_r[:, :n_shared_joints]
 
@@ -389,6 +418,39 @@ def _blocks_collide(
             best_r_idx = int(map_r[global_row // Nl].item())
             best_l_idx = int(map_l[global_row % Nl].item())
 
+    closest_r_link: str | None = None
+    closest_l_link: str | None = None
+    if debug_links and n_colliding > 0 and best_r_idx >= 0 and best_l_idx >= 0:
+        q_r = joints_r[best_r_idx : best_r_idx + 1].to(device=dev)
+        q_l = joints_l[best_l_idx : best_l_idx + 1].clone().to(device=dev)
+        if n_shared_joints > 0 and use_shared_torso:
+            q_l[:, :n_shared_joints] = q_r[:, :n_shared_joints]
+        state_r = kin_right.get_state(q_r)
+        state_l = kin_left.get_state(q_l)
+        sph_r = state_r.link_spheres_tensor.view(1, -1, 4)
+        sph_l = state_l.link_spheres_tensor.view(1, -1, 4)
+        c_r, r_r = sph_r[..., :3], sph_r[..., 3]
+        c_l, r_l = sph_l[..., :3], sph_l[..., 3]
+        valid_r = r_r > 0
+        valid_l = r_l > 0
+        aa = (c_r * c_r).sum(dim=-1, keepdim=True)
+        bb = (c_l * c_l).sum(dim=-1).unsqueeze(1)
+        ab = torch.bmm(c_r, c_l.transpose(1, 2))
+        dist2 = torch.clamp(aa + bb - 2.0 * ab, min=0.0)
+        radii = r_r.unsqueeze(-1) + r_l.unsqueeze(-2) + collision_margin
+        valid_pairs = valid_r.unsqueeze(-1) & valid_l.unsqueeze(-2)
+        penetration = torch.sqrt(dist2) - radii
+        penetration = torch.where(
+            valid_pairs, penetration, torch.tensor(float("inf"), device=dev)
+        )
+        pen_flat = penetration.view(-1)
+        min_flat_idx = int(pen_flat.argmin().item())
+        nr = sph_r.shape[1]
+        sphere_r_idx = min_flat_idx // sph_l.shape[1]
+        sphere_l_idx = min_flat_idx % sph_l.shape[1]
+        closest_r_link = _sphere_index_to_link_name(kin_right, sphere_r_idx)
+        closest_l_link = _sphere_index_to_link_name(kin_left, sphere_l_idx)
+
     return BlockCollisionResult(
         collides=n_colliding > 0,
         n_colliding_pairs=n_colliding,
@@ -396,6 +458,8 @@ def _blocks_collide(
         min_penetration=global_min_pen,
         closest_r_idx=best_r_idx,
         closest_l_idx=best_l_idx,
+        closest_r_link=closest_r_link,
+        closest_l_link=closest_l_link,
     )
 
 
@@ -660,6 +724,8 @@ def build_dag_schedule(
     milp_max_time: float = 5.0,
     hold_latter_entire_subtask: bool = False,
     hold_former_part: str = "skill",
+    debug_collision_links: bool = False,
+    use_shared_torso: bool = True,
 ) -> DiscreteSchedule:
     """Build a discrete schedule using DAG-based segment-level MILP ordering.
 
@@ -746,7 +812,7 @@ def build_dag_schedule(
     mutex_pairs: list[tuple[SubtaskBlock, SubtaskBlock]] = []
     print(
         f"[DAG Collision] Checking {len(blocks_r)} x {len(blocks_l)} block pairs, "
-        f"margin={collision_margin}m, densify={densify_factor}x"
+        f"margin={collision_margin}m, densify={densify_factor}x, use_shared_torso={use_shared_torso}"
     )
     for br in blocks_r:
         for bl in blocks_l:
@@ -759,14 +825,19 @@ def build_dag_schedule(
                 n_shared_joints=n_shared_joints,
                 batch_size=pair_batch,
                 densify_factor=densify_factor,
+                debug_links=debug_collision_links,
+                use_shared_torso=use_shared_torso,
             )
             status = "COLLIDE" if result.collides else "clear"
-            print(
+            msg = (
                 f"[DAG Collision] {br} x {bl}: {status} | "
                 f"pairs={result.n_colliding_pairs}/{result.total_pairs} | "
                 f"min_pen={result.min_penetration:.4f}m | "
                 f"closest=R[{br.start_idx + result.closest_r_idx}] vs L[{bl.start_idx + result.closest_l_idx}]"
             )
+            if result.collides and result.closest_r_link and result.closest_l_link:
+                msg += f" | links: {result.closest_r_link} vs {result.closest_l_link}"
+            print(msg)
             if result.collides:
                 mutex_pairs.append((br, bl))
 

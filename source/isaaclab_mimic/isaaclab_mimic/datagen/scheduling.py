@@ -119,13 +119,16 @@ def _compute_collision_pairs(
     pair_batch: int = 4096,
     collision_margin: float = 0.0,
     n_shared_joints: int = 6,
+    use_shared_torso: bool = True,
     debug_save_path: str | None = None,
 ) -> list[tuple[int, int, float]]:
     """Find colliding waypoint pairs using sphere overlaps.
-    
+
     Returns list of (r_idx, l_idx, penetration) tuples, where penetration is negative for actual collisions.
-    
-    Synchronizes shared torso joints so both arms compute spheres in consistent coordinates.
+
+    When use_shared_torso is True, left's first n_shared_joints are overwritten with right's so both arms
+    use the same base frame. When False, each arm uses its own torso from its waypoint (avoids false
+    collisions when torso differs between waypoints, e.g. humanoid).
     
     Set env COLLISION_DEBUG=1 to enable debug visualization data saving.
     Set env COLLISION_DEBUG_PATH to specify save path (default: /tmp/collision_debug.pkl).
@@ -157,12 +160,11 @@ def _compute_collision_pairs(
     q_l = pos_l_dense.repeat(Nr, 1)
     total_rows = q_r.shape[0]
 
-    # CRITICAL: Synchronize shared joints so both arms use the same torso configuration
-    if n_shared_joints > 0:
+    if n_shared_joints > 0 and use_shared_torso:
         q_l = q_l.clone()
         q_l[:, :n_shared_joints] = q_r[:, :n_shared_joints]
-    
-    print(f"[Collision] Synchronized {n_shared_joints} shared joints, checking {total_rows} pairs")
+
+    print(f"[Collision] use_shared_torso={use_shared_torso}, checking {total_rows} pairs")
 
     # Debug: Print sample joint values and resulting sphere positions
     if _COLLISION_DEBUG_ENABLED:
@@ -667,6 +669,7 @@ def build_collision_aware_schedule(
     collision_margin: float = 0.01,
     min_dt: float | None = None,
     hold_constraints: list[HoldConstraint] | None = None,
+    use_shared_torso: bool = True,
 ) -> DiscreteSchedule:
     """Build a discrete collision-aware schedule for both arm trajectories.
     
@@ -681,6 +684,8 @@ def build_collision_aware_schedule(
         collision_margin: Collision margin in meters.
         min_dt: Minimum time delta between waypoints.
         hold_constraints: List of hold constraints from sequential subtask ordering.
+        use_shared_torso: If True, left config uses right's torso for collision check; if False, each arm
+            uses its own torso (recommended for humanoids when torso can differ between waypoints).
     """
     print("[Scheduling] Computing collision pairs...")
     print(f"  Right joints: {arm_right.joint_positions.shape}, device: {arm_right.joint_positions.device}")
@@ -718,6 +723,7 @@ def build_collision_aware_schedule(
         densify_factor=densify_factor,
         pair_batch=pair_batch,
         collision_margin=collision_margin,
+        use_shared_torso=use_shared_torso,
     )
     print(f"[Scheduling] Found {len(joint_pairs)} collision pairs")
 

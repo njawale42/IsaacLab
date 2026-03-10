@@ -59,13 +59,21 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         # Former part the latter waits for: "mp" (latter can only start its MP after former's MP
         # for the constrained subtask completes), "skill", or "entire".
         self.datagen_config.schedule_hold_former_part = "mp"
+        # Log which link pair has minimum penetration for each colliding block pair (for debugging).
+        self.datagen_config.schedule_debug_collision_links = True
+        # If True, skip gripper injection into planner joints (for testing if injection causes false collisions).
+        self.datagen_config.schedule_debug_disable_gripper_injection = False
+        # If False, each arm uses its own torso from its waypoint (tests shared-torso false-collision hypothesis).
+        self.datagen_config.schedule_collision_use_shared_torso = False
+        # (Non-DAG only) Cap injected hold waypoints; 0 = no cap. Use 1 to minimize; DAG does not inject.
+        self.datagen_config.schedule_max_hold_waypoints = 1
         self.datagen_config.debug_schedule_replay = False  # Enable debug prints for schedule replay
         self.datagen_config.debug_gripper_detail = False  # Show every gripper command (verbose)
         self.datagen_config.skill_gripper_delay_steps = 8 #18 #18  # ~1.5 seconds delay at 50Hz
         self.datagen_config.skill_gripper_interp_steps = 4  # ~1 second smooth close at 50Hz
         # self.datagen_config.schedule_min_dt = 0.05  # Match step_dt for consistency
         self.datagen_config.schedule_all_offline = True
-        self.datagen_config.max_joint_step_rad = 0.07 #0.01  # Smoother wrist motion (2.9 degrees max per tick)
+        self.datagen_config.max_joint_step_rad = 0.09 #0.01  # Smoother wrist motion (2.9 degrees max per tick)
         self.datagen_config.final_hold_steps = 0
 
         # The following are the subtask configurations for the stack task.
@@ -182,7 +190,7 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
                 # Amount of action noise to apply during this subtask
                 action_noise=0.0,
                 # Number of interpolation steps to bridge to this subtask segment
-                num_interpolation_steps=5,
+                num_interpolation_steps=0,
                 # Additional fixed steps for the robot to reach the necessary pose
                 num_fixed_steps=0,
                 # If True, apply action noise during the interpolation phase and execution
@@ -195,6 +203,6 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
             SubTaskConstraintConfig(
                 eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
                 constraint_type=SubTaskConstraintType.SEQUENTIAL,
-                sequential_min_time_diff=0,
+                sequential_min_time_diff=1,
             )
         )
