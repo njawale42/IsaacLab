@@ -23,6 +23,7 @@ from isaaclab_mimic.datagen.scheduling import (
     ArmPath,
     DiscreteSchedule,
     HoldConstraint,
+    _densify_path,  # pyright: ignore[reportPrivateUsage]
     _discretize,  # pyright: ignore[reportPrivateUsage]
 )
 
@@ -36,6 +37,7 @@ class SubtaskBlock:
     start_idx: int
     end_idx: int  # exclusive
     joint_positions: torch.Tensor  # [block_len, num_joints]
+    block_type: str = "mixed"  # "mp", "skill", or "mixed"
 
     @property
     def duration(self) -> int:
@@ -46,7 +48,8 @@ class SubtaskBlock:
         return f"{self.arm_name}_{self.start_idx}"
 
     def __repr__(self) -> str:
-        return f"{self.arm_name}[st{self.subtask_index}:{self.start_idx}-{self.end_idx}]"
+        tag = f"/{self.block_type}" if self.block_type != "mixed" else ""
+        return f"{self.arm_name}[st{self.subtask_index}{tag}:{self.start_idx}-{self.end_idx}]"
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +57,12 @@ class SubtaskBlock:
 # ---------------------------------------------------------------------------
 
 def _extract_blocks(arm_path: ArmPath) -> list[SubtaskBlock]:
-    """Extract subtask blocks from an ArmPath using its subtask_boundaries."""
+    """Extract subtask blocks from an ArmPath, splitting each into MP and skill blocks.
+
+    If ``skill_boundaries`` is available, each subtask is split into an MP block
+    (motion planner waypoints) and a skill block (demonstrated trajectory), matching
+    the separate MotionPolicy/SkillPolicy structure in skill_interface.py.
+    """
     if arm_path.subtask_boundaries is None or len(arm_path.subtask_boundaries) == 0:
         return [
             SubtaskBlock(
@@ -69,38 +77,88 @@ def _extract_blocks(arm_path: ArmPath) -> list[SubtaskBlock]:
     blocks: list[SubtaskBlock] = []
     for idx in sorted(arm_path.subtask_boundaries.keys()):
         start, end = arm_path.subtask_boundaries[idx]
-        blocks.append(
-            SubtaskBlock(
+        skill_start = (
+            arm_path.skill_boundaries.get(idx, start)
+            if arm_path.skill_boundaries is not None
+            else start
+        )
+
+        # MP block (if there are MP waypoints)
+        if skill_start > start:
+            blocks.append(SubtaskBlock(
                 arm_name=arm_path.name,
                 subtask_index=idx,
                 start_idx=start,
+                end_idx=skill_start,
+                joint_positions=arm_path.joint_positions[start:skill_start],
+                block_type="mp",
+            ))
+
+        # Skill block (if there are skill waypoints)
+        if end > skill_start:
+            blocks.append(SubtaskBlock(
+                arm_name=arm_path.name,
+                subtask_index=idx,
+                start_idx=skill_start,
                 end_idx=end,
-                joint_positions=arm_path.joint_positions[start:end],
-            )
-        )
+                joint_positions=arm_path.joint_positions[skill_start:end],
+                block_type="skill",
+            ))
     return blocks
 
 
-def _split_blocks_at_holds(
+@dataclass
+class _TaskOrdering:
+    """Directed ordering from a SEQUENTIAL constraint.
+
+    When a collision mutex is found between a block on ``yielding_arm``
+    (within the yielding subtask range) and a block on ``leading_arm``
+    (within the leading subtask range), the yielding arm always waits.
+    """
+
+    leading_arm: str
+    leading_subtask: int
+    yielding_arm: str
+    yielding_subtask: int
+
+
+def _process_hold_constraints(
     blocks_r: list[SubtaskBlock],
     blocks_l: list[SubtaskBlock],
     hold_constraints: list[HoldConstraint] | None,
     arm_right: ArmPath,
     arm_left: ArmPath,
-) -> tuple[list[SubtaskBlock], list[SubtaskBlock], list[tuple[SubtaskBlock, SubtaskBlock]]]:
-    """Split blocks at hold points so pre-hold portions can run concurrently.
+    *,
+    hold_latter_entire_subtask: bool = False,
+    hold_former_part: str = "skill",
+) -> tuple[list[SubtaskBlock], list[SubtaskBlock],
+           list[tuple[SubtaskBlock, SubtaskBlock]], list[_TaskOrdering]]:
+    """Process hold constraints into hard orderings and/or directed mutex preferences.
 
-    A hold constraint says: "LATTER arm can play until hold_start_idx, then must
-    pause until FORMER arm reaches other_arm_len."  We split the LATTER block at
-    hold_start_idx into a pre-hold sub-block (no ordering constraint) and a
-    post-hold sub-block (must wait for the FORMER block to finish).
+    When ``hold_start_idx`` is inside a block (min_time_diff > 0), the block
+    is split and a hard ordering edge is added for the post-hold portion.
+
+    Regardless of min_time_diff, a :class:`_TaskOrdering` is always emitted so
+    that collision mutexes between the ordered subtask pair are directed (the
+    yielding arm always waits, the leading arm never does).
+
+    If ``hold_latter_entire_subtask`` is False (default), the hold edge targets
+    the latter arm's *skill* block so its MP can run in parallel. If True, the
+    hold edge targets the latter's *first* block (MP) of that subtask so the
+    latter does not start the subtask at all until the former finishes.
+
+    ``hold_former_part`` controls which part of the former's subtask the latter
+    waits for: "mp" (former's MP only; latter can then start its own MP), "skill"
+    (former's skill only), or "entire" (former's full subtask). When "mp", the
+    hold edge targets the latter's first block (MP) so the latter can only start
+    its planning segment after the former's MP for this constraint completes.
 
     Returns:
-        (blocks_r, blocks_l, hold_orderings) where hold_orderings is a list of
-        (former_block, post_hold_block) pairs to add as hard ordering edges.
+        (blocks_r, blocks_l, hold_orderings, task_orderings)
     """
+    task_orderings: list[_TaskOrdering] = []
     if not hold_constraints:
-        return blocks_r, blocks_l, []
+        return blocks_r, blocks_l, [], task_orderings
 
     blocks_r = list(blocks_r)
     blocks_l = list(blocks_l)
@@ -111,58 +169,127 @@ def _split_blocks_at_holds(
         latter_path = arm_right if hold.holding_arm == "right" else arm_left
         former_blocks = blocks_l if hold.other_arm == "left" else blocks_r
 
-        # Find the LATTER block containing hold_start_idx
-        target_idx: int | None = None
-        for i, block in enumerate(latter_blocks):
-            if block.start_idx <= hold.hold_start_idx < block.end_idx:
-                target_idx = i
-                break
-        if target_idx is None:
-            continue
-
-        block = latter_blocks[target_idx]
-        split_at = hold.hold_start_idx
-
-        # Split only if the hold point is strictly inside the block
-        if split_at > block.start_idx:
-            pre_hold = SubtaskBlock(
-                arm_name=block.arm_name,
-                subtask_index=block.subtask_index,
-                start_idx=block.start_idx,
-                end_idx=split_at,
-                joint_positions=latter_path.joint_positions[block.start_idx:split_at],
-            )
-            post_hold = SubtaskBlock(
-                arm_name=block.arm_name,
-                subtask_index=block.subtask_index,
-                start_idx=split_at,
-                end_idx=block.end_idx,
-                joint_positions=latter_path.joint_positions[split_at:block.end_idx],
-            )
-            latter_blocks[target_idx:target_idx + 1] = [pre_hold, post_hold]
-            post_hold_block = post_hold
-            print(
-                f"[DAG] Split {block.arm_name}[{block.subtask_index}] at idx {split_at}: "
-                f"pre-hold={pre_hold.duration}wp, post-hold={post_hold.duration}wp"
-            )
-        else:
-            post_hold_block = block
-
-        # Find the FORMER block that must complete before the post-hold can start
-        former_block: SubtaskBlock | None = None
+        # Always emit a task ordering so collision mutexes are directed
+        former_subtask_idx: int | None = None
         for fb in former_blocks:
             if fb.start_idx < hold.other_arm_len <= fb.end_idx:
-                former_block = fb
+                former_subtask_idx = fb.subtask_index
                 break
+        if former_subtask_idx is None and former_blocks:
+            former_subtask_idx = former_blocks[-1].subtask_index
+
+        latter_subtask_idx: int | None = None
+        for block in latter_blocks:
+            if block.start_idx <= hold.hold_start_idx < block.end_idx:
+                latter_subtask_idx = block.subtask_index
+                break
+        # When hold_start_idx == subtask_end (min_time_diff=0), check the previous block
+        if latter_subtask_idx is None:
+            for block in latter_blocks:
+                if block.end_idx == hold.hold_start_idx:
+                    latter_subtask_idx = block.subtask_index
+                    break
+
+        if former_subtask_idx is not None and latter_subtask_idx is not None:
+            task_orderings.append(_TaskOrdering(
+                leading_arm=hold.other_arm,
+                leading_subtask=former_subtask_idx,
+                yielding_arm=hold.holding_arm,
+                yielding_subtask=latter_subtask_idx,
+            ))
+            print(
+                f"[DAG] Task ordering: {hold.other_arm}[st{former_subtask_idx}] leads, "
+                f"{hold.holding_arm}[st{latter_subtask_idx}] yields on collision"
+            )
+
+        # Choose which block on the latter arm to constrain.
+        # - hold_former_part="mp": target latter's first block (MP) so latter can only start its
+        #   planning segment after former's MP for this constraint's subtask completes.
+        # - hold_latter_entire_subtask=True: target first block (latter waits for whole task).
+        # - else: target latter's skill block (latter MP can overlap with former).
+        latter_target_block: SubtaskBlock | None = None
+        if hold_former_part == "mp" or hold_latter_entire_subtask:
+            for block in latter_blocks:
+                if block.subtask_index == latter_subtask_idx:
+                    latter_target_block = block
+                    break
+        else:
+            for block in latter_blocks:
+                if (block.subtask_index == latter_subtask_idx
+                        and block.block_type in ("skill", "mixed")):
+                    latter_target_block = block
+                    break
+        if latter_target_block is None:
+            continue
+
+        # Find the FORMER arm's block to wait for (by hold_former_part)
+        former_subtask_blocks = [fb for fb in former_blocks if fb.subtask_index == former_subtask_idx]
+        former_block: SubtaskBlock | None = None
+        if former_subtask_blocks:
+            if hold_former_part == "mp":
+                mp_blocks = [b for b in former_subtask_blocks if b.block_type == "mp"]
+                former_block = max(mp_blocks, key=lambda b: b.end_idx) if mp_blocks else None
+            elif hold_former_part == "skill":
+                skill_blocks = [b for b in former_subtask_blocks if b.block_type in ("skill", "mixed")]
+                former_block = max(skill_blocks, key=lambda b: b.end_idx) if skill_blocks else None
+            elif hold_former_part == "entire":
+                former_block = max(former_subtask_blocks, key=lambda b: b.end_idx)
+            else:
+                former_block = max(
+                    [b for b in former_subtask_blocks if b.block_type in ("skill", "mixed")],
+                    key=lambda b: b.end_idx,
+                ) if any(b.block_type in ("skill", "mixed") for b in former_subtask_blocks) else None
         if former_block is None and former_blocks:
             former_block = former_blocks[-1]
         if former_block is None:
             continue
 
-        hold_orderings.append((former_block, post_hold_block))
-        print(f"[DAG] Hold ordering: {former_block} -> {post_hold_block}")
+        hold_orderings.append((former_block, latter_target_block))
+        print(f"[DAG] Hold ordering: {former_block} -> {latter_target_block}")
 
-    return blocks_r, blocks_l, hold_orderings
+    return blocks_r, blocks_l, hold_orderings, task_orderings
+
+
+def _split_large_blocks(
+    blocks: list[SubtaskBlock],
+    arm_path: ArmPath,
+    max_block_size: int,
+) -> list[SubtaskBlock]:
+    """Split blocks that exceed *max_block_size* into consecutive sub-blocks.
+
+    This gives the MILP finer scheduling granularity: only the sub-blocks that
+    actually collide with the other arm need to be serialised, while the rest
+    can overlap.
+    """
+    if max_block_size <= 0:
+        return blocks
+
+    out: list[SubtaskBlock] = []
+    for block in blocks:
+        if block.duration <= max_block_size:
+            out.append(block)
+            continue
+
+        n_before = len(out)
+        cursor = block.start_idx
+        while cursor < block.end_idx:
+            chunk_end = min(cursor + max_block_size, block.end_idx)
+            out.append(
+                SubtaskBlock(
+                    arm_name=block.arm_name,
+                    subtask_index=block.subtask_index,
+                    start_idx=cursor,
+                    end_idx=chunk_end,
+                    joint_positions=arm_path.joint_positions[cursor:chunk_end],
+                )
+            )
+            cursor = chunk_end
+
+        print(
+            f"[DAG] Split {block} ({block.duration}wp) into "
+            f"{len(out) - n_before} chunks of <={max_block_size}wp"
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -189,16 +316,29 @@ def _blocks_collide(
     collision_margin: float = 0.0,
     n_shared_joints: int = 6,
     batch_size: int = 4096,
+    densify_factor: int = 4,
 ) -> BlockCollisionResult:
-    """Check collisions between two joint-position arrays and return diagnostics."""
-    Nr = int(joints_r.shape[0])
-    Nl = int(joints_l.shape[0])
-    if Nr == 0 or Nl == 0:
+    """Check collisions between two joint-position arrays and return diagnostics.
+
+    Linearly densifies both paths by ``densify_factor`` before checking, so
+    intermediate configurations between waypoints are also tested.  Reported
+    indices (closest_r_idx, closest_l_idx) are mapped back to the original
+    (non-densified) waypoint indices.
+    """
+    Nr_orig = int(joints_r.shape[0])
+    Nl_orig = int(joints_l.shape[0])
+    if Nr_orig == 0 or Nl_orig == 0:
         return BlockCollisionResult(False, 0, 0, float("inf"), -1, -1)
 
     dev = joints_r.device
-    q_r = joints_r.repeat_interleave(Nl, dim=0)
-    q_l = joints_l.repeat(Nr, 1)
+
+    dense_r, map_r = _densify_path(joints_r, densify_factor)
+    dense_l, map_l = _densify_path(joints_l, densify_factor)
+    Nr = int(dense_r.shape[0])
+    Nl = int(dense_l.shape[0])
+
+    q_r = dense_r.repeat_interleave(Nl, dim=0)
+    q_l = dense_l.repeat(Nr, 1)
     total = q_r.shape[0]
 
     if n_shared_joints > 0:
@@ -246,8 +386,8 @@ def _blocks_collide(
         if batch_min_val < global_min_pen:
             global_min_pen = batch_min_val
             global_row = start + batch_min_idx
-            best_r_idx = global_row // Nl
-            best_l_idx = global_row % Nl
+            best_r_idx = int(map_r[global_row // Nl].item())
+            best_l_idx = int(map_l[global_row % Nl].item())
 
     return BlockCollisionResult(
         collides=n_colliding > 0,
@@ -268,6 +408,7 @@ def _solve_block_milp(
     blocks_l: list[SubtaskBlock],
     mutex_pairs: list[tuple[SubtaskBlock, SubtaskBlock]],
     hold_orderings: list[tuple[SubtaskBlock, SubtaskBlock]],
+    task_orderings: list[_TaskOrdering],
     base_dt: float,
     max_time: float = 5.0,
 ) -> dict[SubtaskBlock, float] | None:
@@ -338,8 +479,62 @@ def _solve_block_milp(
     total_duration = sum(b.duration for b in all_blocks) * base_dt
     M = 1000.0 * max(total_duration, 1.0)
 
+    # Build index maps so we can look up the next block on each arm
+    r_idx_map = {b: i for i, b in enumerate(blocks_r)}
+    l_idx_map = {b: i for i, b in enumerate(blocks_l)}
+
+    # Check if a mutex pair is directed by a task ordering
+    def _is_directed(br: SubtaskBlock, bl: SubtaskBlock) -> str | None:
+        """Return 'left_leads' or 'right_leads' if task ordering applies, else None."""
+        for to in task_orderings:
+            if (to.yielding_arm == "right" and br.subtask_index == to.yielding_subtask
+                    and to.leading_arm == "left" and bl.subtask_index == to.leading_subtask):
+                return "left_leads"
+            if (to.yielding_arm == "left" and bl.subtask_index == to.yielding_subtask
+                    and to.leading_arm == "right" and br.subtask_index == to.leading_subtask):
+                return "right_leads"
+        return None
+
     z_vars: dict[tuple[SubtaskBlock, SubtaskBlock], Variable] = {}
+    n_directed = 0
     for br, bl in mutex_pairs:
+        i_r = r_idx_map[br]
+        i_l = l_idx_map[bl]
+        next_r = blocks_r[i_r + 1] if i_r + 1 < len(blocks_r) else None
+        next_l = blocks_l[i_l + 1] if i_l + 1 < len(blocks_l) else None
+
+        direction = _is_directed(br, bl)
+
+        if direction is not None:
+            # Directed: force the yielding arm to wait (no binary variable)
+            n_directed += 1
+            if direction == "left_leads":
+                # Right yields: t[br] >= t[next_l] (or t[bl] + dur_l if last)
+                if next_l is not None:
+                    constraints.append(Constraint(
+                        lower=0.0,
+                        coefficients={block_vars[br].name: +1, block_vars[next_l].name: -1},
+                    ))
+                else:
+                    constraints.append(Constraint(
+                        lower=bl.duration * base_dt,
+                        coefficients={block_vars[br].name: +1, block_vars[bl].name: -1},
+                    ))
+            else:
+                # Left yields: t[bl] >= t[next_r] (or t[br] + dur_r if last)
+                if next_r is not None:
+                    constraints.append(Constraint(
+                        lower=0.0,
+                        coefficients={block_vars[bl].name: +1, block_vars[next_r].name: -1},
+                    ))
+                else:
+                    constraints.append(Constraint(
+                        lower=br.duration * base_dt,
+                        coefficients={block_vars[bl].name: +1, block_vars[br].name: -1},
+                    ))
+            continue
+
+        # Undirected: MILP chooses via binary variable
         z = Variable(
             name=f"z_{br.var_name}__{bl.var_name}",
             integer=True,
@@ -349,28 +544,32 @@ def _solve_block_milp(
         z_vars[(br, bl)] = z
         variables.append(z)
 
-        dur_r = br.duration * base_dt
-        dur_l = bl.duration * base_dt
+        if next_r is not None:
+            constraints.append(Constraint(
+                lower=0.0,
+                coefficients={block_vars[bl].name: +1, block_vars[next_r].name: -1, z.name: +M},
+            ))
+        else:
+            constraints.append(Constraint(
+                lower=br.duration * base_dt,
+                coefficients={block_vars[bl].name: +1, block_vars[br].name: -1, z.name: +M},
+            ))
 
-        # z=0 → right finishes before left starts:  t[l] >= t[r] + dur_r
-        # z=1 → left finishes before right starts:   t[r] >= t[l] + dur_l
-        constraints.extend(
-            [
-                Constraint(
-                    lower=dur_r,
-                    coefficients={block_vars[bl].name: +1, block_vars[br].name: -1, z.name: +M},
-                ),
-                Constraint(
-                    lower=dur_l - M,
-                    coefficients={block_vars[br].name: +1, block_vars[bl].name: -1, z.name: -M},
-                ),
-            ]
-        )
+        if next_l is not None:
+            constraints.append(Constraint(
+                lower=0.0 - M,
+                coefficients={block_vars[br].name: +1, block_vars[next_l].name: -1, z.name: -M},
+            ))
+        else:
+            constraints.append(Constraint(
+                lower=bl.duration * base_dt - M,
+                coefficients={block_vars[br].name: +1, block_vars[bl].name: -1, z.name: -M},
+            ))
 
     print(
         f"[DAG MILP] blocks_r={len(blocks_r)}, blocks_l={len(blocks_l)}, "
-        f"mutexes={len(mutex_pairs)}, hold_edges={len(hold_orderings)}, "
-        f"binary_vars={len(z_vars)}"
+        f"mutexes={len(mutex_pairs)} ({n_directed} directed, {len(z_vars)} binary), "
+        f"hold_edges={len(hold_orderings)}"
     )
 
     solution = solve_milp(
@@ -453,16 +652,24 @@ def build_dag_schedule(
     step_dt: float,
     hold_constraints: list[HoldConstraint] | None = None,
     collision_margin: float = 0.01,
+    densify_factor: int = 4,
+    max_block_size: int = 0,
     pair_batch: int = 4096,
     n_shared_joints: int = 6,
     min_dt: float | None = None,
     milp_max_time: float = 5.0,
+    hold_latter_entire_subtask: bool = False,
+    hold_former_part: str = "skill",
 ) -> DiscreteSchedule:
     """Build a discrete schedule using DAG-based segment-level MILP ordering.
 
     Each subtask block is treated as an atomic unit with fixed duration.  Hold
     constraints split blocks at the hold point so the pre-hold portion can run
     concurrently while only the post-hold portion waits for the other arm.
+
+    Large blocks are optionally chopped into chunks of at most
+    ``max_block_size`` waypoints so the MILP can serialise only the chunks
+    that actually collide, allowing the rest to overlap.
 
     The MILP decides the *start time* of each (sub-)block to minimise makespan
     while avoiding inter-arm collisions and respecting hold orderings.
@@ -473,19 +680,61 @@ def build_dag_schedule(
         step_dt: Simulator step duration.
         hold_constraints: Sequential ordering constraints.
         collision_margin: Sphere collision margin (m).
+        densify_factor: Linear interpolation factor for densifying paths before
+            collision checking (e.g. 4 inserts 3 intermediate samples between
+            each pair of consecutive waypoints).
+        max_block_size: Maximum waypoints per block. Blocks exceeding this are
+            split into consecutive chunks. 0 disables splitting.
         pair_batch: FK batch size for collision checking.
         n_shared_joints: Number of leading shared (torso) joints to synchronise.
         min_dt: Minimum time delta between consecutive waypoints inside a block.
         milp_max_time: MILP solver timeout (seconds).
+        hold_latter_entire_subtask: If True, hold edge targets the latter's first block
+            (MP) so the latter does not start the subtask until the former finishes.
+            If False, hold edge targets the latter's skill block (latter MP can overlap).
+        hold_former_part: Which part of the former's subtask the latter waits for:
+            "mp" (former MP only), "skill" (former skill only), "entire" (former full subtask).
+            Default "skill".
     """
     blocks_r = _extract_blocks(arm_right)
     blocks_l = _extract_blocks(arm_left)
     base_dt = min_dt if min_dt is not None else max(step_dt, 1e-3)
 
-    # Split blocks at hold points so pre-hold portions can overlap
-    blocks_r, blocks_l, hold_orderings = _split_blocks_at_holds(
+    # Process hold constraints: split blocks at hold points and extract task orderings
+    blocks_r, blocks_l, hold_orderings, task_orderings = _process_hold_constraints(
         blocks_r, blocks_l, hold_constraints, arm_right, arm_left,
+        hold_latter_entire_subtask=hold_latter_entire_subtask,
+        hold_former_part=hold_former_part,
     )
+
+    # Split large blocks into smaller chunks for finer MILP granularity
+    if max_block_size > 0:
+        blocks_r = _split_large_blocks(blocks_r, arm_right, max_block_size)
+        blocks_l = _split_large_blocks(blocks_l, arm_left, max_block_size)
+
+        # Remap hold orderings: the original block objects may have been
+        # replaced by chunks.  The former block's intent is "must finish" so
+        # we point to the LAST chunk covering its range.  The latter block's
+        # intent is "can't start" so we point to the FIRST chunk.
+        all_new = blocks_r + blocks_l
+        updated_orderings: list[tuple[SubtaskBlock, SubtaskBlock]] = []
+        for former, latter in hold_orderings:
+            new_former = former
+            if former not in all_new:
+                candidates = [b for b in all_new
+                              if b.arm_name == former.arm_name and b.end_idx == former.end_idx]
+                if candidates:
+                    new_former = candidates[0]
+            new_latter = latter
+            if latter not in all_new:
+                candidates = [b for b in all_new
+                              if b.arm_name == latter.arm_name and b.start_idx == latter.start_idx]
+                if candidates:
+                    new_latter = candidates[0]
+            updated_orderings.append((new_former, new_latter))
+            if new_former is not former or new_latter is not latter:
+                print(f"[DAG] Remapped hold ordering: {new_former} -> {new_latter}")
+        hold_orderings = updated_orderings
 
     print(f"[DAG Schedule] Right blocks: {blocks_r}")
     print(f"[DAG Schedule] Left blocks:  {blocks_l}")
@@ -495,7 +744,10 @@ def build_dag_schedule(
     kin_left = planner_left.motion_gen.kinematics
 
     mutex_pairs: list[tuple[SubtaskBlock, SubtaskBlock]] = []
-    print(f"[DAG Collision] Checking {len(blocks_r)} x {len(blocks_l)} block pairs, margin={collision_margin}m")
+    print(
+        f"[DAG Collision] Checking {len(blocks_r)} x {len(blocks_l)} block pairs, "
+        f"margin={collision_margin}m, densify={densify_factor}x"
+    )
     for br in blocks_r:
         for bl in blocks_l:
             result = _blocks_collide(
@@ -506,6 +758,7 @@ def build_dag_schedule(
                 collision_margin=collision_margin,
                 n_shared_joints=n_shared_joints,
                 batch_size=pair_batch,
+                densify_factor=densify_factor,
             )
             status = "COLLIDE" if result.collides else "clear"
             print(
@@ -527,6 +780,7 @@ def build_dag_schedule(
         blocks_l,
         mutex_pairs,
         hold_orderings,
+        task_orderings,
         base_dt,
         max_time=milp_max_time,
     )
@@ -544,11 +798,42 @@ def build_dag_schedule(
     total_time = max(times_r[-1] if times_r else 0.0, times_l[-1] if times_l else 0.0)
     print(f"[DAG Schedule] Total time: {total_time:.3f}, step_dt: {step_dt:.4f}")
 
+    # Debug: show time gaps (holds) in each arm's time array
+    for arm_name, times in [("right", times_r), ("left", times_l)]:
+        for i in range(1, len(times)):
+            gap = times[i] - times[i - 1]
+            if gap > base_dt * 2:
+                print(
+                    f"[DAG Schedule] {arm_name} time gap at wp {i-1}->{i}: "
+                    f"{times[i-1]:.3f} -> {times[i]:.3f} (gap={gap:.3f}s, "
+                    f"{int(gap / step_dt)} ticks of hold)"
+                )
+
     dev = arm_right.joint_positions.device
     idx_r = _discretize(times_r, total_time, step_dt, len_r, dev, gripper_actions=arm_right.gripper_actions)
     idx_l = _discretize(times_l, total_time, step_dt, len_l, dev, gripper_actions=arm_left.gripper_actions)
 
     print(f"[DAG Schedule] Discretized: idx_r[:10]={idx_r[:10].tolist()}, idx_l[:10]={idx_l[:10].tolist()}")
     print(f"[DAG Schedule] idx_r[-10:]={idx_r[-10:].tolist()}, idx_l[-10:]={idx_l[-10:].tolist()}")
+
+    # Debug: detect holds (consecutive ticks with the same index)
+    for arm_name, idx in [("right", idx_r), ("left", idx_l)]:
+        holds = []
+        run_start = 0
+        for t in range(1, len(idx)):
+            if idx[t] != idx[t - 1]:
+                run_len = t - run_start
+                if run_len > 5:
+                    holds.append((run_start, t - 1, int(idx[run_start].item()), run_len))
+                run_start = t
+        run_len = len(idx) - run_start
+        if run_len > 5:
+            holds.append((run_start, len(idx) - 1, int(idx[run_start].item()), run_len))
+        if holds:
+            for tick_start, tick_end, wp_idx, length in holds:
+                print(
+                    f"[DAG Schedule] {arm_name} HOLD: ticks {tick_start}-{tick_end} "
+                    f"({length} ticks, {length * step_dt:.2f}s) at waypoint {wp_idx}"
+                )
 
     return DiscreteSchedule(left_indices=idx_l, right_indices=idx_r, total_time=total_time, step_dt=step_dt)

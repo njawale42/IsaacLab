@@ -83,7 +83,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
     # )
     sorting_bowl = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/SortingBowl",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.04539, 0.53793, 0.9861], rot=[1, 0, 0, 0]), # [0.02779, 0.43007, 0.9860]
+        init_state=RigidObjectCfg.InitialStateCfg(pos=[-0.04539, 0.49793, 0.9861], rot=[1, 0, 0, 0]), # [0.02779, 0.43007, 0.9860]
         spawn=UsdFileCfg(
             usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Mimic/nut_pour_task/nut_pour_assets/sorting_bowl_yellow.usd",
             scale=(1.0, 1.0, 1.5),

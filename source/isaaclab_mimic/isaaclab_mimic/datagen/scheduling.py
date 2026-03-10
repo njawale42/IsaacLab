@@ -31,6 +31,11 @@ class ArmPath:
     """Maps subtask_index -> (start_idx, end_idx) within the concatenated trajectory.
     Includes both MP transition and skill waypoints for each subtask."""
 
+    skill_boundaries: dict[int, int] | None = None
+    """Maps subtask_index -> skill_start_idx within the concatenated trajectory.
+    Waypoints before this index are MP (motion planner) waypoints; from this
+    index onward are skill (demonstrated trajectory) waypoints."""
+
 
 @dataclass
 class HoldConstraint:

@@ -246,6 +246,9 @@ class EEFGenerationState:
     is_currently_paused: bool = False  # Track if arm is paused due to constraint - used to skip step increment
     _was_paused_prev_iter: bool = False  # Internal: track pause state transitions for proper waypoint capture
     current_joint_trajectory: list[torch.Tensor | None] = field(default_factory=list)
+    current_mp_waypoint_count: int = 0
+    """Number of MP (motion planner) waypoints in the current subtask trajectory.
+    The rest are skill (demonstrated) waypoints. Used to build separate MP/skill blocks."""
 
 
 class DataGeneratorScheduled:
@@ -1706,6 +1709,53 @@ class DataGeneratorScheduled:
 
         return torch.stack(result).to(dtype=torch.float32)
 
+    def _inject_gripper_into_planner_joints(
+        self,
+        joint_positions: torch.Tensor,
+        gripper_action: torch.Tensor,
+        arm_planner: Any,
+        eef_name: str,
+        env_id: int = 0,
+    ) -> torch.Tensor:
+        """Overwrite hand/finger DOFs in planner joint vector with gripper_action.
+
+        Ensures the joint configuration used for collision (FK) matches what we
+        command at execution. Call after IK or motion plan when building/storing
+        joint positions for scheduling.
+
+        Args:
+            joint_positions: Full joint vector in planner ordering (modified in place).
+            gripper_action: Hand joint values for this arm (same order as hand_joint_names).
+            arm_planner: Arm-specific planner for joint name lookup.
+            eef_name: "left" or "right".
+            env_id: Environment ID (unused; for API consistency with _extract_gripper_from_joints).
+
+        Returns:
+            joint_positions with hand DOFs overwritten (same tensor, modified in place).
+        """
+        if not hasattr(arm_planner, "motion_gen"):
+            return joint_positions
+
+        actions_cfg = getattr(getattr(self.env, "cfg", None), "actions", None)
+        pink_cfg = getattr(actions_cfg, "pink_ik_cfg", None) if actions_cfg else None
+        hand_names = getattr(pink_cfg, "hand_joint_names", None) if pink_cfg else None
+        if not hand_names:
+            return joint_positions
+
+        cu_names = list(arm_planner.motion_gen.kinematics.joint_names)
+        name_to_cu_idx = {n: i for i, n in enumerate(cu_names)}
+        prefix = "L_" if eef_name == "left" else "R_"
+        arm_hand_names = [n for n in hand_names if n.startswith(prefix)]
+        if not arm_hand_names:
+            return joint_positions
+
+        jpos = joint_positions.view(-1).to(device=self.env.device, dtype=torch.float32)
+        gripper = gripper_action.view(-1).to(device=self.env.device, dtype=torch.float32)
+        for i, name in enumerate(arm_hand_names):
+            if name in name_to_cu_idx and name_to_cu_idx[name] < jpos.shape[0] and i < gripper.shape[0]:
+                jpos[name_to_cu_idx[name]] = gripper[i]
+        return joint_positions
+
     def _convert_planned_trajectory_to_waypoints(
         self,
         motion_planner: Any,
@@ -1907,9 +1957,17 @@ class DataGeneratorScheduled:
                     step_dt=self.env.step_dt,
                     hold_constraints=hold_constraints,
                     collision_margin=float(getattr(self.env_cfg.datagen_config, "schedule_collision_margin", 0.01)),
+                    densify_factor=int(getattr(self.env_cfg.datagen_config, "schedule_densify_factor", 4)),
+                    max_block_size=int(getattr(self.env_cfg.datagen_config, "schedule_max_block_size", 0)),
                     pair_batch=int(getattr(self.env_cfg.datagen_config, "schedule_pair_batch", 4096)),
                     min_dt=getattr(self.env_cfg.datagen_config, "schedule_min_dt", None),
                     milp_max_time=float(getattr(self.env_cfg.datagen_config, "schedule_milp_max_time", 5.0)),
+                    hold_latter_entire_subtask=bool(
+                        getattr(self.env_cfg.datagen_config, "schedule_hold_latter_entire_subtask", False)
+                    ),
+                    hold_former_part=str(
+                        getattr(self.env_cfg.datagen_config, "schedule_hold_former_part", "skill")
+                    ),
                 )
             else:
                 schedule = build_collision_aware_schedule(
@@ -2118,6 +2176,7 @@ class DataGeneratorScheduled:
                                 force_use_prev_traj=True,
                             )
                             eef_state.current_trajectory = mp_waypoints + skill_waypoints
+                            eef_state.current_mp_waypoint_count = len(mp_waypoints)
                             # Build joint trajectory: MP joints + None for skill (to be IK-solved)
                             eef_state.current_joint_trajectory = list(mp_joints) + [None] * len(skill_waypoints)
                             eef_state.subtask_step_index = 0
@@ -2132,6 +2191,7 @@ class DataGeneratorScheduled:
                         prev_executed_traj=eef_state.current_trajectory,
                         subtask_trajectory=eef_subtask_trajectory,
                     )
+                    eef_state.current_mp_waypoint_count = 0
                     eef_state.current_joint_trajectory = [None] * len(eef_state.current_trajectory)
                     eef_state.subtask_step_index = 0
                     eef_state.subtask_started = True
@@ -2152,10 +2212,12 @@ class DataGeneratorScheduled:
             for eef_name, waypoint in eef_waypoints.items():
                 eef_state = eef_states[eef_name]
                 joint_vec = eef_state.last_commanded_joint_position
+                step_idx = eef_state.subtask_step_index or 0
                 waypoint_logs[eef_name].append({
                     "waypoint": deepcopy(waypoint),
                     "joint": joint_vec.clone() if joint_vec is not None else None,
                     "subtask_index": eef_state.current_subtask_index,
+                    "is_mp": step_idx < eef_state.current_mp_waypoint_count,
                 })
 
             # Track which subtasks are about to complete (for world state updates)
@@ -2517,6 +2579,10 @@ class DataGeneratorScheduled:
                 )
 
             if joint_vec is not None:
+                # Overwrite hand DOFs so collision uses same finger config as execution
+                self._inject_gripper_into_planner_joints(
+                    joint_vec, waypoint.gripper_action, arm_planner, eef_name, env_id
+                )
                 eef_state.last_commanded_joint_position = joint_vec.clone()
                 # Merge this arm's joints into the global state for consistency
                 if arm_planner is not None:
@@ -2835,22 +2901,30 @@ class DataGeneratorScheduled:
             poses = torch.stack([e["waypoint"].pose.clone() for e in entries], dim=0)
             gripper_actions = torch.stack([e["waypoint"].gripper_action.clone() for e in entries], dim=0)
 
-            # Compute subtask boundaries: subtask_index -> (start_idx, end_idx)
-            # Each subtask includes both MP transition and skill waypoints.
+            # Compute subtask boundaries and skill start indices.
             subtask_boundaries: dict[int, tuple[int, int]] = {}
+            skill_boundaries: dict[int, int] = {}
             current_subtask: int | None = None
             subtask_start = 0
+            first_skill_idx: int | None = None
             for i, entry in enumerate(entries):
                 si = entry.get("subtask_index")
                 if si != current_subtask:
                     if current_subtask is not None:
                         subtask_boundaries[current_subtask] = (subtask_start, i)
+                        skill_boundaries[current_subtask] = first_skill_idx if first_skill_idx is not None else subtask_start
                     current_subtask = si
                     subtask_start = i
+                    first_skill_idx = None
+                if first_skill_idx is None and not entry.get("is_mp", False):
+                    first_skill_idx = i
             if current_subtask is not None:
                 subtask_boundaries[current_subtask] = (subtask_start, len(entries))
+                skill_boundaries[current_subtask] = first_skill_idx if first_skill_idx is not None else subtask_start
 
-            print(f"[ArmPath] {eef_name} subtask boundaries (MP+skill): {subtask_boundaries}")
+            for si, (s, e) in subtask_boundaries.items():
+                sk = skill_boundaries.get(si, s)
+                print(f"[ArmPath] {eef_name} subtask {si}: MP [{s}:{sk}] ({sk - s}wp), skill [{sk}:{e}] ({e - sk}wp)")
 
             # Apply gripper delay and interpolation if configured
             gripper_interp_steps = int(getattr(self.env_cfg.datagen_config, "skill_gripper_interp_steps", 20))
@@ -2877,6 +2951,7 @@ class DataGeneratorScheduled:
                 gripper_actions=gripper_actions,
                 joint_positions=joint_positions,
                 subtask_boundaries=subtask_boundaries,
+                skill_boundaries=skill_boundaries,
             )
 
         if "left" not in arm_paths or "right" not in arm_paths:
@@ -2906,8 +2981,6 @@ class DataGeneratorScheduled:
             former_subtask_idx = constraint.get("pre_condition_subtask_ind")
             min_time_diff = constraint.get("min_time_diff", 0)
 
-            if min_time_diff <= 0:
-                continue
             if latter_eef not in arm_paths or former_eef not in arm_paths:
                 continue
 
@@ -2929,11 +3002,11 @@ class DataGeneratorScheduled:
                 subtask_start, subtask_end = latter_boundaries[latter_subtask_idx]
 
             subtask_len = subtask_end - subtask_start
-            hold_idx = subtask_start + max(0, subtask_len - min_time_diff)
-            n_hold = max(0, former_len - hold_idx)
-
-            if n_hold <= 0:
-                continue
+            if min_time_diff > 0:
+                hold_idx = subtask_start + max(0, subtask_len - min_time_diff)
+            else:
+                hold_idx = subtask_start
+            n_hold = max(1, former_len - hold_idx)
 
             hold_constraints.append(HoldConstraint(
                 holding_arm=latter_eef,
@@ -3102,20 +3175,26 @@ class DataGeneratorScheduled:
         last_valid: torch.Tensor | None = None
 
         for entry in entries:
+            waypoint = entry["waypoint"]
             joint_vec = entry.get("joint")
             if joint_vec is not None:
                 # Use recorded joint position (already in planner space, just ensure device/dtype)
                 projected = self._project_joint_to_planner(joint_vec, arm_planner)
                 projected = projected.to(device=planner_device, dtype=planner_dtype)
+                self._inject_gripper_into_planner_joints(
+                    projected, waypoint.gripper_action, arm_planner, eef_name, env_id
+                )
                 joints.append(projected)
                 last_valid = projected
             else:
                 # Solve IK for this waypoint
-                waypoint = entry["waypoint"]
                 solved = self._solve_ik_for_waypoint(waypoint.pose, arm_planner, last_valid)
                 if solved is not None:
                     projected = self._project_joint_to_planner(solved, arm_planner)
                     projected = projected.to(device=planner_device, dtype=planner_dtype)
+                    self._inject_gripper_into_planner_joints(
+                        projected, waypoint.gripper_action, arm_planner, eef_name, env_id
+                    )
                     joints.append(projected)
                     last_valid = projected
                 elif last_valid is not None:

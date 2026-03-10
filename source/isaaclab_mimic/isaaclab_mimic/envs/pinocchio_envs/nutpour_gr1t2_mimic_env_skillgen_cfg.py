@@ -47,8 +47,18 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         # Scheduling parameters for bimanual collision avoidance
         # Higher densify_factor = more waypoints = less skipping during discretization
         self.datagen_config.schedule_densify_factor = 1
+        # Split blocks so delayed arm holds further back (e.g. at wp 20 instead of at bowl wp 31)
+        self.datagen_config.schedule_max_block_size = 30
         self.datagen_config.schedule_pair_batch = 4096
-        self.datagen_config.schedule_collision_margin = 0.08
+        # Margin must exceed min_pen of right 20-30 vs left pour (~0.02–0.12m) so those
+        # chunks are mutex; then right holds at wp 20 instead of wp 31 (at bowl).
+        self.datagen_config.schedule_collision_margin = 0.0
+        # False: hold edge targets latter's skill block (latter MP can run in parallel).
+        # True: hold edge targets latter's first block (MP); latter does not start subtask until former finishes.
+        self.datagen_config.schedule_hold_latter_entire_subtask = False
+        # Former part the latter waits for: "mp" (latter can only start its MP after former's MP
+        # for the constrained subtask completes), "skill", or "entire".
+        self.datagen_config.schedule_hold_former_part = "mp"
         self.datagen_config.debug_schedule_replay = False  # Enable debug prints for schedule replay
         self.datagen_config.debug_gripper_detail = False  # Show every gripper command (verbose)
         self.datagen_config.skill_gripper_delay_steps = 8 #18 #18  # ~1.5 seconds delay at 50Hz
@@ -185,6 +195,6 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
             SubTaskConstraintConfig(
                 eef_subtask_constraint_tuple=[("left", 1), ("right", 0)],
                 constraint_type=SubTaskConstraintType.SEQUENTIAL,
-                sequential_min_time_diff=60,
+                sequential_min_time_diff=0,
             )
         )
