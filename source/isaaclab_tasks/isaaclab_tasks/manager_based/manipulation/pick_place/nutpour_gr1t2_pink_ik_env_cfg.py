@@ -205,7 +205,7 @@
 
 # Copyright (c) 2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
-#
+
 # SPDX-License-Identifier: BSD-3-Clause
 
 import carb
@@ -330,24 +330,24 @@ class NutPourGR1T2PinkIKEnvCfg(NutPourGR1T2BaseEnvCfg):
                 variable_input_tasks=[
                     FrameTask(
                         "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
-                        position_cost=20.0,  # [cost] / [m]
-                        orientation_cost=2.0,  # [cost] / [rad]
-                        lm_damping=75,  # dampening for solver for step jumps
-                        gain=0.1,
+                        position_cost=30.0,  # [cost] / [m]
+                        orientation_cost=5.0,  # [cost] / [rad]
+                        lm_damping=50,  # dampening for solver for step jumps
+                        gain=0.08,
                     ),
                     FrameTask(
                         "GR1T2_fourier_hand_6dof_right_hand_pitch_link",
-                        position_cost=20.0,  # [cost] / [m]
-                        orientation_cost=2.0,  # [cost] / [rad]
-                        lm_damping=75,  # dampening for solver for step jumps
-                        gain=0.1,
+                        position_cost=30.0,  # [cost] / [m]
+                        orientation_cost=5.0,  # [cost] / [rad]
+                        lm_damping=50,  # dampening for solver for step jumps
+                        gain=0.08,
                     ),
                     DampingTask(
-                        cost=0.5,  # [cost] * [s] / [rad]
+                        cost=0.1,  # [cost] * [s] / [rad]
                     ),
                     NullSpacePostureTask(
                         cost=0.1,
-                        lm_damping=75,
+                        lm_damping=50,
                         controlled_frames=[
                             "GR1T2_fourier_hand_6dof_left_hand_pitch_link",
                             "GR1T2_fourier_hand_6dof_right_hand_pitch_link",

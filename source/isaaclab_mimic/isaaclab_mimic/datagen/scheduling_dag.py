@@ -309,7 +309,7 @@ class BlockCollisionResult:
     closest_r_link: str | None = None  # link name on right arm at worst penetration
     closest_l_link: str | None = None  # link name on left arm at worst penetration
 
-
+# TODO: Neel: Simplify this function (remove redundant checks & code)
 def _sphere_index_to_link_name(kin, sphere_idx: int) -> str | None:
     """Resolve a single sphere index to link name using kinematics_config."""
     if not hasattr(kin, "kinematics_config"):

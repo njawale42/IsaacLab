@@ -3681,6 +3681,72 @@ class DataGeneratorScheduled:
             prev_left_idx = left_idx
             prev_right_idx = right_idx
 
+        # --- Goal-reaching correction ---
+        # After the scheduled trajectory completes, the IK controller may not
+        # have fully converged to the final target (tracking lag over long
+        # trajectories).  Read the actual EE poses and, if the error exceeds
+        # the threshold, smoothly interpolate from actual→target over a few
+        # extra steps so the objects end up in the right place.
+        goal_corr_steps = int(getattr(self.env_cfg.datagen_config, "goal_correction_steps", 0))
+        goal_corr_thresh = float(getattr(self.env_cfg.datagen_config, "goal_correction_threshold", 0.02))
+
+        if goal_corr_steps > 0 and not buffers.success:
+            final_waypoints = {
+                "left": Waypoint(
+                    pose=arm_paths["left"].poses[-1].to(device=self.env.device, dtype=torch.float32),
+                    gripper_action=arm_paths["left"].gripper_actions[-1].to(device=self.env.device, dtype=torch.float32),
+                    noise=0.0,
+                ),
+                "right": Waypoint(
+                    pose=arm_paths["right"].poses[-1].to(device=self.env.device, dtype=torch.float32),
+                    gripper_action=arm_paths["right"].gripper_actions[-1].to(device=self.env.device, dtype=torch.float32),
+                    noise=0.0,
+                ),
+            }
+
+            needs_correction = self._compute_tracking_correction_steps(
+                env_id=env_id,
+                target_waypoints=final_waypoints,
+                max_pose_error=goal_corr_thresh,
+            )
+
+            if needs_correction > 0:
+                actual_steps = max(needs_correction, goal_corr_steps)
+                if debug_schedule:
+                    print(f"[Goal Correction] Applying {actual_steps} correction steps (error > {goal_corr_thresh}m)")
+                for step in range(actual_steps):
+                    alpha = float(step + 1) / float(actual_steps)
+                    corrected_waypoints = self._interpolate_from_actual(
+                        env_id=env_id,
+                        target_waypoints=final_waypoints,
+                        alpha=alpha,
+                        prev_gripper_actions=last_commanded_gripper if last_commanded_gripper else None,
+                    )
+                    corr_multi = MultiWaypoint(corrected_waypoints)
+                    exec_results = await corr_multi.execute(
+                        env=self.env,
+                        success_term=success_term,
+                        env_id=env_id,
+                        env_action_queue=env_action_queue,
+                    )
+                    self._update_execution_buffers(exec_results, buffers)
+
+                # Hold at the final target for a few more steps to let the
+                # controller fully settle
+                hold_after_correction = max(goal_corr_steps // 2, 2)
+                for _ in range(hold_after_correction):
+                    hold_multi = MultiWaypoint(final_waypoints)
+                    exec_results = await hold_multi.execute(
+                        env=self.env,
+                        success_term=success_term,
+                        env_id=env_id,
+                        env_action_queue=env_action_queue,
+                    )
+                    self._update_execution_buffers(exec_results, buffers)
+
+                if debug_schedule:
+                    print(f"[Goal Correction] Done. Success after correction: {buffers.success}")
+
         print(f"[Replay] Completed {num_ticks} ticks. Success: {buffers.success}")
 
         generated_actions: list[torch.Tensor] | torch.Tensor

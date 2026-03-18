@@ -76,6 +76,21 @@ class DataGenConfig:
     use_skillgen: bool = False
     """Whether to use skillgen to generate motion trajectories."""
 
+    goal_correction_steps: int = 0
+    """Number of interpolation steps from actual EE pose to final target at end of replay.
+
+    After the scheduled trajectory completes, if the EE position error exceeds
+    ``goal_correction_threshold``, this many steps are executed that smoothly
+    interpolate from the robot's actual EE pose to the commanded final target.
+    Set to 0 to disable.
+    """
+
+    goal_correction_threshold: float = 0.02
+    """Position error threshold (meters) that triggers goal-reaching correction.
+
+    Only applies when ``goal_correction_steps > 0``.
+    """
+
 
 @configclass
 class SubTaskConfig:

@@ -73,8 +73,10 @@ class NutPourGR1T2MimicEnvSkillGenCfg(NutPourGR1T2PinkIKEnvCfg, MimicEnvCfg):
         self.datagen_config.skill_gripper_interp_steps = 4  # ~1 second smooth close at 50Hz
         # self.datagen_config.schedule_min_dt = 0.05  # Match step_dt for consistency
         self.datagen_config.schedule_all_offline = True
-        self.datagen_config.max_joint_step_rad = 0.09 #0.01  # Smoother wrist motion (2.9 degrees max per tick)
-        self.datagen_config.final_hold_steps = 0
+        self.datagen_config.max_joint_step_rad = 0.1 #0.01  # Smoother wrist motion (2.9 degrees max per tick)
+        self.datagen_config.final_hold_steps = 2
+        self.datagen_config.goal_correction_steps = 10
+        self.datagen_config.goal_correction_threshold = 0.005
 
         # The following are the subtask configurations for the stack task.
         subtask_configs = []
