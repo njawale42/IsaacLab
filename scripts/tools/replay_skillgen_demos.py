@@ -49,6 +49,15 @@ parser.add_argument(
     default=None,
     help="Output directory for recorded videos. Defaults to replay_videos/ next to the dataset file.",
 )
+parser.add_argument(
+    "--video_fps",
+    type=str,
+    default="realtime",
+    help=(
+        "Video FPS mode. 'realtime' (default) encodes at physics real-time speed (1/step_dt). "
+        "'wallclock' encodes at measured sim-window speed. Or pass a number for explicit FPS."
+    ),
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -69,6 +78,7 @@ import gymnasium as gym
 import h5py
 import numpy as np
 import os
+import time
 import torch
 
 from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
@@ -127,6 +137,41 @@ def resolve_task_name(hdf5_file: h5py.File, cli_task: str | None) -> str:
     return env_args["env_name"]
 
 
+def _resolve_video_fps(mode: str, metadata_fps: float, measured_fps: float) -> float:
+    """Resolve the encoding FPS from the --video_fps argument."""
+    if mode == "realtime":
+        return metadata_fps
+    if mode == "wallclock":
+        return measured_fps
+    return float(mode)
+
+
+def _write_video(
+    frames: list[np.ndarray],
+    video_dir: str,
+    wall_elapsed: float,
+    fps_mode: str,
+    env,
+):
+    """Encode collected frames into an MP4."""
+    from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+
+    n = len(frames)
+    metadata_fps = env.metadata.get("render_fps", 30)
+    measured_fps = n / wall_elapsed if wall_elapsed > 0 else metadata_fps
+    chosen_fps = _resolve_video_fps(fps_mode, metadata_fps, measured_fps)
+
+    print(f"Video encoding: {n} frames, wall-clock {wall_elapsed:.1f}s")
+    print(f"  realtime fps (1/step_dt): {metadata_fps:.1f}")
+    print(f"  wallclock fps (sim-window): {measured_fps:.1f}")
+    print(f"  encoding fps: {chosen_fps:.1f}")
+
+    video_path = os.path.join(video_dir, "replay.mp4")
+    clip = ImageSequenceClip(list(frames), fps=chosen_fps)
+    clip.write_videofile(video_path, logger=None)
+    print(f"Saved video: {video_path}")
+
+
 def main():
     global is_paused
 
@@ -156,27 +201,19 @@ def main():
 
     render_mode = "rgb_array" if args_cli.video else None
     _gym_env = gym.make(task_name, cfg=env_cfg, render_mode=render_mode)
+    env = _gym_env.unwrapped
 
+    video_frames: list[np.ndarray] = []
+    video_dir = None
     if args_cli.video:
-        action_key = "processed_actions" if args_cli.use_processed_actions else "actions"
-        total_video_steps = sum(
-            data_group[episode_names[i]][action_key].shape[0]
-            for i in episode_indices
-            if i < episode_count
-        )
         video_dir = args_cli.video_dir or os.path.join(
             os.path.dirname(os.path.abspath(args_cli.dataset_file)), "replay_videos"
         )
-        _gym_env = gym.wrappers.RecordVideo(
-            _gym_env,
-            video_folder=video_dir,
-            step_trigger=lambda step: step == 0,
-            video_length=total_video_steps,
-            disable_logger=True,
-        )
-        print(f"Recording video ({total_video_steps} steps) -> {video_dir}")
-
-    env = _gym_env.unwrapped
+        os.makedirs(video_dir, exist_ok=True)
+        metadata_fps = env.metadata.get("render_fps", 30)
+        print(f"Recording video -> {video_dir}")
+        print(f"  metadata render_fps (real-time): {metadata_fps:.1f}")
+        print(f"  video_fps mode: {args_cli.video_fps}")
 
     teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.1, rot_sensitivity=0.1))
     teleop_interface.add_callback("N", play_cb)
@@ -198,6 +235,8 @@ def main():
     env_step = [0] * num_envs
 
     replayed = 0
+    wall_t0 = time.perf_counter()
+    pause_duration = 0.0
 
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while simulation_app.is_running() and not simulation_app.is_exiting():
@@ -234,12 +273,23 @@ def main():
                     actions[env_id] = env_actions[env_id][env_step[env_id]]
                     env_step[env_id] += 1
 
+            pause_t0 = time.perf_counter()
             while is_paused:
                 env.sim.render()
+            pause_duration += time.perf_counter() - pause_t0
 
             _gym_env.step(actions)
 
+            if args_cli.video:
+                frame = env.render()
+                if frame is not None:
+                    video_frames.append(frame)
+
+    wall_elapsed = time.perf_counter() - wall_t0 - pause_duration
     hdf5_file.close()
+
+    if args_cli.video and video_frames:
+        _write_video(video_frames, video_dir, wall_elapsed, args_cli.video_fps or "realtime", env)
 
     suffix = "s" if replayed != 1 else ""
     print(f"Finished replaying {replayed} episode{suffix}.")
