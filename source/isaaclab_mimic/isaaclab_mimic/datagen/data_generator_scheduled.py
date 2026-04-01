@@ -271,7 +271,7 @@ class DataGeneratorScheduled:
         demo_keys: list[str] | None = None,
         *,
         skillgen_type: str = "single_arm",
-        schedule_offline: bool = True,
+        schedule_offline: bool | None = None,
     ):
         """
         Args:
@@ -282,13 +282,16 @@ class DataGeneratorScheduled:
                 will be used.
             skillgen_type: type of skillgen workflow ("single_arm" or "bimanual")
             schedule_offline: when True, builds complete arm paths offline without stepping
-                the simulator, then schedules them for collision-aware execution.
+                the simulator, then schedules them for collision-aware execution. If None,
+                defaults to True only for bimanual workflows.
         """
         self.env = env
         self.env_cfg = env.cfg
         assert isinstance(self.env_cfg, MimicEnvCfg)
         self.dataset_path = dataset_path
         self.skillgen_type = skillgen_type
+        if schedule_offline is None:
+            schedule_offline = skillgen_type == "bimanual"
         self.schedule_offline = schedule_offline
         self._goal_visualizers: dict[tuple[int, str], VisualizationMarkers] = {}
         self._goal_viz_warning_emitted: bool = False
@@ -920,7 +923,7 @@ class DataGeneratorScheduled:
                         # so that constraints apply to the full (MP + skill) length,
                         # matching data_gen_bimanual.py behavior.
                         transition_started, combined_waypoints, failure_result = (
-                            self._start_motion_planned_transition_if_needed(
+                            await self._start_motion_planned_transition_if_needed(
                                 env_id=env_id,
                                 eef_name=eef_name,
                                 eef_state=eef_state,
@@ -1124,7 +1127,7 @@ class DataGeneratorScheduled:
             prev_pool_size = current_pool_size
         return randomized_subtask_boundaries, prev_pool_size
 
-    def _start_motion_planned_transition_if_needed(
+    async def _start_motion_planned_transition_if_needed(
         self,
         env_id: int,
         eef_name: str,
@@ -1215,7 +1218,11 @@ class DataGeneratorScheduled:
                 planner_kwargs["input_is_site_frame"] = True
                 # Force the specific arm to avoid auto-selection based on proximity
                 planner_kwargs["arm"] = eef_name
-            planning_success = motion_planner.update_world_and_plan_motion(**planner_kwargs)
+            plan_async = getattr(motion_planner, "update_world_and_plan_motion_async", None)
+            if plan_async is not None:
+                planning_success = await plan_async(**planner_kwargs)
+            else:
+                planning_success = motion_planner.update_world_and_plan_motion(**planner_kwargs)
 
         if not planning_success:
             print(f"Env {env_id}: Motion planning failed for {eef_name}")

@@ -8,7 +8,7 @@
 from isaaclab.app import AppLauncher
 
 # Launch omniverse app
-simulation_app = AppLauncher(headless=True).app
+simulation_app = AppLauncher(headless=False).app
 
 import os
 import subprocess
@@ -71,21 +71,33 @@ def test_generate_dataset_skillgen(setup_skillgen_test_environment):
         "--output_file",
         output_file,
         "--num_envs",
-        "1",
+        "2",
         "--generation_num_trials",
         "1",
         "--use_skillgen",
+        "--planner_max_batch",
+        "8",
         "--headless",
         "--task",
         "Isaac-Stack-Cube-Franka-IK-Rel-Skillgen-v0",
     ]
 
-    result = subprocess.run(command, capture_output=True, text=True)
+    timeout_s = 60
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        pytest.fail(
+            f"SkillGen dataset generation timed out after {timeout_s}s.\n"
+            f"Partial stdout:\n{stdout}\n\nPartial stderr:\n{stderr}"
+        )
 
     print("SkillGen dataset generation result:")
     print(result.stdout)
     print(result.stderr)
 
     assert result.returncode == 0, result.stderr
+    assert os.path.exists(output_file)
     expected_output = "successes/attempts. Exiting"
     assert expected_output in result.stdout

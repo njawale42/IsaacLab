@@ -70,6 +70,7 @@ def env_loop(
     env_action_queue: asyncio.Queue,
     shared_datagen_info_pool: DataGenInfoPool,
     asyncio_event_loop: asyncio.AbstractEventLoop,
+    data_gen_tasks: asyncio.Future | None = None,
 ):
     """Main asyncio loop for the environment.
 
@@ -79,6 +80,8 @@ def env_loop(
         env_action_queue: The asyncio queue to handle actions to for executing actions.
         shared_datagen_info_pool: The shared datagen info pool that stores source demo info.
         asyncio_event_loop: The main asyncio event loop.
+        data_gen_tasks: Optional gather future for async generation tasks. If any task fails,
+            the env loop aborts immediately instead of waiting forever for missing actions.
     """
     global num_success, num_failures, num_attempts
     env_id_tensor = torch.tensor([0], dtype=torch.int64, device=env.device)
@@ -90,6 +93,13 @@ def env_loop(
             # check if any environment needs to be reset while waiting for actions
             while env_action_queue.qsize() != env.num_envs:
                 asyncio_event_loop.run_until_complete(asyncio.sleep(0))
+                if data_gen_tasks is not None and data_gen_tasks.done():
+                    task_exception = data_gen_tasks.exception()
+                    if task_exception is not None:
+                        raise RuntimeError("Data generation task failed") from task_exception
+                    raise RuntimeError("Data generation tasks finished unexpectedly before filling action queue")
+                if env.sim.has_gui() or env.sim.has_rtx_sensors():
+                    env.render()
                 while not env_reset_queue.empty():
                     env_id_tensor[0] = env_reset_queue.get_nowait()
                     env.reset(env_ids=env_id_tensor)
@@ -205,6 +215,7 @@ def setup_async_generation(
     pause_subtask: bool = False,
     motion_planners: Any = None,
     skillgen_type: str = "single_arm",
+    schedule_offline: bool | None = None,
 ) -> dict[str, Any]:
     """Setup async data generation tasks.
 
@@ -214,7 +225,9 @@ def setup_async_generation(
         input_file: Path to input dataset file
         success_term: Success termination condition
         pause_subtask: Whether to pause after subtasks
-        motion_planners: Motion planner instances for all environments
+        motion_planners: Motion planner instances or planner handles for all environments
+        schedule_offline: Whether to build full paths offline before execution. If None,
+            the data generator infers the default from the workflow type.
 
     Returns:
         List of asyncio tasks for data generation
@@ -232,6 +245,7 @@ def setup_async_generation(
         env=env,
         src_demo_datagen_info_pool=shared_datagen_info_pool,
         skillgen_type=skillgen_type,
+        schedule_offline=schedule_offline,
     )
     data_generator_asyncio_tasks = []
     for i in range(num_envs):

@@ -60,6 +60,26 @@ parser.add_argument(
     help="Scheduling strategy for bimanual collision avoidance: "
          "'retiming' (waypoint-level MILP, default) or 'dag' (segment-level MILP).",
 )
+schedule_offline_group = parser.add_mutually_exclusive_group()
+schedule_offline_group.add_argument(
+    "--schedule_offline",
+    dest="schedule_offline",
+    action="store_true",
+    help="Enable offline scheduling before execution. Intended for bimanual SkillGen workflows.",
+)
+schedule_offline_group.add_argument(
+    "--no_schedule_offline",
+    dest="schedule_offline",
+    action="store_false",
+    help="Disable offline scheduling and use normal online SkillGen execution.",
+)
+parser.set_defaults(schedule_offline=None)
+parser.add_argument(
+    "--planner_max_batch",
+    type=int,
+    default=8,
+    help="Maximum cuRobo micro-batch size for shared cube-stack batch planning.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -100,6 +120,9 @@ import isaaclab_tasks  # noqa: F401
 
 def main():
     num_envs = args_cli.num_envs
+    async_components = None
+    data_gen_tasks = None
+    shared_motion_planner_backend = None
 
     # Setup output paths and get env name
     output_dir, output_file_name = setup_output_paths(args_cli.output_file)
@@ -162,37 +185,50 @@ def main():
 
     motion_planners = None
     if args_cli.use_skillgen:
+        from isaaclab_mimic.motion_planners.curobo.batched_cube_stack_planner import (
+            create_batched_cube_stack_motion_planners,
+        )
         from isaaclab_mimic.motion_planners.curobo.bimanual_humanoid_planner import BimanualHumanoidPlanner
         from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
         from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
 
-        motion_planners = {}
-        for env_id in range(num_envs):
-            print(f"Initializing motion planner for environment {env_id}")
+        planner_config = CuroboPlannerCfg.from_task_name(env_name)
+        if args_cli.skillgen_type != "bimanual" and "stack-cube" in env_name.lower():
+            print("Initializing shared batched cube-stack planner backend")
+            shared_motion_planner_backend, motion_planners = create_batched_cube_stack_motion_planners(
+                env=env,
+                robot=env.scene["robot"],
+                config=planner_config,
+                num_envs=num_envs,
+                max_batch=args_cli.planner_max_batch,
+            )
+        else:
+            motion_planners = {}
             if (
                 args_cli.skillgen_type == "bimanual"
                 and "nutpour-gr1t2" in env_name.lower()
                 and prebuilt_humanoid_cfgs is not None
             ):
-                cfg_left, cfg_right = prebuilt_humanoid_cfgs
-                motion_planners[env_id] = BimanualHumanoidPlanner(
-                    env=env,
-                    robot=env.scene["robot"],
-                    cfg_right=cfg_right,
-                    cfg_left=cfg_left,
-                    env_id=env_id,
-                )
+                for env_id in range(num_envs):
+                    cfg_left, cfg_right = prebuilt_humanoid_cfgs
+                    motion_planners[env_id] = BimanualHumanoidPlanner(
+                        env=env,
+                        robot=env.scene["robot"],
+                        cfg_right=cfg_right,
+                        cfg_left=cfg_left,
+                        env_id=env_id,
+                    )
             else:
-                planner_config = CuroboPlannerCfg.from_task_name(env_name)
-                # No planner visualization during dataset generation
-                # planner_config.visualize_spheres = False
-                # planner_config.visualize_plan = False
-                motion_planners[env_id] = CuroboPlanner(
+                print(f"Initializing shared motion planner for {num_envs} environments...")
+                planners = CuroboPlanner.create_shared_planners(
                     env=env,
                     robot=env.scene["robot"],
                     config=planner_config,
-                    env_id=env_id,
+                    num_envs=num_envs,
                 )
+                for env_id, planner in enumerate(planners):
+                    motion_planners[env_id] = planner
+                print(f"Shared planner ready: 1 MotionGen serving {num_envs} environments")
 
     # Setup and run async data generation
     async_components = setup_async_generation(
@@ -203,6 +239,7 @@ def main():
         pause_subtask=args_cli.pause_subtask,
         motion_planners=motion_planners,  # Pass the motion planners dictionary
         skillgen_type=args_cli.skillgen_type,
+        schedule_offline=args_cli.schedule_offline,
     )
 
     try:
@@ -213,19 +250,24 @@ def main():
             async_components["action_queue"],
             async_components["info_pool"],
             async_components["event_loop"],
+            data_gen_tasks=data_gen_tasks,
         )
     except asyncio.CancelledError:
         print("Tasks were cancelled.")
     finally:
         # Cancel all async tasks when env_loop finishes
-        data_gen_tasks.cancel()
+        if data_gen_tasks is not None:
+            data_gen_tasks.cancel()
         try:
             # Wait for tasks to be cancelled
-            async_components["event_loop"].run_until_complete(data_gen_tasks)
+            if async_components is not None and data_gen_tasks is not None:
+                async_components["event_loop"].run_until_complete(data_gen_tasks)
         except asyncio.CancelledError:
             print("Remaining async tasks cancelled and cleaned up.")
         except Exception as e:
             print(f"Error cancelling remaining async tasks: {e}")
+        if shared_motion_planner_backend is not None and async_components is not None:
+            async_components["event_loop"].run_until_complete(shared_motion_planner_backend.aclose())
         # Cleanup of motion planners and their visualizers
         if motion_planners is not None:
             for env_id, planner in motion_planners.items():

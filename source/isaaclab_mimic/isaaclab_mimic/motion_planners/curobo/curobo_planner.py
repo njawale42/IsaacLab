@@ -148,12 +148,18 @@ class CuroboPlanner(MotionPlannerBase):
         num_trajopt_seeds: int = 12,
         num_graph_seeds: int = 12,
         interpolation_dt: float = 0.05,
+        shared_motion_gen: MotionGen | None = None,
     ) -> None:
         """Initialize the motion planner for a specific environment.
 
         Sets up the cuRobo motion generator with collision checking, configures the robot model,
         and prepares visualization components if enabled. The planner is isolated to CUDA device
         regardless of Isaac Lab's device configuration.
+
+        When ``shared_motion_gen`` is provided, this planner reuses an existing MotionGen instance
+        instead of creating its own. This enables multiple environments to share a single GPU-heavy
+        planner, dramatically reducing CUDA memory usage. The shared MotionGen's collision world
+        is swapped to the current env's state before each planning call.
 
         Args:
             env: The Isaac Lab environment instance containing the robot and scene
@@ -165,6 +171,8 @@ class CuroboPlanner(MotionPlannerBase):
             num_trajopt_seeds: Number of seeds for trajectory optimization
             num_graph_seeds: Number of seeds for graph search
             interpolation_dt: Time step for interpolating waypoints
+            shared_motion_gen: Pre-created MotionGen instance to share across environments.
+                When provided, skips MotionGen creation and warmup.
 
         Raises:
             ValueError: If ``robot_config_file`` is not provided
@@ -182,6 +190,7 @@ class CuroboPlanner(MotionPlannerBase):
         self.step_size: float | None = self.config.motion_step_size
         self.visualize_plan: bool = self.config.visualize_plan
         self.visualize_spheres: bool = self.config.visualize_spheres
+        self._is_shared: bool = shared_motion_gen is not None
 
         # Log the config parameter values
         self.logger.info(f"Config parameter values: {self.config}")
@@ -207,14 +216,12 @@ class CuroboPlanner(MotionPlannerBase):
         setup_curobo_logger("warn")
 
         # Force cuRobo to always use CUDA device regardless of Isaac Lab device
-        # This isolates the motion planner from Isaac Lab's device configuration
         self.tensor_args: TensorDeviceType
         if torch.cuda.is_available():
             idx = self.config.cuda_device if self.config.cuda_device is not None else torch.cuda.current_device()
             self.tensor_args = TensorDeviceType(device=torch.device(f"cuda:{idx}"), dtype=torch.float32)
             self.logger.debug(f"cuRobo motion planner initialized on CUDA device {idx}")
         else:
-            # Fallback to CPU if CUDA not available, but this may cause issues
             self.tensor_args = TensorDeviceType()
             self.logger.warning("CUDA not available, cuRobo using CPU - this may cause device compatibility issues")
 
@@ -223,40 +230,37 @@ class CuroboPlanner(MotionPlannerBase):
             raise ValueError("robot_config_file is required")
         robot_cfg_file = self.config.robot_config_file
         robot_cfg: dict[str, Any] = load_yaml(robot_cfg_file)["robot_cfg"]
-        self.logger.info(f"Loaded robot configuration from {robot_cfg_file}")
 
-        # Configure collision spheres
         if self.config.collision_spheres_file:
             robot_cfg["kinematics"]["collision_spheres"] = self.config.collision_spheres_file
-
-        # Configure extra collision spheres
         if self.config.extra_collision_spheres:
             robot_cfg["kinematics"]["extra_collision_spheres"] = self.config.extra_collision_spheres
 
         self.robot_cfg: dict[str, Any] = robot_cfg
 
-        # Load world configuration using the config's method
-        world_cfg: WorldConfig = self.config.get_world_config()
-
-        # Create motion generator config with parameters from configuration
-        motion_gen_config: MotionGenConfig = MotionGenConfig.load_from_robot_config(
-            robot_cfg,
-            world_cfg,
-            tensor_args=self.tensor_args,
-            collision_checker_type=self.config.collision_checker_type,
-            num_trajopt_seeds=self.config.num_trajopt_seeds,
-            num_graph_seeds=self.config.num_graph_seeds,
-            interpolation_dt=self.config.interpolation_dt,
-            collision_cache=self.config.collision_cache_size,
-            trajopt_tsteps=self.config.trajopt_tsteps,
-            maximum_trajectory_dt=self.config.maximum_trajectory_dt,
-            collision_activation_distance=self.config.collision_activation_distance,
-            position_threshold=self.config.position_threshold,
-            rotation_threshold=self.config.rotation_threshold,
-        )
-
-        # Create motion generator
-        self.motion_gen: MotionGen = MotionGen(motion_gen_config)
+        if shared_motion_gen is not None:
+            # Reuse existing MotionGen — skip creation, warmup, and static world init.
+            # The primary planner (env_id=0) already set up the world.
+            self.motion_gen: MotionGen = shared_motion_gen
+        else:
+            # Full initialisation path: build a new MotionGen from scratch.
+            world_cfg: WorldConfig = self.config.get_world_config()
+            motion_gen_config: MotionGenConfig = MotionGenConfig.load_from_robot_config(
+                robot_cfg,
+                world_cfg,
+                tensor_args=self.tensor_args,
+                collision_checker_type=self.config.collision_checker_type,
+                num_trajopt_seeds=self.config.num_trajopt_seeds,
+                num_graph_seeds=self.config.num_graph_seeds,
+                interpolation_dt=self.config.interpolation_dt,
+                collision_cache=self.config.collision_cache_size,
+                trajopt_tsteps=self.config.trajopt_tsteps,
+                maximum_trajectory_dt=self.config.maximum_trajectory_dt,
+                collision_activation_distance=self.config.collision_activation_distance,
+                position_threshold=self.config.position_threshold,
+                rotation_threshold=self.config.rotation_threshold,
+            )
+            self.motion_gen: MotionGen = MotionGen(motion_gen_config)
 
         # Set motion generator reference for plan visualizer if enabled
         if self.visualize_plan:
@@ -284,16 +288,12 @@ class CuroboPlanner(MotionPlannerBase):
         self.spheres: list[tuple[str, float]] | None = None
         self.sphere_update_freq: int = self.config.sphere_update_freq
 
-        # Sync joint limits from Isaac Lab to cuRobo BEFORE warmup
-        # This ensures cuRobo plans within the same limits the controller uses
-        self._sync_joint_limits_from_isaac_lab()
-
-        # Warm up planner
-        self.logger.info("Warming up motion planner...")
-        self.motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
-
-        # Read static world geometry once
-        self._initialize_static_world()
+        if shared_motion_gen is None:
+            # Primary planner path: full init
+            self._sync_joint_limits_from_isaac_lab()
+            self.logger.info("Warming up motion planner...")
+            self.motion_gen.warmup(enable_graph=True, warmup_js_trajopt=False)
+            self._initialize_static_world()
 
         # Defer object validation baseline until first update_world() call when scene is fully loaded
         self._expected_objects: set[str] | None = None
@@ -304,6 +304,50 @@ class CuroboPlanner(MotionPlannerBase):
         # Cache object mappings
         # Only recompute when objects are added/removed, not when poses change
         self._cached_object_mappings: dict[str, str] | None = None
+
+    # =====================================================================================
+    # SHARED PLANNER FACTORY
+    # =====================================================================================
+
+    @classmethod
+    def create_shared_planners(
+        cls,
+        env: ManagerBasedEnv,
+        robot: Articulation,
+        config: CuroboPlannerCfg,
+        num_envs: int,
+    ) -> list["CuroboPlanner"]:
+        """Create N planner instances sharing a single MotionGen.
+
+        The first planner (env_id=0) creates the MotionGen, warms it up, and initialises
+        the static world. Subsequent planners reuse that MotionGen, saving significant
+        CUDA memory (one set of IK/trajopt/graph-planner GPU buffers instead of N).
+
+        All planners share the same collision world model. Before each planning call the
+        per-env planner updates object poses for its own env_id, so the collision world
+        always reflects the correct state for the env being planned.
+
+        Args:
+            env: The Isaac Lab environment.
+            robot: Robot articulation shared across envs.
+            config: Planner configuration (same for every env).
+            num_envs: Number of environments.
+
+        Returns:
+            List of CuroboPlanner instances, one per env, sharing one MotionGen.
+        """
+        primary = cls(env=env, robot=robot, config=config, env_id=0)
+        planners: list[CuroboPlanner] = [primary]
+        for i in range(1, num_envs):
+            planner = cls(
+                env=env,
+                robot=robot,
+                config=config,
+                env_id=i,
+                shared_motion_gen=primary.motion_gen,
+            )
+            planners.append(planner)
+        return planners
 
     # =====================================================================================
     # DEVICE CONVERSION UTILITIES
@@ -883,6 +927,16 @@ class CuroboPlanner(MotionPlannerBase):
 
         return self._cached_object_mappings
 
+    @property
+    def _world_model_env_id(self) -> int:
+        """Env id whose USD paths are stored in the shared collision world model.
+
+        For shared MotionGen the static world was built from env_0, so all obstacle
+        paths use the ``/World/envs/env_0/`` prefix regardless of which env this
+        planner instance is serving.
+        """
+        return 0 if self._is_shared else self.env_id
+
     def _discover_object_mappings(self, world_model, rigid_objects) -> dict[str, str]:
         """Build mapping between Isaac Lab object names and cuRobo world paths.
 
@@ -890,6 +944,10 @@ class CuroboPlanner(MotionPlannerBase):
         and their full USD paths in cuRobo's world model. This mapping is essential for
         pose synchronization and attachment operations, as cuRobo uses full USD paths
         while Isaac Lab uses short object names.
+
+        For shared MotionGen, the world model always uses env_0 paths. Planners for
+        other envs will discover objects using the env_0 prefix, then update those
+        same paths with their own env_id's poses.
 
         Args:
             world_model: cuRobo's collision world model containing primitive objects
@@ -899,7 +957,7 @@ class CuroboPlanner(MotionPlannerBase):
             Dictionary mapping Isaac Lab object names to their corresponding USD paths
         """
         mappings = {}
-        env_prefix = f"/World/envs/env_{self.env_id}/"
+        env_prefix = f"/World/envs/env_{self._world_model_env_id}/"
         world_object_paths = []
 
         # Collect all primitive objects from cuRobo world model
@@ -911,7 +969,6 @@ class CuroboPlanner(MotionPlannerBase):
 
         # Match Isaac Lab object names to world paths
         for object_name in rigid_objects.keys():
-            # Direct name matching
             for path in world_object_paths:
                 if object_name.lower().replace("_", "") in path.lower().replace("_", ""):
                     mappings[object_name] = path
@@ -2104,6 +2161,34 @@ class CuroboPlanner(MotionPlannerBase):
     # HIGH-LEVEL PLANNING INTERFACE
     # =====================================================================================
 
+    def _reset_shared_attachment_state(self) -> None:
+        """Ensure the shared MotionGen has a clean attachment state before planning.
+
+        When multiple envs share one MotionGen, the previous env's planning may have
+        left attached-object collision spheres on the kinematics model. This method
+        unconditionally detaches everything so the current env can set up its own
+        attachment state from scratch.
+
+        Only called when ``self._is_shared`` is True.
+        """
+        configured_link = self.config.attached_object_link_name
+        link_idx_map = getattr(
+            self.motion_gen.kinematics.kinematics_config, "link_name_to_idx_map", {}
+        )
+        if configured_link in link_idx_map:
+            try:
+                self.motion_gen.detach_object_from_robot(link_name=configured_link)
+            except ValueError:
+                pass
+
+        # Re-enable all obstacles that may have been disabled by attachment
+        object_mappings = self._get_object_mappings()
+        for _, object_path in object_mappings.items():
+            try:
+                self.motion_gen.world_coll_checker.enable_obstacle(object_path, enable=True)
+            except Exception:
+                pass
+
     def update_world_and_plan_motion(
         self,
         target_pose: torch.Tensor,
@@ -2138,6 +2223,10 @@ class CuroboPlanner(MotionPlannerBase):
         """
         # Always reset the plan before starting a new one to ensure a clean state
         self.reset_plan()
+
+        # For shared MotionGen, clean up attachment state left by previous env
+        if self._is_shared:
+            self._reset_shared_attachment_state()
 
         self.logger.debug("=== MOTION PLANNING DEBUG ===")
         self.logger.debug(f"Expected attached object: {expected_attached_object}")
