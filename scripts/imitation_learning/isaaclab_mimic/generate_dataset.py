@@ -80,6 +80,44 @@ parser.add_argument(
     default=8,
     help="Maximum cuRobo micro-batch size for shared cube-stack batch planning.",
 )
+parser.add_argument(
+    "--planner_mode",
+    type=str,
+    choices=["legacy", "shared", "batched"],
+    default="legacy",
+    help=(
+        "Planner ownership mode for SkillGen. "
+        "'legacy' creates one planner per env, "
+        "'shared' reuses one MotionGen across per-env planners, "
+        "'batched' batches detached planning calls for single-arm cube-stack."
+    ),
+)
+parser.add_argument(
+    "--debug_planner",
+    action="store_true",
+    default=False,
+    help="Enable verbose planner debug logging.",
+)
+parser.add_argument(
+    "--debug_datagen",
+    action="store_true",
+    default=False,
+    help="Enable verbose data-generation attempt logging.",
+)
+generation_guarantee_group = parser.add_mutually_exclusive_group()
+generation_guarantee_group.add_argument(
+    "--generation_guarantee",
+    dest="generation_guarantee",
+    action="store_true",
+    help="Keep retrying until the requested number of successful demos are generated.",
+)
+generation_guarantee_group.add_argument(
+    "--no_generation_guarantee",
+    dest="generation_guarantee",
+    action="store_false",
+    help="Stop after the requested number of attempts, even if all attempts fail.",
+)
+parser.set_defaults(generation_guarantee=None)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -153,6 +191,18 @@ def main():
         except Exception:
             pass
 
+    if args_cli.generation_guarantee is not None:
+        try:
+            env_cfg.datagen_config.generation_guarantee = bool(args_cli.generation_guarantee)
+        except Exception:
+            pass
+
+    if args_cli.debug_datagen:
+        try:
+            env_cfg.datagen_config.debug_generation = True
+        except Exception:
+            pass
+
     # Precompute humanoid planner configs BEFORE creating the env (ordering matters)
     prebuilt_humanoid_cfgs = None
     if args_cli.use_skillgen and args_cli.skillgen_type == "bimanual" and "nutpour-gr1t2" in env_name.lower():
@@ -193,22 +243,13 @@ def main():
         from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
 
         planner_config = CuroboPlannerCfg.from_task_name(env_name)
-        if args_cli.skillgen_type != "bimanual" and "stack-cube" in env_name.lower():
-            print("Initializing shared batched cube-stack planner backend")
-            shared_motion_planner_backend, motion_planners = create_batched_cube_stack_motion_planners(
-                env=env,
-                robot=env.scene["robot"],
-                config=planner_config,
-                num_envs=num_envs,
-                max_batch=args_cli.planner_max_batch,
-            )
-        else:
-            motion_planners = {}
-            if (
-                args_cli.skillgen_type == "bimanual"
-                and "nutpour-gr1t2" in env_name.lower()
-                and prebuilt_humanoid_cfgs is not None
-            ):
+        planner_config.debug_planner = bool(args_cli.debug_planner)
+        planner_mode = args_cli.planner_mode
+        motion_planners = {}
+        if args_cli.skillgen_type == "bimanual":
+            if planner_mode != "legacy":
+                raise ValueError("planner_mode shared/batched is not supported for bimanual SkillGen workflows yet.")
+            if "nutpour-gr1t2" in env_name.lower() and prebuilt_humanoid_cfgs is not None:
                 for env_id in range(num_envs):
                     cfg_left, cfg_right = prebuilt_humanoid_cfgs
                     motion_planners[env_id] = BimanualHumanoidPlanner(
@@ -219,16 +260,38 @@ def main():
                         env_id=env_id,
                     )
             else:
-                print(f"Initializing shared motion planner for {num_envs} environments...")
-                planners = CuroboPlanner.create_shared_planners(
+                raise ValueError("Bimanual SkillGen currently expects prebuilt humanoid planner configs.")
+        elif planner_mode == "batched":
+            if "stack-cube" not in env_name.lower():
+                raise ValueError("planner_mode=batched is currently only supported for single-arm cube-stack workflows.")
+            print("Initializing shared batched cube-stack planner backend")
+            shared_motion_planner_backend, motion_planners = create_batched_cube_stack_motion_planners(
+                env=env,
+                robot=env.scene["robot"],
+                config=planner_config,
+                num_envs=num_envs,
+                max_batch=args_cli.planner_max_batch,
+            )
+        elif planner_mode == "shared":
+            print(f"Initializing shared motion planner for {num_envs} environments...")
+            planners = CuroboPlanner.create_shared_planners(
+                env=env,
+                robot=env.scene["robot"],
+                config=planner_config,
+                num_envs=num_envs,
+            )
+            for env_id, planner in enumerate(planners):
+                motion_planners[env_id] = planner
+            print(f"Shared planner ready: 1 MotionGen serving {num_envs} environments")
+        else:
+            for env_id in range(num_envs):
+                print(f"Initializing legacy motion planner for environment {env_id}")
+                motion_planners[env_id] = CuroboPlanner(
                     env=env,
                     robot=env.scene["robot"],
                     config=planner_config,
-                    num_envs=num_envs,
+                    env_id=env_id,
                 )
-                for env_id, planner in enumerate(planners):
-                    motion_planners[env_id] = planner
-                print(f"Shared planner ready: 1 MotionGen serving {num_envs} environments")
 
     # Setup and run async data generation
     async_components = setup_async_generation(

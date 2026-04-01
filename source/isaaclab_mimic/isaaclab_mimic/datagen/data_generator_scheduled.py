@@ -856,6 +856,7 @@ class DataGeneratorScheduled:
             dict containing simulator states, observations, actions, and success flag.
         """
         self._require_motion_planner_if_skillgen(motion_planner)
+        debug_generation = bool(getattr(self.env_cfg.datagen_config, "debug_generation", False))
 
         # Use offline scheduling pipeline if enabled (bimanual only)
         if self.schedule_offline:
@@ -888,6 +889,7 @@ class DataGeneratorScheduled:
         prev_src_demo_datagen_info_pool_size = 0
 
         while True:
+            pending_subtask_trajectories: list[tuple[str, EEFGenerationState, WaypointTrajectory]] = []
             pool_lock = self.src_demo_datagen_info_pool.asyncio_lock
             assert pool_lock is not None
             async with pool_lock:
@@ -917,40 +919,47 @@ class DataGeneratorScheduled:
                         runtime_subtask_constraints_dict=runtime_subtask_constraints,
                         selected_src_demo_inds=selected_src_demo_inds,
                     )
+                    pending_subtask_trajectories.append((eef_name, eef_state, eef_subtask_trajectory))
 
-                    if self.env_cfg.datagen_config.use_skillgen:
-                        # SkillGen: combine MP waypoints + skill waypoints into one trajectory
-                        # so that constraints apply to the full (MP + skill) length,
-                        # matching data_gen_bimanual.py behavior.
-                        transition_started, combined_waypoints, failure_result = (
-                            await self._start_motion_planned_transition_if_needed(
-                                env_id=env_id,
-                                eef_name=eef_name,
-                                eef_state=eef_state,
-                                eef_subtask_trajectory=eef_subtask_trajectory,
-                                selected_src_demo_inds=selected_src_demo_inds,
-                                randomized_subtask_boundaries=randomized_subtask_boundaries,
-                                motion_planner=motion_planner,
-                            )
+            for eef_name, eef_state, eef_subtask_trajectory in pending_subtask_trajectories:
+                if self.env_cfg.datagen_config.use_skillgen:
+                    # Do not hold the shared demo-pool lock while awaiting the planner.
+                    # Releasing the lock here allows multiple env tasks to enqueue their
+                    # requests into the batched backend together.
+                    transition_started, combined_waypoints, failure_result = (
+                        await self._start_motion_planned_transition_if_needed(
+                            env_id=env_id,
+                            eef_name=eef_name,
+                            eef_state=eef_state,
+                            eef_subtask_trajectory=eef_subtask_trajectory,
+                            selected_src_demo_inds=selected_src_demo_inds,
+                            randomized_subtask_boundaries=randomized_subtask_boundaries,
+                            motion_planner=motion_planner,
                         )
-                        if failure_result is not None:
-                            return failure_result
-                        if transition_started and combined_waypoints is not None:
-                            eef_state.current_trajectory = combined_waypoints
-                            eef_state.subtask_step_index = 0
-                            eef_state.subtask_started = True
-                            continue
-
-                    # Non-SkillGen path or no motion planner: just use skill waypoints
-                    eef_state.current_trajectory = self.merge_eef_subtask_trajectory(
-                        env_id=env_id,
-                        eef_name=eef_name,
-                        subtask_index=eef_state.current_subtask_index,
-                        prev_executed_traj=eef_state.current_trajectory,
-                        subtask_trajectory=eef_subtask_trajectory,
                     )
-                    eef_state.subtask_step_index = 0
-                    eef_state.subtask_started = True
+                    if failure_result is not None:
+                        if debug_generation:
+                            print(
+                                f"[Datagen][Env {env_id}] Aborting attempt during subtask"
+                                f" {eef_state.current_subtask_index} for {eef_name} due to motion-planning failure."
+                            )
+                        return failure_result
+                    if transition_started and combined_waypoints is not None:
+                        eef_state.current_trajectory = combined_waypoints
+                        eef_state.subtask_step_index = 0
+                        eef_state.subtask_started = True
+                        continue
+
+                # Non-SkillGen path or no motion plan needed: just use skill waypoints
+                eef_state.current_trajectory = self.merge_eef_subtask_trajectory(
+                    env_id=env_id,
+                    eef_name=eef_name,
+                    subtask_index=eef_state.current_subtask_index,
+                    prev_executed_traj=eef_state.current_trajectory,
+                    subtask_trajectory=eef_subtask_trajectory,
+                )
+                eef_state.subtask_step_index = 0
+                eef_state.subtask_started = True
 
             eef_waypoints = self._collect_eef_waypoints(
                 env_id=env_id,
@@ -997,6 +1006,20 @@ class DataGeneratorScheduled:
             actions=generated_actions,
             success=buffers.success,
         )
+        if debug_generation:
+            subtask_progress = {
+                eef_name: {
+                    "current_subtask_index": eef_state.current_subtask_index,
+                    "subtasks_done": eef_state.subtasks_done,
+                    "subtask_step_index": eef_state.subtask_step_index,
+                    "trajectory_len": len(eef_state.current_trajectory),
+                }
+                for eef_name, eef_state in eef_states.items()
+            }
+            print(
+                f"[Datagen][Env {env_id}] Attempt finished. Success={buffers.success},"
+                f" ticks={len(buffers.actions)}, progress={subtask_progress}"
+            )
         return results
 
     def _require_motion_planner_if_skillgen(self, motion_planner: Any | None) -> None:
@@ -1225,7 +1248,12 @@ class DataGeneratorScheduled:
                 planning_success = motion_planner.update_world_and_plan_motion(**planner_kwargs)
 
         if not planning_success:
-            print(f"Env {env_id}: Motion planning failed for {eef_name}")
+            planner_status = getattr(motion_planner, "last_plan_status", None)
+            planner_error = getattr(motion_planner, "last_plan_error", None)
+            print(
+                f"Env {env_id}: Motion planning failed for {eef_name}"
+                f" (subtask={eef_state.current_subtask_index}, status={planner_status}, error={planner_error})"
+            )
             return False, None, {"success": False}
 
         print(f"Env {env_id}: Motion planning succeeded")

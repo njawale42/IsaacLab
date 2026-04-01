@@ -29,6 +29,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs.manager_based_env import ManagerBasedEnv
 
 from isaaclab_mimic.motion_planners.curobo.curobo_planner_cfg import CuroboPlannerCfg
+from isaaclab_mimic.motion_planners.curobo.curobo_planner import CuroboPlanner
 from isaaclab_mimic.motion_planners.motion_planner_base import MotionPlannerBase
 
 
@@ -108,7 +109,10 @@ class BatchedCubeStackPlannerBackend:
             enable_graph_attempt=None,
             max_attempts=self.config.max_planning_attempts,
             enable_finetune_trajopt=self.config.enable_finetune_trajopt,
-            time_dilation_factor=self.config.time_dilation_factor,
+            # cuRobo's internal retime_trajectory() only supports single results.
+            # We therefore disable batch-level time dilation here and apply any
+            # desired retiming after splitting results back into per-env plans.
+            time_dilation_factor=1.0,
         )
 
         self._sync_joint_limits_from_isaac_lab()
@@ -129,6 +133,7 @@ class BatchedCubeStackPlannerBackend:
         self._canonical_attachment_pose: Pose | None = None
         self._canonical_attachment_template: Any | None = None
         self._canonical_attachment_active = False
+        self._exact_shared_planners: dict[int, CuroboPlanner] | None = None
         self.batch_history: list[tuple[str, int]] = []
 
         self._queue: asyncio.Queue[_PlanRequest | None] = asyncio.Queue()
@@ -201,25 +206,59 @@ class BatchedCubeStackPlannerBackend:
                 return
 
     async def _process_requests(self, requests: list[_PlanRequest]) -> None:
-        open_detached: list[_PlanRequest] = []
-        closed_detached: list[_PlanRequest] = []
-        closed_attached: list[_PlanRequest] = []
+        detached_requests: list[_PlanRequest] = []
+        attached_requests: list[_PlanRequest] = []
 
         for request in requests:
             if request.expected_attached_object is None:
-                open_detached.append(request)
-            elif self._is_object_grasped(request.handle.env_id):
-                closed_attached.append(request)
+                detached_requests.append(request)
             else:
-                closed_detached.append(request)
+                attached_requests.append(request)
 
-        for bucket, gripper_closed, attach_canonical in (
-            (open_detached, False, False),
-            (closed_detached, True, False),
-            (closed_attached, True, True),
-        ):
-            if bucket:
-                self._solve_bucket(bucket, gripper_closed=gripper_closed, attach_canonical=attach_canonical)
+        if detached_requests:
+            self._solve_bucket(detached_requests, gripper_closed=False, attach_canonical=False)
+        if attached_requests:
+            self._solve_exact_attached_requests(attached_requests)
+
+    def _ensure_exact_shared_planners(self) -> dict[int, CuroboPlanner]:
+        if self._exact_shared_planners is None:
+            planners = CuroboPlanner.create_shared_planners(
+                env=self.env,
+                robot=self.robot,
+                config=self.config,
+                num_envs=self.num_envs,
+            )
+            self._exact_shared_planners = {planner.env_id: planner for planner in planners}
+        return self._exact_shared_planners
+
+    def _solve_exact_attached_requests(self, requests: list[_PlanRequest]) -> None:
+        exact_planners = self._ensure_exact_shared_planners()
+        self.batch_history.append(("closed_attached", len(requests)))
+
+        for request in requests:
+            planner = exact_planners[request.handle.env_id]
+            success = planner.update_world_and_plan_motion(
+                target_pose=request.target_pose,
+                expected_attached_object=request.expected_attached_object,
+                env_id=request.handle.env_id,
+                step_size=request.step_size,
+                enable_retiming=request.enable_retiming,
+            )
+
+            if not success or planner.current_plan is None:
+                request.handle.reset_plan()
+                request.handle.last_plan_status = getattr(planner, "last_plan_status", None) or "failed_exact_attached"
+                request.handle.last_plan_error = getattr(planner, "last_plan_error", None)
+                if not request.future.done():
+                    request.future.set_result(False)
+                continue
+
+            request.handle._current_plan = self._ensure_trajectory_joint_state(planner.current_plan.clone())
+            request.handle._plan_index = 0
+            request.handle.last_plan_status = getattr(planner, "last_plan_status", None) or "success_exact_attached"
+            request.handle.last_plan_error = getattr(planner, "last_plan_error", None)
+            if not request.future.done():
+                request.future.set_result(True)
 
     def _solve_bucket(
         self,
@@ -252,6 +291,8 @@ class BatchedCubeStackPlannerBackend:
             torch.cuda.empty_cache()
         for request in chunk:
             request.handle.reset_plan()
+            request.handle.last_plan_status = "oom"
+            request.handle.last_plan_error = str(exc)
             if not request.future.done():
                 request.future.set_result(False)
         self.logger.warning("Chunk OOM details: %s", exc)
@@ -272,6 +313,9 @@ class BatchedCubeStackPlannerBackend:
             mode_name = "closed_detached"
         else:
             mode_name = "open_detached"
+
+        if self.config.debug_planner and len(chunk) > 1:
+            print(f"[BatchedPlanner] Solving {mode_name} chunk with {len(chunk)} requests")
 
         start_states = [self.get_current_joint_state(req.handle.env_id) for req in chunk]
         self._set_gripper_state(gripper_closed)
@@ -329,7 +373,10 @@ class BatchedCubeStackPlannerBackend:
 
             for row_idx, request in enumerate(active_requests):
                 success = bool(result.success[row_idx].item()) if result.success is not None else False
+                row_status = result.status[row_idx] if isinstance(result.status, list) else result.status
                 if not success:
+                    request.handle.last_plan_status = str(row_status) if row_status is not None else None
+                    request.handle.last_plan_error = None
                     request.handle.reset_plan()
                     continue
 
@@ -378,6 +425,8 @@ class BatchedCubeStackPlannerBackend:
 
             request.handle._current_plan = plan
             request.handle._plan_index = 0
+            request.handle.last_plan_status = "success"
+            request.handle.last_plan_error = None
             if not request.future.done():
                 request.future.set_result(True)
 
@@ -851,6 +900,8 @@ class BatchedCubeStackPlannerBackend:
 
             success = bool(result.success[0].item()) if result.success is not None else False
             if not success:
+                request.handle.last_plan_status = str(result.status) if result.status is not None else None
+                request.handle.last_plan_error = None
                 return None
 
             row_plan = self._extract_row_plan(result, 0)
@@ -870,6 +921,8 @@ class BatchedCubeStackPlannerBackend:
             )
             current_state = current_state.get_ordered_joint_state(self.motion_gen.kinematics.joint_names)
 
+        request.handle.last_plan_status = "success"
+        request.handle.last_plan_error = None
         return full_plan
 
 
@@ -893,6 +946,8 @@ class BatchedCubeStackPlannerHandle(MotionPlannerBase):
         self.visualize_spheres = False
         self.visualize_plan = False
         self.plan_visualizer = None
+        self.last_plan_status: str | None = None
+        self.last_plan_error: str | None = None
         self._current_plan: JointState | None = None
         self._plan_index = 0
 

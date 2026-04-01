@@ -282,6 +282,8 @@ class CuroboPlanner(MotionPlannerBase):
         # Initialize planning state
         self._current_plan: JointState | None = None
         self._plan_index: int = 0
+        self.last_plan_status: str | None = None
+        self.last_plan_error: str | None = None
 
         # Initialize visualization state
         self.frame_counter: int = 0
@@ -1428,8 +1430,12 @@ class CuroboPlanner(MotionPlannerBase):
                     x for x in self.robot.data.joint_names if x in self._current_plan.joint_names
                 ]
                 self._current_plan = self._current_plan.get_ordered_joint_state(common_js_names)
+                self.last_plan_status = "success"
+                self.last_plan_error = None
             else:
                 self._current_plan = None
+                self.last_plan_status = str(result.status)
+                self.last_plan_error = None
                 print(f"Plan failed: {result.status}")
         else:
             success: bool = self._plan_to_contact(
@@ -1622,11 +1628,17 @@ class CuroboPlanner(MotionPlannerBase):
                 self._plan_index = 0
 
                 planning_success = True
+                self.last_plan_status = "success"
+                self.last_plan_error = None
                 self.logger.debug(f"Contact planning succeeded with {len(self._current_plan.position)} waypoints")
             else:
+                self.last_plan_status = str(result.status)
+                self.last_plan_error = None
                 self.logger.debug(f"Contact planning failed: {result.status}")
 
         except Exception as e:
+            self.last_plan_status = "exception"
+            self.last_plan_error = str(e)
             self.logger.debug(f"Error during planning: {e}")
 
         # Always restore sphere state after planning, regardless of success
@@ -2223,6 +2235,8 @@ class CuroboPlanner(MotionPlannerBase):
         """
         # Always reset the plan before starting a new one to ensure a clean state
         self.reset_plan()
+        self.last_plan_status = None
+        self.last_plan_error = None
 
         # For shared MotionGen, clean up attachment state left by previous env
         if self._is_shared:
