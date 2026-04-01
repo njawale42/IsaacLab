@@ -247,7 +247,7 @@ class TestBatchedCubeStackPlanner:
         for planner in self.planners.values():
             assert planner.current_plan is not None
 
-    def test_attached_batch_plans_with_canonical_cube(self) -> None:
+    def test_attached_batch_plans_with_exact_local_spheres(self) -> None:
         self.env.reset()
         self.backend.batch_history.clear()
 
@@ -273,6 +273,5 @@ class TestBatchedCubeStackPlanner:
 
         assert results == [True] * self.env.num_envs
         _assert_bucket_history(self.backend, "closed_attached", self.env.num_envs)
-        assert self.backend._canonical_attachment_pose is not None
         for planner in self.planners.values():
             assert planner.current_plan is not None

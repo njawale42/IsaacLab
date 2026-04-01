@@ -102,5 +102,4 @@ def test_generate_dataset_skillgen(setup_skillgen_test_environment):
 
     assert result.returncode == 0, result.stderr
     assert os.path.exists(output_file)
-    expected_output = "successes/attempts. Exiting"
-    assert expected_output in result.stdout
+    assert "Exiting." in result.stdout

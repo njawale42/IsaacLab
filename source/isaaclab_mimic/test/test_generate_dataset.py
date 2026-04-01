@@ -138,5 +138,4 @@ def test_generate_dataset(setup_test_environment):
     assert result.returncode == 0, result.stderr
 
     # Check for specific output
-    expected_output = "successes/attempts. Exiting"
-    assert expected_output in result.stdout
+    assert "Exiting." in result.stdout

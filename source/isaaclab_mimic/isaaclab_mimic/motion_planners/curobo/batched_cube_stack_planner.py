@@ -218,7 +218,7 @@ class BatchedCubeStackPlannerBackend:
         if detached_requests:
             self._solve_bucket(detached_requests, gripper_closed=False, attach_canonical=False)
         if attached_requests:
-            self._solve_exact_attached_requests(attached_requests)
+            self._solve_bucket(attached_requests, gripper_closed=True, attach_canonical=True)
 
     def _ensure_exact_shared_planners(self) -> dict[int, CuroboPlanner]:
         if self._exact_shared_planners is None:
@@ -319,15 +319,10 @@ class BatchedCubeStackPlannerBackend:
 
         start_states = [self.get_current_joint_state(req.handle.env_id) for req in chunk]
         self._set_gripper_state(gripper_closed)
-        self._detach_canonical_attachment()
+        self.motion_gen.clear_batch_attached_link_spheres()
+        attached_local_spheres_by_handle: dict[BatchedCubeStackPlannerHandle, torch.Tensor] | None = None
         if attach_canonical:
-            self._ensure_canonical_attachment(chunk[0], start_states[0])
-            if not self._attach_canonical_attachment(start_states[0]):
-                for request in chunk:
-                    request.handle.reset_plan()
-                    if not request.future.done():
-                        request.future.set_result(False)
-                return
+            attached_local_spheres_by_handle = self._build_batch_attached_local_spheres_map(chunk, start_states)
 
         for slot, request in enumerate(chunk):
             carried_object = request.expected_attached_object if attach_canonical else None
@@ -356,7 +351,22 @@ class BatchedCubeStackPlannerBackend:
 
             restore_attached_spheres = None
             if contact_flag:
-                restore_attached_spheres = self._disable_contact_links(include_attachment=attach_canonical)
+                restore_attached_spheres = self._disable_contact_links(include_attachment=False)
+
+            if attach_canonical and attached_local_spheres_by_handle is not None:
+                phase_local_spheres = torch.stack(
+                    [attached_local_spheres_by_handle[request.handle] for request in active_requests], dim=0
+                )
+                phase_enable_mask = torch.zeros(
+                    len(active_requests), device=self.tensor_args.device, dtype=torch.bool
+                ) if contact_flag else torch.ones(
+                    len(active_requests), device=self.tensor_args.device, dtype=torch.bool
+                )
+                self.motion_gen.set_batch_attached_link_spheres(
+                    link_name=self.config.attached_object_link_name,
+                    local_spheres=phase_local_spheres,
+                    enable_mask=phase_enable_mask,
+                )
 
             batch_start_state = self._stack_joint_states(active_states)
             batch_goal_pose = self._stack_goal_poses(
@@ -430,6 +440,7 @@ class BatchedCubeStackPlannerBackend:
             if not request.future.done():
                 request.future.set_result(True)
 
+        self.motion_gen.clear_batch_attached_link_spheres()
         self.batch_history.append((mode_name, len(chunk)))
 
     def get_current_joint_state(self, env_id: int) -> JointState:
@@ -639,6 +650,51 @@ class BatchedCubeStackPlannerBackend:
         rel_pos = quat_apply(robot_quat_inv, obj_pos_w - robot_pos_w)
         rel_quat = quat_mul(robot_quat_inv, obj_quat_w)
         return self._make_pose(position=rel_pos, quaternion=rel_quat)
+
+    def _get_template_obstacle(self, object_name: str) -> Any:
+        if object_name not in self._object_mappings:
+            raise KeyError(f"Object '{object_name}' not found in cuRobo world mappings")
+        object_path = self._object_mappings[object_name]
+        world_model = self.motion_gen.world_coll_checker.world_model
+        if isinstance(world_model, list):
+            world_model = world_model[0]
+        obstacle = world_model.get_obstacle(object_path)
+        if obstacle is None:
+            raise KeyError(f"Obstacle '{object_path}' not found in cuRobo world model")
+        return deepcopy(obstacle)
+
+    def _build_external_obstacle_for_env(self, env_id: int, object_name: str) -> Any:
+        obstacle = self._get_template_obstacle(object_name)
+        obstacle.pose = self._pose_to_list(self._get_object_pose_in_base_frame(env_id, object_name))
+        return obstacle
+
+    def _build_batch_attached_local_spheres_map(
+        self,
+        requests: list[_PlanRequest],
+        start_states: list[JointState],
+    ) -> dict[BatchedCubeStackPlannerHandle, torch.Tensor]:
+        local_spheres: dict[BatchedCubeStackPlannerHandle, torch.Tensor] = {}
+        for request, start_state in zip(requests, start_states):
+            if request.expected_attached_object is None:
+                raise ValueError("Attached batch requested without expected_attached_object")
+            obstacle = self._build_external_obstacle_for_env(
+                env_id=request.handle.env_id,
+                object_name=request.expected_attached_object,
+            )
+            sphere_tensor = self.motion_gen.compute_attachment_sphere_tensor_from_external_objects(
+                joint_state=start_state,
+                external_objects=[obstacle],
+                link_name=self.config.attached_object_link_name,
+                surface_sphere_radius=self.config.surface_sphere_radius,
+                sphere_fit_type=SphereFitType.SAMPLE_SURFACE,
+            )
+            if sphere_tensor is None:
+                raise RuntimeError(
+                    f"Failed to build attached sphere tensor for env {request.handle.env_id}"
+                    f" object {request.expected_attached_object}"
+                )
+            local_spheres[request.handle] = sphere_tensor
+        return local_spheres
 
     def _ensure_canonical_attachment(self, request: _PlanRequest, start_state: JointState) -> None:
         if self._canonical_attachment_pose is not None and self._canonical_attachment_template is not None:
@@ -885,10 +941,26 @@ class BatchedCubeStackPlannerBackend:
 
         current_state = start_state
         full_plan: JointState | None = None
+        self.motion_gen.clear_batch_attached_link_spheres()
+        attached_local_spheres: torch.Tensor | None = None
+        if attach_canonical:
+            attached_local_spheres = torch.stack(
+                list(self._build_batch_attached_local_spheres_map([request], [start_state]).values()), dim=0
+            )
         for phase_idx, contact_flag in enumerate(contacts):
             restore_attached_spheres = None
             if contact_flag:
-                restore_attached_spheres = self._disable_contact_links(include_attachment=attach_canonical)
+                restore_attached_spheres = self._disable_contact_links(include_attachment=False)
+
+            if attach_canonical and attached_local_spheres is not None:
+                phase_enable_mask = torch.zeros(1, device=self.tensor_args.device, dtype=torch.bool) if contact_flag else torch.ones(
+                    1, device=self.tensor_args.device, dtype=torch.bool
+                )
+                self.motion_gen.set_batch_attached_link_spheres(
+                    link_name=self.config.attached_object_link_name,
+                    local_spheres=attached_local_spheres,
+                    enable_mask=phase_enable_mask,
+                )
 
             batch_start_state = self._stack_joint_states([current_state])
             batch_goal_pose = self._stack_goal_poses([targets[phase_idx]])
@@ -921,6 +993,7 @@ class BatchedCubeStackPlannerBackend:
             )
             current_state = current_state.get_ordered_joint_state(self.motion_gen.kinematics.joint_names)
 
+        self.motion_gen.clear_batch_attached_link_spheres()
         request.handle.last_plan_status = "success"
         request.handle.last_plan_error = None
         return full_plan
