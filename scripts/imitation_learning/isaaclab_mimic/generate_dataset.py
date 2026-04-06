@@ -83,13 +83,14 @@ parser.add_argument(
 parser.add_argument(
     "--planner_mode",
     type=str,
-    choices=["legacy", "shared", "batched"],
+    choices=["legacy", "shared", "batched", "wavefront"],
     default="legacy",
     help=(
         "Planner ownership mode for SkillGen. "
         "'legacy' creates one planner per env, "
         "'shared' reuses one MotionGen across per-env planners, "
-        "'batched' batches detached planning calls for single-arm cube-stack."
+        "'batched' batches planning requests opportunistically for single-arm cube-stack, "
+        "'wavefront' runs phase-synchronous batched planning/execution for single-arm cube-stack."
     ),
 )
 parser.add_argument(
@@ -248,7 +249,9 @@ def main():
         motion_planners = {}
         if args_cli.skillgen_type == "bimanual":
             if planner_mode != "legacy":
-                raise ValueError("planner_mode shared/batched is not supported for bimanual SkillGen workflows yet.")
+                raise ValueError(
+                    "planner_mode shared/batched/wavefront is not supported for bimanual SkillGen workflows yet."
+                )
             if "nutpour-gr1t2" in env_name.lower() and prebuilt_humanoid_cfgs is not None:
                 for env_id in range(num_envs):
                     cfg_left, cfg_right = prebuilt_humanoid_cfgs
@@ -261,10 +264,12 @@ def main():
                     )
             else:
                 raise ValueError("Bimanual SkillGen currently expects prebuilt humanoid planner configs.")
-        elif planner_mode == "batched":
+        elif planner_mode in {"batched", "wavefront"}:
             if "stack-cube" not in env_name.lower():
-                raise ValueError("planner_mode=batched is currently only supported for single-arm cube-stack workflows.")
-            print("Initializing shared batched cube-stack planner backend")
+                raise ValueError(
+                    f"planner_mode={planner_mode} is currently only supported for single-arm cube-stack workflows."
+                )
+            print(f"Initializing shared batched cube-stack planner backend for planner_mode={planner_mode}")
             shared_motion_planner_backend, motion_planners = create_batched_cube_stack_motion_planners(
                 env=env,
                 robot=env.scene["robot"],
@@ -303,6 +308,7 @@ def main():
         motion_planners=motion_planners,  # Pass the motion planners dictionary
         skillgen_type=args_cli.skillgen_type,
         schedule_offline=args_cli.schedule_offline,
+        planner_mode=planner_mode if args_cli.use_skillgen else "legacy",
     )
 
     try:

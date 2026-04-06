@@ -35,6 +35,7 @@ class FrankaCubeStackIKRelSkillgenEnvCfg(FrankaCubeStackSkillgenEnvCfg, MimicEnv
         self.datagen_config.generation_relative = True
         self.datagen_config.max_num_failures = 25
         self.datagen_config.seed = 1
+        self.datagen_config.debug_generation = True
 
         # The following are the subtask configurations for the stack task.
         subtask_configs = []

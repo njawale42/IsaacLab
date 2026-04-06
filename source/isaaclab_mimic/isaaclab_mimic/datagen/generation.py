@@ -25,6 +25,48 @@ num_failures = 0
 num_attempts = 0
 
 
+def _generation_target_reached(env: ManagerBasedRLMimicEnv) -> bool:
+    """Check whether dataset generation has reached its configured stop condition."""
+    generation_guarantee = env.cfg.datagen_config.generation_guarantee
+    generation_num_trials = env.cfg.datagen_config.generation_num_trials
+    check_val = num_success if generation_guarantee else num_attempts
+    return check_val >= generation_num_trials
+
+
+def _print_generation_progress_if_needed(env: ManagerBasedRLMimicEnv, prev_num_attempts: int) -> tuple[int, bool]:
+    """Print success/failure counters when new attempts have completed."""
+    if prev_num_attempts == num_attempts:
+        return prev_num_attempts, False
+
+    prev_num_attempts = num_attempts
+    generated_success_rate = 100 * num_success / num_attempts if num_attempts > 0 else 0.0
+    print("")
+    print("*" * 50, "\033[K")
+    print(
+        f"{num_success} successes / {num_attempts} attempts / {num_failures} failures"
+        f" ({generated_success_rate:.1f}% success rate)\033[K"
+    )
+    print("*" * 50, "\033[K")
+
+    if _generation_target_reached(env):
+        generation_guarantee = env.cfg.datagen_config.generation_guarantee
+        generation_num_trials = env.cfg.datagen_config.generation_num_trials
+        if generation_guarantee:
+            print(
+                f"Reached {num_success} successful demos"
+                f" (threshold {generation_num_trials}). Exiting."
+            )
+        else:
+            print(
+                f"Reached {num_attempts} attempts"
+                f" (threshold {generation_num_trials}) with {num_success} successes"
+                f" and {num_failures} failures. Exiting."
+            )
+        return prev_num_attempts, True
+
+    return prev_num_attempts, False
+
+
 async def run_data_generator(
     env: ManagerBasedRLMimicEnv,
     env_id: int,
@@ -64,6 +106,43 @@ async def run_data_generator(
         num_attempts += 1
 
 
+async def run_wavefront_data_generator(
+    env: ManagerBasedRLMimicEnv,
+    env_reset_queue: asyncio.Queue,
+    env_action_queue: asyncio.Queue,
+    data_generator: DataGeneratorScheduled,
+    success_term: TerminationTermCfg,
+    motion_planners: dict[int, Any],
+):
+    """Run phase-synchronous wavefront generation across the full environment cohort."""
+    global num_success, num_failures, num_attempts
+
+    env_ids = list(range(env.num_envs))
+    while True:
+        results = await data_generator.generate_wavefront_batch(
+            env_ids=env_ids,
+            success_term=success_term,
+            env_reset_queue=env_reset_queue,
+            env_action_queue=env_action_queue,
+            motion_planners=motion_planners,
+        )
+        batch_success = 0
+        for env_id in env_ids:
+            if bool(results[env_id]["success"]):
+                num_success += 1
+                batch_success += 1
+            else:
+                num_failures += 1
+            num_attempts += 1
+        batch_failures = len(env_ids) - batch_success
+        print(
+            f"[Wavefront] Completed cohort attempt: {batch_success} successes /"
+            f" {len(env_ids)} attempts / {batch_failures} failures"
+        )
+        if _generation_target_reached(env):
+            return
+
+
 def env_loop(
     env: ManagerBasedRLMimicEnv,
     env_reset_queue: asyncio.Queue,
@@ -89,14 +168,21 @@ def env_loop(
     # simulate environment -- run everything in inference mode
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while True:
+            should_exit = False
 
             # check if any environment needs to be reset while waiting for actions
             while env_action_queue.qsize() != env.num_envs:
                 asyncio_event_loop.run_until_complete(asyncio.sleep(0))
+                prev_num_attempts, should_exit = _print_generation_progress_if_needed(env, prev_num_attempts)
+                if should_exit:
+                    break
                 if data_gen_tasks is not None and data_gen_tasks.done():
                     task_exception = data_gen_tasks.exception()
                     if task_exception is not None:
                         raise RuntimeError("Data generation task failed") from task_exception
+                    if _generation_target_reached(env):
+                        should_exit = True
+                        break
                     raise RuntimeError("Data generation tasks finished unexpectedly before filling action queue")
                 if env.sim.has_gui() or env.sim.has_rtx_sensors():
                     env.render()
@@ -105,16 +191,27 @@ def env_loop(
                     env.reset(env_ids=env_id_tensor)
                     env_reset_queue.task_done()
 
+            if should_exit:
+                break
+
             actions = torch.zeros(env.action_space.shape)
+            export_step_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
 
             # get actions from all the data generators
             for i in range(env.num_envs):
                 # an async-blocking call to get an action from a data generator
-                env_id, action = asyncio_event_loop.run_until_complete(env_action_queue.get())
+                queued_item = asyncio_event_loop.run_until_complete(env_action_queue.get())
+                if len(queued_item) == 3:
+                    env_id, action, export_step = queued_item
+                    export_step_mask[env_id] = bool(export_step)
+                else:
+                    env_id, action = queued_item
                 actions[env_id] = action
 
             # perform action on environment
+            env._episode_export_step_mask = export_step_mask
             env.step(actions)
+            env._episode_export_step_mask = None
 
             # Flush any queued goal visualizations on the main thread.
             # drain_goal_visualizations(env)
@@ -123,34 +220,9 @@ def env_loop(
             for i in range(env.num_envs):
                 env_action_queue.task_done()
 
-            if prev_num_attempts != num_attempts:
-                prev_num_attempts = num_attempts
-                generated_success_rate = 100 * num_success / num_attempts if num_attempts > 0 else 0.0
-                print("")
-                print("*" * 50, "\033[K")
-                print(
-                    f"{num_success} successes / {num_attempts} attempts / {num_failures} failures"
-                    f" ({generated_success_rate:.1f}% success rate)\033[K"
-                )
-                print("*" * 50, "\033[K")
-
-                # termination condition is on enough successes if @guarantee_success or enough attempts otherwise
-                generation_guarantee = env.cfg.datagen_config.generation_guarantee
-                generation_num_trials = env.cfg.datagen_config.generation_num_trials
-                check_val = num_success if generation_guarantee else num_attempts
-                if check_val >= generation_num_trials:
-                    if generation_guarantee:
-                        print(
-                            f"Reached {num_success} successful demos"
-                            f" (threshold {generation_num_trials}). Exiting."
-                        )
-                    else:
-                        print(
-                            f"Reached {num_attempts} attempts"
-                            f" (threshold {generation_num_trials}) with {num_success} successes"
-                            f" and {num_failures} failures. Exiting."
-                        )
-                    break
+            prev_num_attempts, should_exit = _print_generation_progress_if_needed(env, prev_num_attempts)
+            if should_exit:
+                break
 
             # check that simulation is stopped or not
             if env.sim.is_stopped():
@@ -226,6 +298,7 @@ def setup_async_generation(
     motion_planners: Any = None,
     skillgen_type: str = "single_arm",
     schedule_offline: bool | None = None,
+    planner_mode: str = "legacy",
 ) -> dict[str, Any]:
     """Setup async data generation tasks.
 
@@ -258,21 +331,36 @@ def setup_async_generation(
         schedule_offline=schedule_offline,
     )
     data_generator_asyncio_tasks = []
-    for i in range(num_envs):
-        env_motion_planner = motion_planners[i] if motion_planners else None
+    if planner_mode == "wavefront":
+        if motion_planners is None:
+            raise ValueError("`planner_mode=wavefront` requires motion planners for all environments.")
         task = asyncio_event_loop.create_task(
-            run_data_generator(
-                env,
-                i,
-                env_reset_queue,
-                env_action_queue,
-                data_generator,
-                success_term,
-                pause_subtask=pause_subtask,
-                motion_planner=env_motion_planner,
+            run_wavefront_data_generator(
+                env=env,
+                env_reset_queue=env_reset_queue,
+                env_action_queue=env_action_queue,
+                data_generator=data_generator,
+                success_term=success_term,
+                motion_planners=motion_planners,
             )
         )
         data_generator_asyncio_tasks.append(task)
+    else:
+        for i in range(num_envs):
+            env_motion_planner = motion_planners[i] if motion_planners else None
+            task = asyncio_event_loop.create_task(
+                run_data_generator(
+                    env,
+                    i,
+                    env_reset_queue,
+                    env_action_queue,
+                    data_generator,
+                    success_term,
+                    pause_subtask=pause_subtask,
+                    motion_planner=env_motion_planner,
+                )
+            )
+            data_generator_asyncio_tasks.append(task)
 
     return {
         "tasks": data_generator_asyncio_tasks,

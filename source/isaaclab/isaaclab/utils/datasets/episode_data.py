@@ -25,6 +25,7 @@ class EpisodeData:
         self._seed = None
         self._env_id = None
         self._success = None
+        self._export_step_mask: list[bool] = []
 
     @property
     def data(self):
@@ -89,6 +90,10 @@ class EpisodeData:
     def is_empty(self):
         """Check if the episode data is empty."""
         return not bool(self._data)
+
+    def append_export_step_mask(self, export_step: bool):
+        """Append whether the latest simulator step should be exported."""
+        self._export_step_mask.append(bool(export_step))
 
     def add(self, key: str, value: torch.Tensor | dict):
         """Add a key-value pair to the dataset.
@@ -218,3 +223,31 @@ class EpisodeData:
                     pre_export_helper(value)
 
         pre_export_helper(self._data)
+
+    def apply_export_step_mask(self):
+        """Filter step-aligned tensors using the export mask.
+
+        This keeps synchronization-only execution ticks available during runtime
+        recording/debugging but removes them from the final exported dataset.
+        """
+        if len(self._export_step_mask) == 0:
+            return
+
+        export_mask = torch.tensor(self._export_step_mask, dtype=torch.bool)
+        if export_mask.numel() == 0 or bool(torch.all(export_mask)):
+            return
+
+        def apply_mask_helper(data, top_level_key: str | None = None):
+            for key, value in data.items():
+                current_top_level_key = key if top_level_key is None else top_level_key
+                if isinstance(value, dict):
+                    apply_mask_helper(value, current_top_level_key)
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if current_top_level_key == "initial_state":
+                    continue
+                if value.shape[0] == export_mask.shape[0]:
+                    data[key] = value[export_mask]
+
+        apply_mask_helper(self._data)

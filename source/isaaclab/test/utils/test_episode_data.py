@@ -152,3 +152,27 @@ def test_get_next_action(device):
 
     # check if None is returned when all actions are exhausted
     assert episode.get_next_action() is None
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_apply_export_step_mask(device):
+    """Test filtering non-exportable synchronization steps before export."""
+    episode = EpisodeData()
+
+    episode.add("initial_state", torch.tensor([42], device=device))
+    episode.add("actions", torch.tensor([1], device=device))
+    episode.add("actions", torch.tensor([2], device=device))
+    episode.add("actions", torch.tensor([3], device=device))
+    episode.add("obs/policy/term", torch.tensor([10], device=device))
+    episode.add("obs/policy/term", torch.tensor([20], device=device))
+    episode.add("obs/policy/term", torch.tensor([30], device=device))
+    episode.append_export_step_mask(True)
+    episode.append_export_step_mask(False)
+    episode.append_export_step_mask(True)
+
+    episode.pre_export()
+    episode.apply_export_step_mask()
+
+    assert torch.equal(episode.data["actions"], torch.tensor([[1], [3]], device=device))
+    assert torch.equal(episode.data["obs"]["policy"]["term"], torch.tensor([[10], [30]], device=device))
+    assert torch.equal(episode.data["initial_state"], torch.tensor([[42]], device=device))

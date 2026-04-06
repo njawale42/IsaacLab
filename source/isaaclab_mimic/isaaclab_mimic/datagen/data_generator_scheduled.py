@@ -251,6 +251,23 @@ class EEFGenerationState:
     The rest are skill (demonstrated) waypoints. Used to build separate MP/skill blocks."""
 
 
+@dataclass
+class WavefrontEnvState:
+    """Per-environment state for wavefront single-arm generation."""
+
+    env_id: int
+    env_id_tensor: torch.Tensor | None = None
+    initial_state: dict | None = None
+    buffers: GenerationBuffers = field(default_factory=GenerationBuffers)
+    eef_state: EEFGenerationState = field(default_factory=EEFGenerationState)
+    runtime_constraints: dict = field(default_factory=dict)
+    selected_src_demo_inds: dict[str, int | None] = field(default_factory=dict)
+    randomized_subtask_boundaries: dict[str, np.ndarray] | None = None
+    prev_src_demo_datagen_info_pool_size: int = 0
+    failed: bool = False
+    failure_reason: str | None = None
+
+
 class DataGeneratorScheduled:
     """
     The main data generator class that generates new trajectories from source datasets.
@@ -830,6 +847,279 @@ class DataGeneratorScheduled:
             interpolated.append(src_actions[current_idx])
         return torch.stack(interpolated, dim=0)
 
+    def _require_wavefront_single_arm_eef(self) -> str:
+        """Validate that the current configuration is supported by wavefront mode."""
+        if not self.env_cfg.datagen_config.use_skillgen:
+            raise ValueError("`planner_mode=wavefront` requires SkillGen-enabled data generation.")
+        if self.skillgen_type == "bimanual":
+            raise ValueError("`planner_mode=wavefront` currently supports single-arm SkillGen workflows only.")
+
+        eef_names = list(self.env_cfg.subtask_configs.keys())
+        if len(eef_names) != 1:
+            raise ValueError(
+                "`planner_mode=wavefront` currently supports exactly one configured end-effector per environment."
+            )
+        return eef_names[0]
+
+    def _infer_motion_planner_waypoint_count(self, motion_planner: Any, combined_waypoints: list[Waypoint]) -> int:
+        """Infer how many leading waypoints in a combined trajectory came from the planner."""
+        get_planned_poses = getattr(motion_planner, "get_planned_poses", None)
+        if get_planned_poses is None:
+            return 0
+        planned_poses = get_planned_poses()
+        if planned_poses is None:
+            return 0
+        if isinstance(planned_poses, list):
+            mp_count = len(planned_poses)
+        else:
+            mp_count = int(planned_poses.shape[0])
+        return max(0, min(len(combined_waypoints), mp_count))
+
+    def _make_wavefront_hold_waypoint(self, env_id: int, eef_name: str, eef_state: EEFGenerationState) -> Waypoint:
+        """Build a stationary waypoint used while an env waits for the cohort."""
+        hold_pose = self.env.get_robot_eef_pose(env_ids=[env_id], eef_name=eef_name)[0].clone()
+        if eef_state.current_trajectory:
+            gripper_action = eef_state.current_trajectory[-1].gripper_action.clone()
+        elif eef_state.last_commanded_gripper_action is not None:
+            gripper_action = eef_state.last_commanded_gripper_action.clone()
+        else:
+            gripper_action = self._get_initial_gripper_from_articulation(env_id, eef_name).clone()
+        return Waypoint(pose=hold_pose, gripper_action=gripper_action, noise=0.0)
+
+    def _update_wavefront_execution_buffers(
+        self,
+        buffers: GenerationBuffers,
+        exec_result: dict,
+        export_step: bool,
+    ) -> None:
+        """Mirror runtime execution results while omitting non-exportable sync holds."""
+        if export_step:
+            buffers.states.extend(exec_result["states"])
+            buffers.observations.extend(exec_result["observations"])
+            buffers.actions.extend(exec_result["actions"])
+        buffers.success = bool(buffers.success or exec_result["success"])
+
+    async def _execute_wavefront_segment(
+        self,
+        env_states: dict[int, WavefrontEnvState],
+        cohort_env_ids: list[int],
+        eef_name: str,
+        segment_waypoints: dict[int, list[Waypoint]],
+        success_term: TerminationTermCfg,
+        env_action_queue: asyncio.Queue | None,
+    ) -> None:
+        """Execute one wavefront segment in lockstep across the full cohort."""
+        if env_action_queue is None:
+            raise ValueError("env_action_queue must be provided for wavefront generation.")
+
+        segment_length = max((len(waypoints) for waypoints in segment_waypoints.values()), default=0)
+        if segment_length == 0:
+            return
+
+        for step_idx in range(segment_length):
+            execution_tasks = []
+            execution_env_ids: list[int] = []
+            export_flags: list[bool] = []
+
+            for env_id in cohort_env_ids:
+                env_state = env_states[env_id]
+                env_segment = segment_waypoints.get(env_id, [])
+
+                if env_state.failed:
+                    waypoint = self._make_wavefront_hold_waypoint(env_id, eef_name, env_state.eef_state)
+                    export_step = False
+                elif step_idx < len(env_segment):
+                    waypoint = env_segment[step_idx]
+                    export_step = True
+                elif len(env_segment) > 0:
+                    waypoint = deepcopy(env_segment[-1])
+                    export_step = False
+                else:
+                    waypoint = self._make_wavefront_hold_waypoint(env_id, eef_name, env_state.eef_state)
+                    export_step = False
+
+                execution_tasks.append(
+                    MultiWaypoint({eef_name: waypoint}).execute(
+                        env=self.env,
+                        success_term=success_term,
+                        env_id=env_id,
+                        env_action_queue=env_action_queue,
+                        export_step=export_step,
+                    )
+                )
+                execution_env_ids.append(env_id)
+                export_flags.append(export_step)
+
+            execution_results = await asyncio.gather(*execution_tasks)
+            for env_id, export_step, exec_result in zip(execution_env_ids, export_flags, execution_results, strict=True):
+                self._update_wavefront_execution_buffers(env_states[env_id].buffers, exec_result, export_step)
+
+    async def generate_wavefront_batch(
+        self,
+        env_ids: list[int],
+        success_term: TerminationTermCfg,
+        env_reset_queue: asyncio.Queue | None = None,
+        env_action_queue: asyncio.Queue | None = None,
+        export_demo: bool = True,
+        motion_planners: dict[int, Any] | None = None,
+    ) -> dict[int, dict]:
+        """Generate one phase-synchronous wavefront batch for a cohort of environments."""
+        if motion_planners is None:
+            raise ValueError("`planner_mode=wavefront` requires motion planners for every environment.")
+
+        debug_generation = bool(getattr(self.env_cfg.datagen_config, "debug_generation", False))
+        eef_name = self._require_wavefront_single_arm_eef()
+        num_subtasks = len(self.env_cfg.subtask_configs[eef_name])
+
+        env_states: dict[int, WavefrontEnvState] = {}
+        env_id_tensor = torch.tensor(env_ids, dtype=torch.int64, device=self.env.device)
+
+        for env_id in env_ids:
+            if env_id not in motion_planners or motion_planners[env_id] is None:
+                raise ValueError(f"Wavefront mode requires a motion planner for environment {env_id}.")
+            reset_env_id_tensor, initial_state = await self._reset_environment_for_generation(
+                env_id=env_id,
+                env_reset_queue=env_reset_queue,
+            )
+            env_states[env_id] = WavefrontEnvState(
+                env_id=env_id,
+                env_id_tensor=reset_env_id_tensor,
+                initial_state=initial_state,
+                runtime_constraints=self._build_runtime_subtask_constraints(),
+                selected_src_demo_inds={eef_name: None},
+            )
+
+        for subtask_index in range(num_subtasks):
+            phase_env_ids = [env_id for env_id in env_ids if not env_states[env_id].failed]
+            if not phase_env_ids:
+                break
+
+            eef_subtask_trajectories: dict[int, WaypointTrajectory] = {}
+            async with self.src_demo_datagen_info_pool.asyncio_lock:
+                for env_id in phase_env_ids:
+                    env_state = env_states[env_id]
+                    env_state.randomized_subtask_boundaries, env_state.prev_src_demo_datagen_info_pool_size = (
+                        self._maybe_refresh_randomized_subtask_boundaries(
+                            env_state.randomized_subtask_boundaries,
+                            env_state.prev_src_demo_datagen_info_pool_size,
+                        )
+                    )
+                    eef_subtask_trajectories[env_id] = self.generate_eef_subtask_trajectory(
+                        env_id=env_id,
+                        eef_name=eef_name,
+                        subtask_ind=env_state.eef_state.current_subtask_index,
+                        all_randomized_subtask_boundaries=env_state.randomized_subtask_boundaries,
+                        runtime_subtask_constraints_dict=env_state.runtime_constraints,
+                        selected_src_demo_inds=env_state.selected_src_demo_inds,
+                    )
+
+            planning_tasks = []
+            for env_id in phase_env_ids:
+                env_state = env_states[env_id]
+                planning_tasks.append(
+                    self._start_motion_planned_transition_if_needed(
+                        env_id=env_id,
+                        eef_name=eef_name,
+                        eef_state=env_state.eef_state,
+                        eef_subtask_trajectory=eef_subtask_trajectories[env_id],
+                        selected_src_demo_inds=env_state.selected_src_demo_inds,
+                        randomized_subtask_boundaries=env_state.randomized_subtask_boundaries,
+                        motion_planner=motion_planners[env_id],
+                    )
+                )
+            planning_results = await asyncio.gather(*planning_tasks)
+
+            mp_segments: dict[int, list[Waypoint]] = {}
+            skill_segments: dict[int, list[Waypoint]] = {}
+            for env_id, planning_result in zip(phase_env_ids, planning_results, strict=True):
+                env_state = env_states[env_id]
+                transition_started, combined_waypoints, failure_result = planning_result
+                if failure_result is not None or not transition_started or combined_waypoints is None:
+                    planner = motion_planners[env_id]
+                    env_state.failed = True
+                    env_state.failure_reason = (
+                        f"planning_failed(status={getattr(planner, 'last_plan_status', None)},"
+                        f" error={getattr(planner, 'last_plan_error', None)})"
+                    )
+                    continue
+
+                mp_waypoint_count = self._infer_motion_planner_waypoint_count(motion_planners[env_id], combined_waypoints)
+                mp_segments[env_id] = combined_waypoints[:mp_waypoint_count]
+                skill_segments[env_id] = combined_waypoints[mp_waypoint_count:]
+                env_state.eef_state.current_trajectory = combined_waypoints
+                env_state.eef_state.current_mp_waypoint_count = mp_waypoint_count
+                if combined_waypoints:
+                    env_state.eef_state.last_commanded_gripper_action = combined_waypoints[-1].gripper_action.clone()
+
+            await self._execute_wavefront_segment(
+                env_states=env_states,
+                cohort_env_ids=env_ids,
+                eef_name=eef_name,
+                segment_waypoints=mp_segments,
+                success_term=success_term,
+                env_action_queue=env_action_queue,
+            )
+            await self._execute_wavefront_segment(
+                env_states=env_states,
+                cohort_env_ids=env_ids,
+                eef_name=eef_name,
+                segment_waypoints=skill_segments,
+                success_term=success_term,
+                env_action_queue=env_action_queue,
+            )
+
+            for env_id in phase_env_ids:
+                env_state = env_states[env_id]
+                if env_state.failed:
+                    continue
+                env_state.eef_state.current_subtask_index = subtask_index + 1
+                env_state.eef_state.subtask_step_index = None
+                env_state.eef_state.subtask_started = False
+                if subtask_index == num_subtasks - 1:
+                    env_state.eef_state.subtasks_done = True
+
+            if debug_generation:
+                debug_progress = {
+                    env_id: {
+                        "failed": env_states[env_id].failed,
+                        "failure_reason": env_states[env_id].failure_reason,
+                        "current_subtask_index": env_states[env_id].eef_state.current_subtask_index,
+                    }
+                    for env_id in env_ids
+                }
+                print(f"[Wavefront] Finished subtask {subtask_index} for cohort {env_ids}: {debug_progress}")
+
+        success_values = []
+        results: dict[int, dict] = {}
+        for env_id in env_ids:
+            env_state = env_states[env_id]
+            success = bool(env_state.buffers.success and not env_state.failed and env_state.eef_state.subtasks_done)
+            success_values.append([success])
+
+            generated_actions: list[torch.Tensor] | torch.Tensor
+            if env_state.buffers.actions:
+                generated_actions = torch.cat(env_state.buffers.actions, dim=0)
+            else:
+                generated_actions = env_state.buffers.actions
+
+            results[env_id] = dict(
+                initial_state=env_state.initial_state,
+                states=env_state.buffers.states,
+                observations=env_state.buffers.observations,
+                actions=generated_actions,
+                success=success,
+                failure_reason=env_state.failure_reason,
+            )
+
+        self.env.recorder_manager.set_success_to_episodes(
+            env_id_tensor,
+            torch.tensor(success_values, dtype=torch.bool, device=self.env.device),
+        )
+        if export_demo:
+            self.env.recorder_manager.export_episodes(env_id_tensor)
+
+        return results
+
     async def generate(
         self,
         env_id: int,
@@ -1094,17 +1384,17 @@ class DataGeneratorScheduled:
         for subtask_constraint in self.env_cfg.task_constraint_configs:
             runtime_constraints.update(subtask_constraint.generate_runtime_subtask_constraints())
 
-        # Debug: Print constraint setup
-        if runtime_constraints:
-            print(f"[Constraints] Built {len(runtime_constraints)} runtime constraints:")
-            for key, constraint in runtime_constraints.items():
-                print(f"  {key}: type={constraint.get('type')}, fulfilled={constraint.get('fulfilled', 'N/A')}")
-        else:
-            print("[Constraints] No runtime constraints configured")
+        debug_generation = bool(getattr(self.env_cfg.datagen_config, "debug_generation", False))
+        if debug_generation:
+            if runtime_constraints:
+                print(f"[Constraints] Built {len(runtime_constraints)} runtime constraints:")
+                for key, constraint in runtime_constraints.items():
+                    print(f"  {key}: type={constraint.get('type')}, fulfilled={constraint.get('fulfilled', 'N/A')}")
+            else:
+                print("[Constraints] No runtime constraints configured")
 
-        # Validate constraint indices against actual subtask counts
-        for eef_name, subtask_configs in self.env_cfg.subtask_configs.items():
-            print(f"[Constraints] {eef_name} has {len(subtask_configs)} subtasks (indices 0-{len(subtask_configs)-1})")
+            for eef_name, subtask_configs in self.env_cfg.subtask_configs.items():
+                print(f"[Constraints] {eef_name} has {len(subtask_configs)} subtasks (indices 0-{len(subtask_configs)-1})")
 
         return runtime_constraints
 
@@ -1190,6 +1480,10 @@ class DataGeneratorScheduled:
         if motion_planner is None:
             return False, None, None
 
+        debug_planner = bool(getattr(motion_planner, "debug_planner", False))
+        debug_generation = bool(getattr(self.env_cfg.datagen_config, "debug_generation", False))
+        verbose_planner_logs = debug_planner or debug_generation
+
         target_pose = eef_subtask_trajectory[0].pose
 
         # Determine the gripper action to use during the motion planning phase.
@@ -1221,9 +1515,10 @@ class DataGeneratorScheduled:
                 self.env.cfg,
             )
 
-        print(f"\n--- Environment {env_id}: Planning motion to target pose ---")
-        print(f"Target pose: {target_pose}")
-        print(f"Expected attached object: {expected_attached_object}")
+        if verbose_planner_logs:
+            print(f"\n--- Environment {env_id}: Planning motion to target pose ---")
+            print(f"Target pose: {target_pose}")
+            print(f"Expected attached object: {expected_attached_object}")
 
         import torch as _torch
 
@@ -1256,7 +1551,8 @@ class DataGeneratorScheduled:
             )
             return False, None, {"success": False}
 
-        print(f"Env {env_id}: Motion planning succeeded")
+        if verbose_planner_logs:
+            print(f"Env {env_id}: Motion planning succeeded")
         # Enqueue goal visualization to be flushed on the main env loop thread.
         # enqueue_goal_visualization(env_id=env_id, eef_name=eef_name, target_pose=target_pose)
 

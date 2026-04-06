@@ -351,6 +351,23 @@ class RecorderManager(ManagerBase):
         for value_index, env_id in enumerate(env_ids):
             self._episodes[env_id].success = success_values[value_index].item()
 
+    def append_export_step_mask_to_episodes(
+        self, export_step_mask: torch.Tensor, env_ids: Sequence[int] | None = None
+    ) -> None:
+        """Append per-env exportability bits for the current simulator step."""
+        if len(self.active_terms) == 0:
+            return
+        if env_ids is None:
+            env_ids = list(range(self._env.num_envs))
+        if isinstance(env_ids, torch.Tensor):
+            env_ids = env_ids.tolist()
+
+        export_step_mask = export_step_mask.view(-1).to(dtype=torch.bool).cpu()
+        use_env_index = export_step_mask.numel() == self._env.num_envs
+        for value_index, env_id in enumerate(env_ids):
+            mask_index = env_id if use_env_index else value_index
+            self._episodes[env_id].append_export_step_mask(bool(export_step_mask[mask_index].item()))
+
     def record_pre_step(self) -> None:
         """Trigger recorder terms for pre-step functions."""
         # Do nothing if no active recorder terms are provided
@@ -370,6 +387,11 @@ class RecorderManager(ManagerBase):
         for term in self._terms.values():
             key, value = term.record_post_step()
             self.add_to_episodes(key, value)
+
+        export_step_mask = getattr(self._env, "_episode_export_step_mask", None)
+        if export_step_mask is None:
+            export_step_mask = torch.ones((self._env.num_envs,), device=self._env.device, dtype=torch.bool)
+        self.append_export_step_mask_to_episodes(export_step_mask)
 
     def record_post_physics_decimation_step(self) -> None:
         """Trigger recorder terms for post-physics step functions in the decimation loop."""
@@ -471,6 +493,7 @@ class RecorderManager(ManagerBase):
         for env_id in env_ids:
             if env_id in self._episodes and not self._episodes[env_id].is_empty():
                 self._episodes[env_id].pre_export()
+                self._episodes[env_id].apply_export_step_mask()
 
                 episode_succeeded = self._episodes[env_id].success
                 target_dataset_file_handler = None

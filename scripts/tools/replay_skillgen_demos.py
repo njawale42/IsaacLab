@@ -5,11 +5,10 @@
 
 """Script to replay SkillGen / Mimic datagen demonstrations.
 
-Unlike replay_demos.py, this script reads the HDF5 schema produced by the
-mimic datagen pipeline where per-timestep states live under
-``data/<demo>/states/{articulation,rigid_object}/...`` and there is no
-dedicated ``initial_state`` key. The first timestep of ``states`` is used
-as the initial state for each episode.
+This script handles the mimic datagen HDF5 schema, including newer files that
+store an explicit ``initial_state`` per episode and older files that only
+store per-timestep ``states``. When ``initial_state`` is unavailable, replay
+falls back to timestep 0 of ``states``.
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -104,13 +103,30 @@ def pause_cb():
     is_paused = True
 
 
-def extract_initial_state(states_group: h5py.Group, device: str) -> dict:
-    """Build an initial-state dict from timestep 0 of the per-step states group.
-
-    The returned dict matches the format expected by ``InteractiveScene.reset_to``:
-    ``{asset_type: {asset_name: {field: tensor(1, ...)}}}``
-    """
+def _load_state_group(state_group: h5py.Group, device: str) -> dict:
+    """Convert a serialized state group into tensors for ``InteractiveScene.reset_to``."""
     state = {}
+    for asset_type in state_group:
+        state[asset_type] = {}
+        for asset_name in state_group[asset_type]:
+            state[asset_type][asset_name] = {}
+            for field in state_group[asset_type][asset_name]:
+                data = np.array(state_group[asset_type][asset_name][field])
+                state[asset_type][asset_name][field] = torch.tensor(data, device=device)
+    return state
+
+
+def extract_initial_state(episode_group: h5py.Group, device: str) -> dict:
+    """Build the reset state for a replayed episode.
+
+    Newer generated datasets store an explicit ``initial_state`` captured right after reset.
+    Older datasets only have per-step ``states``; for those we fall back to timestep 0.
+    """
+    if "initial_state" in episode_group:
+        return _load_state_group(episode_group["initial_state"], device)
+
+    state = {}
+    states_group = episode_group["states"]
     for asset_type in states_group:
         state[asset_type] = {}
         for asset_name in states_group[asset_type]:
@@ -255,10 +271,18 @@ def main():
                     print(f"{replayed:4d}: Loading {ep_name} (idx {ep_idx}) -> env_{env_id}")
 
                     ep_group = data_group[ep_name]
-                    initial_state = extract_initial_state(ep_group["states"], env.device)
+                    initial_state = extract_initial_state(ep_group, env.device)
                     env.reset_to(initial_state, torch.tensor([env_id], device=env.device), is_relative=True)
 
                     env_actions[env_id] = load_actions(ep_group, env.device, args_cli.use_processed_actions)
+                    expected_action_dim = idle_action.shape[-1]
+                    if env_actions[env_id].shape[-1] != expected_action_dim:
+                        action_key = "processed_actions" if args_cli.use_processed_actions else "actions"
+                        raise ValueError(
+                            f"Dataset field '{action_key}' has action dim {env_actions[env_id].shape[-1]},"
+                            f" but env.step expects {expected_action_dim}. "
+                            "Replay raw 'actions' for this task unless you know the processed action schema matches."
+                        )
                     env_step[env_id] = 0
                     env_episode_idx[env_id] = ep_idx
 

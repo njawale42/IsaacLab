@@ -377,6 +377,7 @@ class MultiWaypoint:
         success_term: TerminationTermCfg,
         env_id: int = 0,
         env_action_queue: asyncio.Queue | None = None,
+        export_step: bool = True,
     ):
         """
         Executes the multi-waypoint eef actions in the environment.
@@ -386,6 +387,7 @@ class MultiWaypoint:
             success_term: The termination term to check for task success.
             env_id: The environment ID to execute the multi-waypoint actions in.
             env_action_queue: The asyncio queue to put the action into.
+            export_step: Whether this simulator tick should be exported to the dataset.
 
         Returns:
             A dictionary containing the state, observation, action, and success of the multi-waypoint actions.
@@ -422,7 +424,7 @@ class MultiWaypoint:
         if env_action_queue is None:
             obs, _, _, _, _ = env.step(play_action)
         else:
-            await env_action_queue.put((env_id, play_action[0]))
+            await env_action_queue.put((env_id, play_action[0], export_step))
             await env_action_queue.join()
             obs = env.obs_buf
 
