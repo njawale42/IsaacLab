@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2024-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -10,15 +10,16 @@ using Rerun's visualization capabilities. It helps in debugging and validating c
 """
 
 import atexit
-import numpy as np
 import os
 import signal
 import subprocess
 import threading
 import time
-import torch
 import weakref
 from typing import TYPE_CHECKING, Any, Optional
+
+import numpy as np
+import torch
 
 # Check if rerun is installed
 try:
@@ -390,8 +391,8 @@ class PlanVisualizer:
                 f"offset={self._base_translation}" if np.linalg.norm(self._base_translation) > 0 else "no offset"
             )
             print(
-                f"Visualizing plan: {len(plan.position)} waypoints, {robot_count} robot spheres,"
-                f" {attached_count} attached spheres, {offset_info}"
+                f"Visualizing plan: {len(plan.position)} waypoints, {robot_count} robot spheres (with offset),"
+                f" {attached_count} attached spheres (with offset), {offset_info}"
             )
 
         # Set timeline for static visualization (separate from animation)
@@ -542,11 +543,13 @@ class PlanVisualizer:
     def _visualize_attached_spheres(self, spheres: list[Any]) -> None:
         """Visualize attached object collision spheres.
 
+        Attached spheres are returned by cuRobo FK in the robot base frame
+        (same as robot link spheres), so they need the same base translation
+        offset to appear at the correct world position in Rerun.
+
         Args:
             spheres: List of attached object spheres
         """
-        # Attached spheres are in robot base frame (computed via FK), so they
-        # need the same offset as robot spheres for correct visualization
         self._log_spheres(
             spheres=spheres,
             entity_type="attached",
@@ -627,9 +630,8 @@ class PlanVisualizer:
                 continue
             rr_path = f"world/scene/{node.replace('/', '_')}"
 
-            # Always update transform (objects may move between calls)
-            # World scene obstacles are in robot base frame (same as robot spheres).
-            # Apply _base_translation to align with robot sphere visualization.
+            # Obstacles are in the robot reference frame; shift by
+            # _base_translation so they align with the robot spheres in Rerun.
             translation = tform[:3, 3] + self._base_translation
             rr.log(
                 rr_path,
@@ -818,17 +820,12 @@ class PlanVisualizer:
                 pos = pos.reshape(-1)
                 radius = float(sphere.radius)
 
-                # ALL spheres from get_robot_as_spheres are in robot base frame
-                # and need the base translation offset for visualization
-                pos_with_offset = pos + self._base_translation
-
                 if i < robot_link_count:
-                    # Robot link sphere
-                    robot_sphere_positions.append(pos_with_offset)
+                    robot_sphere_positions.append(pos + self._base_translation)
                     robot_sphere_radii.append(radius)
                 else:
-                    # Attached object sphere (also in robot base frame via FK)
-                    attached_sphere_positions.append(pos_with_offset)
+                    # Attached spheres are also in robot base frame (from FK)
+                    attached_sphere_positions.append(pos + self._base_translation)
                     attached_sphere_radii.append(radius)
 
             # Log robot spheres with green color
@@ -886,9 +883,7 @@ class PlanVisualizer:
         """
         if len(plan.position) < 2:
             # If only one waypoint, just return it
-            return [
-                plan.position[0] if isinstance(plan.position[0], torch.Tensor) else torch.tensor(plan.position[0])
-            ]  # type: ignore
+            return [plan.position[0] if isinstance(plan.position[0], torch.Tensor) else torch.tensor(plan.position[0])]  # type: ignore
 
         interpolated_positions = []
 
@@ -924,6 +919,60 @@ class PlanVisualizer:
             motion_gen: CuRobo motion generator instance
         """
         self._motion_gen_ref = motion_gen
+
+    def visualize_debug_state(
+        self,
+        robot_spheres: list[Any],
+        target_pose: torch.Tensor | None = None,
+        world_scene: Optional["trimesh.Scene"] = None,
+        colliding_indices: list[int] | None = None,
+    ) -> None:
+        """Visualize the current robot state for debugging failed plans.
+
+        Shows robot collision spheres and world scene without requiring a
+        successful plan.  Colliding spheres are highlighted in red.
+
+        Args:
+            robot_spheres: List of robot collision spheres at current config.
+            target_pose: Optional target pose to display.
+            world_scene: Optional world scene geometry.
+            colliding_indices: Sphere indices that are in collision (shown in red).
+        """
+        rr.set_time("static_plan", sequence=self._current_frame)
+        self._current_frame += 1
+        self._clear_visualization()
+
+        if world_scene is not None:
+            self._visualize_world_scene(world_scene)
+
+        if target_pose is not None:
+            self._visualize_target_pose(target_pose)
+
+        colliding_set = set(colliding_indices) if colliding_indices else set()
+
+        for i, sphere in enumerate(robot_spheres):
+            entity_id = f"sphere_{i}"
+            self._sphere_entities.setdefault("robot", []).append(entity_id)
+
+            pos = (
+                sphere.position.detach().cpu().numpy()
+                if torch.is_tensor(sphere.position)
+                else np.array(sphere.position)
+            )
+            pos = pos.reshape(-1) + self._base_translation
+
+            color = [255, 0, 0, 200] if i in colliding_set else [0, 255, 100, 128]
+            rr.log(
+                f"world/robot/{entity_id}",
+                rr.Points3D(positions=np.array([pos]), colors=[color], radii=[float(sphere.radius)]),
+            )
+
+        if self.debug:
+            n_colliding = len(colliding_set)
+            print(
+                f"Debug state: {len(robot_spheres)} spheres ({n_colliding} colliding), "
+                f"world_scene={'yes' if world_scene else 'no'}"
+            )
 
     def mark_idle(self) -> None:
         """Signal that the planner is idle, clearing animations.

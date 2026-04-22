@@ -121,6 +121,8 @@ def _compute_collision_pairs(
     n_shared_joints: int = 6,
     use_shared_torso: bool = True,
     debug_save_path: str | None = None,
+    base_pos_right: torch.Tensor | None = None,
+    base_pos_left: torch.Tensor | None = None,
 ) -> list[tuple[int, int, float]]:
     """Find colliding waypoint pairs using sphere overlaps.
 
@@ -129,9 +131,10 @@ def _compute_collision_pairs(
     When use_shared_torso is True, left's first n_shared_joints are overwritten with right's so both arms
     use the same base frame. When False, each arm uses its own torso from its waypoint (avoids false
     collisions when torso differs between waypoints, e.g. humanoid).
-    
-    Set env COLLISION_DEBUG=1 to enable debug visualization data saving.
-    Set env COLLISION_DEBUG_PATH to specify save path (default: /tmp/collision_debug.pkl).
+
+    For separate-base-frame arms (e.g. YAM bimanual with two articulations),
+    pass base_pos_right / base_pos_left to shift sphere centres into a common
+    world frame before distance computation.
     """
     if joint_path_r.numel() == 0 or joint_path_l.numel() == 0:
         return []
@@ -253,6 +256,11 @@ def _compute_collision_pairs(
         r_r = sph_r[..., 3]
         c_l = sph_l[..., :3]
         r_l = sph_l[..., 3]
+
+        if base_pos_right is not None:
+            c_r = c_r + base_pos_right.to(c_r.device)
+        if base_pos_left is not None:
+            c_l = c_l + base_pos_left.to(c_l.device)
 
         # Filter out spheres with radius <= 0 (disabled spheres)
         valid_r = r_r > 0
@@ -670,6 +678,8 @@ def build_collision_aware_schedule(
     min_dt: float | None = None,
     hold_constraints: list[HoldConstraint] | None = None,
     use_shared_torso: bool = True,
+    base_pos_right: torch.Tensor | None = None,
+    base_pos_left: torch.Tensor | None = None,
 ) -> DiscreteSchedule:
     """Build a discrete collision-aware schedule for both arm trajectories.
     
@@ -686,6 +696,8 @@ def build_collision_aware_schedule(
         hold_constraints: List of hold constraints from sequential subtask ordering.
         use_shared_torso: If True, left config uses right's torso for collision check; if False, each arm
             uses its own torso (recommended for humanoids when torso can differ between waypoints).
+        base_pos_right: World-frame position of right arm base (for separate-base setups).
+        base_pos_left: World-frame position of left arm base (for separate-base setups).
     """
     print("[Scheduling] Computing collision pairs...")
     print(f"  Right joints: {arm_right.joint_positions.shape}, device: {arm_right.joint_positions.device}")
@@ -724,6 +736,8 @@ def build_collision_aware_schedule(
         pair_batch=pair_batch,
         collision_margin=collision_margin,
         use_shared_torso=use_shared_torso,
+        base_pos_right=base_pos_right,
+        base_pos_left=base_pos_left,
     )
     print(f"[Scheduling] Found {len(joint_pairs)} collision pairs")
 

@@ -273,6 +273,9 @@ class CuroboPlanner(MotionPlannerBase):
             max_attempts=self.config.max_planning_attempts,
             enable_finetune_trajopt=self.config.enable_finetune_trajopt,
             time_dilation_factor=self.config.time_dilation_factor,
+            finetune_dt_scale=1.05,
+            finetune_attempts=10,
+            finetune_dt_decay=1.05,
         )
 
         # Create USD helper
@@ -627,10 +630,13 @@ class CuroboPlanner(MotionPlannerBase):
         object_mappings = self._get_object_mappings()
         world_model = self.motion_gen.world_coll_checker.world_model
 
-        object_path = object_mappings.get(object_name)
-        if not object_path:
+        object_paths = object_mappings.get(object_name)
+        if not object_paths:
             self.logger.debug(f"Object {object_name} not found in world model")
             return None
+
+        # Any sub-mesh shares the same pose; use the first path for lookup.
+        first_path = object_paths[0] if isinstance(object_paths, list) else object_paths
 
         # Search for object in world model
         for obj_list, _ in [
@@ -641,7 +647,7 @@ class CuroboPlanner(MotionPlannerBase):
                 continue
 
             for obj in obj_list:
-                if obj.name and object_path in str(obj.name):
+                if obj.name and first_path in str(obj.name):
                     if obj.pose is not None:
                         return Pose.from_list(obj.pose, tensor_args=self.tensor_args)
 
@@ -852,7 +858,7 @@ class CuroboPlanner(MotionPlannerBase):
 
         updated_count = 0
 
-        for object_name, object_path in object_mappings.items():
+        for object_name, object_paths in object_mappings.items():
             if object_name not in rigid_objects:
                 continue
 
@@ -895,8 +901,8 @@ class CuroboPlanner(MotionPlannerBase):
             # DEBUG: Print transformed position
             print(f"[SYNC DEBUG] {object_name}: CuRobo pos (base) = {pose_list[:3]}")
 
-            # Update object pose in cuRobo's world model
-            if self._update_object_in_world_model(world_model, object_name, object_path, pose_list):
+            # Update all sub-meshes that belong to the object.
+            if self._update_object_in_world_model(world_model, object_name, object_paths, pose_list):
                 updated_count += 1
                 print(f"[SYNC DEBUG] {object_name}: Updated in world model")
             else:
@@ -908,7 +914,7 @@ class CuroboPlanner(MotionPlannerBase):
         if updated_count > 0:
             # Update individual obstacle poses in collision checker
             # This preserves static mesh objects unlike load_collision_model which rebuilds everything
-            for object_name, object_path in object_mappings.items():
+            for object_name, object_paths in object_mappings.items():
                 if object_name not in rigid_objects:
                     continue
 
@@ -930,22 +936,23 @@ class CuroboPlanner(MotionPlannerBase):
                 current_pos = self._to_curobo_device(current_pos_raw)
                 current_quat = self._to_curobo_device(current_quat_raw)
 
-                # Create cuRobo pose and update collision checker directly
                 curobo_pose = self._make_pose(position=current_pos, quaternion=current_quat)
-                self.motion_gen.world_coll_checker.update_obstacle_pose(  # type: ignore
-                    object_path, curobo_pose, update_cpu_reference=True
-                )
+                paths = object_paths if isinstance(object_paths, list) else [object_paths]
+                for op in paths:
+                    self.motion_gen.world_coll_checker.update_obstacle_pose(  # type: ignore
+                        op, curobo_pose, update_cpu_reference=True
+                    )
 
             self.logger.debug(f"Updated {updated_count} object poses in collision checker")
 
-    def _get_object_mappings(self) -> dict[str, str]:
+    def _get_object_mappings(self) -> dict[str, list[str]]:
         """Get object mappings with caching for performance optimization.
 
         Returns cached mappings if available, otherwise computes and caches them.
         Cache is invalidated when the object set changes.
 
         Returns:
-            Dictionary mapping Isaac Lab object names to their corresponding USD paths
+            Dictionary mapping Isaac Lab object names to lists of matching USD paths.
         """
         if self._cached_object_mappings is None:
             world_model = self.motion_gen.world_coll_checker.world_model
@@ -965,7 +972,7 @@ class CuroboPlanner(MotionPlannerBase):
         """
         return 0 if self._is_shared else self.env_id
 
-    def _discover_object_mappings(self, world_model, rigid_objects) -> dict[str, str]:
+    def _discover_object_mappings(self, world_model, rigid_objects) -> dict[str, list[str]]:
         """Build mapping between Isaac Lab object names and cuRobo world paths.
 
         Automatically discovers the correspondence between Isaac Lab's rigid object names
@@ -982,11 +989,11 @@ class CuroboPlanner(MotionPlannerBase):
             rigid_objects: Isaac Lab's rigid objects dictionary
 
         Returns:
-            Dictionary mapping Isaac Lab object names to their corresponding USD paths
+            Dictionary mapping Isaac Lab object names to a list of matching USD paths.
         """
-        mappings = {}
+        mappings: dict[str, list[str]] = {}
         env_prefix = f"/World/envs/env_{self._world_model_env_id}/"
-        world_object_paths = []
+        world_object_paths: list[str] = []
 
         # Collect all primitive objects from cuRobo world model
         for primitive_type in self.primitive_types:
@@ -995,35 +1002,37 @@ class CuroboPlanner(MotionPlannerBase):
                 if primitive.name and env_prefix in str(primitive.name):
                     world_object_paths.append(str(primitive.name))
 
-        # Match Isaac Lab object names to world paths
+        # Match Isaac Lab object names to all corresponding world paths.
         for object_name in rigid_objects.keys():
+            matched = []
             for path in world_object_paths:
                 if object_name.lower().replace("_", "") in path.lower().replace("_", ""):
-                    mappings[object_name] = path
-                    self.logger.debug(f"MAPPING: {object_name} -> {path}")
-                    break
+                    matched.append(path)
+            if matched:
+                mappings[object_name] = matched
+                self.logger.debug(f"MAPPING: {object_name} -> {len(matched)} paths (first: {matched[0]})")
             else:
                 self.logger.debug(f"WARNING: Could not find world path for {object_name}")
 
         return mappings
 
     def _update_object_in_world_model(
-        self, world_model, object_name: str, object_path: str, pose_list: list[float]
+        self, world_model, object_name: str, object_paths: str | list[str], pose_list: list[float]
     ) -> bool:
-        """Update a single object's pose in cuRobo's collision world model.
+        """Update an object's pose in cuRobo's collision world model.
 
-        Searches through all primitive types in the world model to find the specified object
-        and updates its pose. Uses flexible matching to handle variations in path naming
-        between Isaac Lab and cuRobo representations.
+        Updates all collision sub-meshes that belong to the object. For simple
+        objects this is typically one path; for complex meshes (e.g. bowls) it
+        may be multiple collision sub-meshes.
 
         Args:
             world_model: cuRobo's collision world model
             object_name: Short object name from Isaac Lab (e.g., "cube_1")
-            object_path: Full USD path for the object in cuRobo world
+            object_paths: Full USD path(s) for the object in cuRobo world
             pose_list: New pose as [x, y, z, w, x, y, z] list in cuRobo format
 
         Returns:
-            True if object was found and successfully updated, False otherwise
+            True if at least one matching path was found and updated, False otherwise
         """
         # Handle case where world_model might be a list
         if isinstance(world_model, list):
@@ -1032,22 +1041,28 @@ class CuroboPlanner(MotionPlannerBase):
             else:
                 return False
 
-        # Update all primitive types
+        if isinstance(object_paths, str):
+            object_paths = [object_paths]
+
+        updated = 0
         for primitive_type in self.primitive_types:
             primitive_list = getattr(world_model, primitive_type)
             for primitive in primitive_list:
                 if primitive.name:
                     primitive_name = str(primitive.name)
-                    # Use bidirectional matching for robust path matching
-                    if object_path == primitive_name or object_path in primitive_name or primitive_name in object_path:
-                        primitive.pose = pose_list
-                        self.logger.debug(f"Updated {primitive_type} {object_name} pose")
-                        return True
+                    for object_path in object_paths:
+                        if object_path == primitive_name or object_path in primitive_name or primitive_name in object_path:
+                            primitive.pose = pose_list
+                            updated += 1
+                            break
+        if updated:
+            self.logger.debug(f"Updated {updated} sub-mesh(es) for {object_name}")
+            return True
 
         self.logger.debug(f"WARNING: Object {object_name} not found in world model")
         return False
 
-    def _attach_object(self, object_name: str, object_path: str, env_id: int) -> bool:
+    def _attach_object(self, object_name: str, object_path: str | list[str], env_id: int) -> bool:
         """Attach an object to the robot for manipulation planning.
 
         Establishes an attachment between the specified object and the robot's end-effector
@@ -1057,15 +1072,18 @@ class CuroboPlanner(MotionPlannerBase):
 
         Args:
             object_name: Short name of the object to attach (e.g., "cube_2")
-            object_path: Full USD path for the object in cuRobo world model
+            object_path: Full USD path(s) for the object in cuRobo world model
             env_id: Environment ID for multi-environment support
 
         Returns:
             True if attachment succeeded, False if attachment failed
         """
+        if isinstance(object_path, str):
+            object_path = [object_path]
+
         current_joint_state = self._get_current_joint_state_for_curobo()
 
-        self.logger.debug(f"Attaching {object_name} at path {object_path}")
+        self.logger.debug(f"Attaching {object_name} ({len(object_path)} sub-mesh(es))")
 
         # Create attachment record (relative pose object-frame to parent link)
         attachment = self.create_attachment(
@@ -1076,7 +1094,7 @@ class CuroboPlanner(MotionPlannerBase):
         self.attached_objects[object_name] = attachment
         success = self.motion_gen.attach_objects_to_robot(
             joint_state=current_joint_state,
-            object_names=[object_path],
+            object_names=object_path,
             link_name=self.config.attached_object_link_name,
             surface_sphere_radius=self.config.surface_sphere_radius,
             sphere_fit_type=SphereFitType.SAMPLE_SURFACE,
@@ -1093,8 +1111,9 @@ class CuroboPlanner(MotionPlannerBase):
 
             self.logger.info(f"Sphere count after attach is successful: {self._count_active_spheres()}")
 
-            # Deactivate the original obstacle as it's now carried by the robot
-            self.motion_gen.world_coll_checker.enable_obstacle(object_path, enable=False)
+            # Deactivate the original obstacle(s) as they are now carried by the robot
+            for op in object_path:
+                self.motion_gen.world_coll_checker.enable_obstacle(op, enable=False)
 
             return True
         else:
@@ -1132,11 +1151,13 @@ class CuroboPlanner(MotionPlannerBase):
             if attachment.parent not in link_names:
                 continue
 
-            # Find object path and re-enable it in the world
-            object_path = object_mappings.get(object_name)
-            if object_path:
-                self.motion_gen.world_coll_checker.enable_obstacle(object_path, enable=True)  # type: ignore
-                self.logger.debug(f"Re-enabled obstacle {object_path}")
+            # Find object path(s) and re-enable them in the world
+            object_paths = object_mappings.get(object_name)
+            if object_paths:
+                for op in (object_paths if isinstance(object_paths, list) else [object_paths]):
+                    self.motion_gen.world_coll_checker.enable_obstacle(op, enable=True)  # type: ignore
+                count = len(object_paths) if isinstance(object_paths, list) else 1
+                self.logger.debug(f"Re-enabled {count} obstacle(s) for {object_name}")
 
             # Collect the link that will need re-enabling
             detached_links.add(attachment.parent)
@@ -1430,7 +1451,10 @@ class CuroboPlanner(MotionPlannerBase):
                 pos_l, rot_l = PoseUtils.unmake_pose(
                     T_base_link.to(device=self.tensor_args.device, dtype=self.tensor_args.dtype)
                 )
-                link_pose_dict[name] = self._make_pose(position=pos_l, quaternion=PoseUtils.quat_from_matrix(rot_l))
+                link_pose_dict[name] = self._make_pose(
+                    position=pos_l,
+                    quaternion=PoseUtils.quat_from_matrix(rot_l),
+                )
             # Prefer start-state-as-retract to bias IK/trajopt to current configuration
             prev_use_start = getattr(self.plan_config, "use_start_state_as_retract", None)
             if prev_use_start is not None:
@@ -2221,11 +2245,12 @@ class CuroboPlanner(MotionPlannerBase):
 
         # Re-enable all obstacles that may have been disabled by attachment
         object_mappings = self._get_object_mappings()
-        for _, object_path in object_mappings.items():
-            try:
-                self.motion_gen.world_coll_checker.enable_obstacle(object_path, enable=True)
-            except Exception:
-                pass
+        for _, object_paths in object_mappings.items():
+            for op in (object_paths if isinstance(object_paths, list) else [object_paths]):
+                try:
+                    self.motion_gen.world_coll_checker.enable_obstacle(op, enable=True)
+                except Exception:
+                    pass
 
     def update_world_and_plan_motion(
         self,
