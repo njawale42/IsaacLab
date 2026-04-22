@@ -341,6 +341,8 @@ def _blocks_collide(
     densify_factor: int = 4,
     debug_links: bool = False,
     use_shared_torso: bool = True,
+    base_pos_right: torch.Tensor | None = None,
+    base_pos_left: torch.Tensor | None = None,
 ) -> BlockCollisionResult:
     """Check collisions between two joint-position arrays and return diagnostics.
 
@@ -391,6 +393,13 @@ def _blocks_collide(
         c_r, r_r = sph_r[..., :3], sph_r[..., 3]
         c_l, r_l = sph_l[..., :3], sph_l[..., 3]
 
+        # For separate-base-frame arms (e.g. YAM bimanual), shift sphere
+        # centres into a common world frame before distance computation.
+        if base_pos_right is not None:
+            c_r = c_r + base_pos_right.to(c_r.device)
+        if base_pos_left is not None:
+            c_l = c_l + base_pos_left.to(c_l.device)
+
         valid_r = r_r > 0
         valid_l = r_l > 0
 
@@ -431,6 +440,10 @@ def _blocks_collide(
         sph_l = state_l.link_spheres_tensor.view(1, -1, 4)
         c_r, r_r = sph_r[..., :3], sph_r[..., 3]
         c_l, r_l = sph_l[..., :3], sph_l[..., 3]
+        if base_pos_right is not None:
+            c_r = c_r + base_pos_right.to(c_r.device)
+        if base_pos_left is not None:
+            c_l = c_l + base_pos_left.to(c_l.device)
         valid_r = r_r > 0
         valid_l = r_l > 0
         aa = (c_r * c_r).sum(dim=-1, keepdim=True)
@@ -726,6 +739,8 @@ def build_dag_schedule(
     hold_former_part: str = "skill",
     debug_collision_links: bool = False,
     use_shared_torso: bool = True,
+    base_pos_right: torch.Tensor | None = None,
+    base_pos_left: torch.Tensor | None = None,
 ) -> DiscreteSchedule:
     """Build a discrete schedule using DAG-based segment-level MILP ordering.
 
@@ -827,6 +842,8 @@ def build_dag_schedule(
                 densify_factor=densify_factor,
                 debug_links=debug_collision_links,
                 use_shared_torso=use_shared_torso,
+                base_pos_right=base_pos_right,
+                base_pos_left=base_pos_left,
             )
             status = "COLLIDE" if result.collides else "clear"
             msg = (

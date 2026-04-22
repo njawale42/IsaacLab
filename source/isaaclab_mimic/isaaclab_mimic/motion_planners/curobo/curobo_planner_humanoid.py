@@ -418,7 +418,7 @@ class HumanoidArmCuroboPlanner(CuroboPlanner):
                 if logger:
                     arm_side = self._arm_side() or "unknown"
                     logger.log(f"[HUMANOID PLANNER _get_current_joint_state] arm={arm_side}")
-                    logger.log(f"  planner joints (clamped): {pos[0, :10].cpu().numpy()} ... (first 10)")
+                    logger.log(f"planner joints (clamped): {pos[0, :10].cpu().numpy()} ... (first 10)")
             except ImportError:
                 pass
 

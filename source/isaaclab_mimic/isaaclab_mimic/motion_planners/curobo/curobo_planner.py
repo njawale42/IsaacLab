@@ -388,6 +388,8 @@ class CuroboPlanner(MotionPlannerBase):
     # INITIALIZATION AND CONFIGURATION
     # =====================================================================================
 
+    _UNBOUNDED_LIMIT_THRESHOLD: float = 1e6
+
     def _sync_joint_limits_from_isaac_lab(self) -> None:
         """Synchronize joint limits from Isaac Lab articulation to cuRobo kinematics.
 
@@ -397,6 +399,9 @@ class CuroboPlanner(MotionPlannerBase):
 
         The method maps Isaac Lab joint names to cuRobo joint names and updates
         cuRobo's position limits to match Isaac Lab's articulation limits.
+        Joints with unbounded Isaac Lab limits (±FLT_MAX) are skipped so cuRobo
+        retains the finite URDF-derived limits it needs for IK sampling and
+        trajectory optimization.
         """
         # Get cuRobo's joint limits and names
         curobo_limits = self.motion_gen.kinematics.get_joint_limits()
@@ -411,6 +416,7 @@ class CuroboPlanner(MotionPlannerBase):
 
         # Track updates for logging
         updated_joints = []
+        skipped_joints = []
         mismatches = []
 
         for curobo_idx, joint_name in enumerate(curobo_joint_names):
@@ -418,6 +424,16 @@ class CuroboPlanner(MotionPlannerBase):
                 isaac_idx = isaac_name_to_idx[joint_name]
                 isaac_lower = isaac_limits[isaac_idx, 0].item()
                 isaac_upper = isaac_limits[isaac_idx, 1].item()
+
+                # Skip joints with unbounded Isaac Lab limits -- keep cuRobo's URDF limits
+                if abs(isaac_lower) > self._UNBOUNDED_LIMIT_THRESHOLD or abs(isaac_upper) > self._UNBOUNDED_LIMIT_THRESHOLD:
+                    curobo_lower = curobo_limits.position[0, curobo_idx].item()
+                    curobo_upper = curobo_limits.position[1, curobo_idx].item()
+                    skipped_joints.append(
+                        f"{joint_name}: kept cuRobo=[{curobo_lower:.3f}, {curobo_upper:.3f}] "
+                        f"(Isaac Lab reports unbounded)"
+                    )
+                    continue
 
                 curobo_lower = curobo_limits.position[0, curobo_idx].item()
                 curobo_upper = curobo_limits.position[1, curobo_idx].item()
@@ -434,13 +450,23 @@ class CuroboPlanner(MotionPlannerBase):
                 curobo_limits.position[1, curobo_idx] = isaac_upper
                 updated_joints.append(joint_name)
 
+        if skipped_joints:
+            self.logger.info(
+                f"Skipped {len(skipped_joints)} joint(s) with unbounded Isaac Lab limits "
+                f"(keeping URDF limits for cuRobo)"
+            )
+            for msg in skipped_joints[:5]:
+                self.logger.debug(f"  {msg}")
+            if len(skipped_joints) > 5:
+                self.logger.debug(f"  ... and {len(skipped_joints) - 5} more")
+
         if mismatches:
             self.logger.info(f"Synced {len(updated_joints)} joint limits from Isaac Lab to cuRobo")
             for mismatch in mismatches[:5]:  # Log first 5 mismatches
                 self.logger.debug(f"  Joint limit updated: {mismatch}")
             if len(mismatches) > 5:
                 self.logger.debug(f"  ... and {len(mismatches) - 5} more")
-        else:
+        elif updated_joints:
             self.logger.debug(f"Joint limits already in sync ({len(updated_joints)} joints checked)")
 
     def _initialize_static_world(self) -> None:
